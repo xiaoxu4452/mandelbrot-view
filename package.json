@@ -1,0 +1,25 @@
+{
+  "name": "mandelbrot-view",
+  "version": "1.0.0",
+  "description": "High-precision fractal observatory — perturbation theory, series approximation and a WebAssembly kernel",
+  "type": "module",
+  "license": "MIT",
+  "author": "xiaoxu4452",
+  "homepage": "https://xiaoxu4452.github.io/mandelbrot-view/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaoxu4452/mandelbrot-view.git"
+  },
+  "scripts": {
+    "page": "node server/static-server.mjs",
+    "core": "node server/render-server.mjs",
+    "build:kernel": "node tools/build-kernel.mjs",
+    "build:core": "node tools/build-core-package.mjs",
+    "build:presets": "node tools/gen-presets.mjs"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.28.20",
+    "playwright-core": "^1.65.0",
+    "wabt": "^1.0.39"
+  }
+}

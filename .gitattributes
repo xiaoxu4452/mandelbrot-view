@@ -1,0 +1,6 @@
+# Normalise line endings: source files use LF, Windows launchers keep CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.zip binary
+*.png binary
+*.wasm binary

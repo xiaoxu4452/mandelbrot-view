@@ -1,0 +1,918 @@
+/* ------------------------------------------------------------------
+ * render.js — CPU 瓦片渲染内核
+ *   direct   双精度直算（浅层，最快）
+ *   perturb  高精度参考轨道 + 双精度扰动 + 混叠聚类修正（深层，可达 10^-300）
+ *   hp       全高精度直算（牛顿集 / 不支持扰动的族）
+ * ----------------------------------------------------------------*/
+
+import { paletteLUT } from './palettes.js';
+import { buildReferenceOrbit } from './formulas.js';
+import { contextFor, resolveBits, requiredBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js';
+import { buildSeries, chooseSkip } from './environment.js';
+import { makeBigContext, compileBig } from './hpeval.js';
+import { compile as compileDouble } from './mathlib.js';
+
+const BAIL2 = 1e20;
+const LOG_BAIL = Math.log(1e10);
+const INTERIOR = [5, 6, 9];
+
+const KIND_CODE = {
+  mandelbrot: 0, multibrot: 0,
+  tricorn: 1, burningship: 2, celtic: 3, perpendicular: 4, phoenix: 5
+};
+
+/* ---------------- 参考轨道缓存 ---------------- */
+
+const orbitCache = new Map();
+const ORBIT_CACHE_MAX = 8;
+
+export function orbitKey(job) {
+  const s = job.spec;
+  return [
+    job.viewId, s.mode, s.kind, s.power, s.phoenixP,
+    s.julia ? s.julia.re + '|' + s.julia.im : '',
+    job.center.re, job.center.im, job.bits, job.maxIter
+  ].join(';');
+}
+
+/** 双精度快速逃逸时间（用于挑选参考点） */
+function escapeTimeDouble(spec, cr, ci, zr0, zi0, limit) {
+  const kind = spec.kind, power = spec.power | 0;
+  const isJulia = spec.mode === 'j';
+  let zr = zr0, zi = zi0;
+  const ph = spec.phoenixP != null ? spec.phoenixP : 0.5667;
+  let pr = 0, pi = 0;
+  for (let n = 0; n < limit; n++) {
+    let nr, ni;
+    switch (KIND_CODE[kind] || 0) {
+      case 0: {
+        if (power === 2) { nr = zr * zr - zi * zi; ni = 2 * zr * zi; }
+        else {
+          let tr = zr, ti = zi;
+          for (let k = 2; k <= power; k++) {
+            const r2 = tr * zr - ti * zi, i2 = tr * zi + ti * zr;
+            tr = r2; ti = i2;
+          }
+          nr = tr; ni = ti;
+        }
+        break;
+      }
+      case 1: nr = zr * zr - zi * zi; ni = -2 * zr * zi; break;
+      case 2: { const ax = Math.abs(zr), ay = Math.abs(zi); nr = ax * ax - ay * ay; ni = 2 * ax * ay; break; }
+      case 3: { const t = zr * zr - zi * zi; nr = Math.abs(t); ni = 2 * zr * zi; break; }
+      case 4: { nr = zr * zr - zi * zi; ni = 2 * Math.abs(zr) * Math.abs(zi); break; }
+      case 5: { nr = zr * zr - zi * zi + ph * pr; ni = 2 * zr * zi + ph * pi; pr = zr; pi = zi; break; }
+      default: nr = zr * zr - zi * zi; ni = 2 * zr * zi;
+    }
+    zr = isJulia ? nr + cr : nr + cr;
+    zi = isJulia ? ni + ci : ni + ci;
+    if (zr * zr + zi * zi > BAIL2) return n;
+  }
+  return limit;
+}
+
+/**
+ * 选择参考点：在视口内取若干候选点，用高精度轨道实测它们的存活时间，
+ * 取“活得最久”的那个作为参考轨道。
+ * 高精度是必需的：深度超过 1e-16 后，double 已经完全区分不出这些候选点，
+ * 而参考轨道一旦提前逃逸，整个画面会塌成同一颜色（深层放大的常见假象）。
+ */
+function pickReference(job, bits) {
+  const { width, height, maxIter } = job;
+  const ps = job.pixelSize;
+  const spec = job.spec;
+
+  /* Reference-point election.
+   *
+   * The perturbation recursion is only well conditioned while the reference
+   * orbit stays "close" to the pixel orbits.  A reference that escapes early
+   * forces the whole view onto the glitch fallback, which is what produced
+   * the black blobs and speckle noise of the previous build.  We therefore
+   * probe a 5×5 grid (centre first) and keep the longest-lived candidate,
+   * preferring a point that never escapes inside the iteration budget. */
+  const cands = [];
+  const G = 5;
+  for (let j = 0; j < G; j++) {
+    for (let i = 0; i < G; i++) cands.push([(i + 0.5) / G, (j + 0.5) / G]);
+  }
+  cands.sort((a, b) =>
+    Math.hypot(a[0] - 0.5, a[1] - 0.5) - Math.hypot(b[0] - 0.5, b[1] - 0.5));
+
+  let best = null;
+  for (const [fx, fy] of cands) {
+    const px = fx * width, py = fy * height;
+    const ox = (px + 0.5 - width * 0.5) * ps;
+    const oy = -(py + 0.5 - height * 0.5) * ps;
+    const centerHP = {
+      re: offsetCoord(job.center.re, ox, bits),
+      im: offsetCoord(job.center.im, oy, bits)
+    };
+    const orb = buildReferenceOrbit(spec, centerHP, bits, maxIter, BAIL2);
+    orb.refPx = px;
+    orb.refPy = py;
+    orb.lifetime = orb.escaped ? orb.len : maxIter;
+    if (!best || orb.lifetime > best.lifetime) best = orb;
+    // An interior point is the ideal reference: stop immediately.
+    if (!orb.escaped) break;
+    // Good enough: within 2% of the iteration budget.
+    if (best.lifetime > maxIter * 0.98) break;
+  }
+  return best;
+}
+
+export function getOrbit(job, bits) {
+  const key = orbitKey(job);
+  let o = orbitCache.get(key);
+  if (o) return o;
+  o = pickReference(job, bits || job.resolvedBits || 128);
+  if (orbitCache.size >= ORBIT_CACHE_MAX) {
+    orbitCache.delete(orbitCache.keys().next().value);
+  }
+  orbitCache.set(key, o);
+  return o;
+}
+
+/* ---------------- 入口 ---------------- */
+
+export function renderTile(job) {
+  const t0 = now();
+  const ps = job.pixelSize;
+  const log2ps = job.psLog2 != null ? job.psLog2 : Math.log2(ps);
+  const bits = resolveBitsFromLog2(job.bits, log2ps);
+  const lut = paletteLUT(job.palette);
+  const spec = job.spec;
+
+  let result;
+  if (spec.mode === 'n') {
+    result = bits > 64 ? renderNewtonHP(job, bits, lut) : renderNewton(job, lut);
+  } else if (spec.mode === 'x') {
+    result = job.customEnv && job.customEnv.deriv
+      ? renderCustomPerturb(job, lut)
+      : renderCustom(job, lut);
+  } else if (bits > 64 && log2ps > -1000 && (spec.kind === 'mandelbrot' || spec.kind === 'multibrot')) {
+    result = renderPerturb(job, bits, lut);
+  } else if (bits > 64) {
+    result = renderHpDirect(job, bits, lut);
+  } else {
+    result = renderDirect(job, lut);
+  }
+
+  result.ms = now() - t0;
+  result.bits = bits;
+  result.precisionLimited = bits < requiredBitsFromLog2(log2ps);
+  return result;
+}
+
+function now() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+function makeTile(w, h) { return new Uint8ClampedArray(w * h * 4); }
+
+function smoothIter(n, m2, power) {
+  const lz = 0.5 * Math.log(m2);
+  const nu = Math.log(lz / LOG_BAIL) / Math.log(power);
+  return n + 1 - (nu === nu ? nu : 0);
+}
+
+function writeColor(lut, t, data, o) {
+  let u = t - Math.floor(t);
+  let ix = u * 512;
+  let i0 = ix | 0; if (i0 >= 512) i0 = 511;
+  const f = ix - i0, j0 = (i0 + 1) & 511;
+  const a4 = i0 * 4, b4 = j0 * 4;
+  data[o] = (lut[a4] + (lut[b4] - lut[a4]) * f) | 0;
+  data[o + 1] = (lut[a4 + 1] + (lut[b4 + 1] - lut[a4 + 1]) * f) | 0;
+  data[o + 2] = (lut[a4 + 2] + (lut[b4 + 2] - lut[a4 + 2]) * f) | 0;
+  data[o + 3] = 255;
+}
+
+/* ---------------- 双精度直算 ---------------- */
+
+function renderDirect(job, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const cxe = parseFloat(job.center.re), cye = parseFloat(job.center.im);
+  const spec = job.spec;
+  const kc = KIND_CODE[spec.kind] || 0;
+  const power = spec.power | 0;
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const isJulia = spec.mode === 'j';
+  const jr = isJulia ? parseFloat(spec.julia.re) : 0;
+  const ji = isJulia ? parseFloat(spec.julia.im) : 0;
+  const ph = spec.phoenixP != null ? spec.phoenixP : 0.5667;
+  const samples = Math.max(1, job.samples | 0);
+  const sq2 = samples * samples;
+  const inv = 1 / sq2;
+  const step = 1 / (samples + 1);
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      let accR = 0, accG = 0, accB = 0;
+      for (let sy = 0; sy < samples; sy++) {
+        for (let sx = 0; sx < samples; sx++) {
+          const gx = x + px + (samples === 1 ? 0.5 : (sx + 1) * step);
+          const gy = y + py + (samples === 1 ? 0.5 : (sy + 1) * step);
+          const ox = (gx - halfW) * ps, oy = -(gy - halfH) * ps;
+          const cr = isJulia ? jr : cxe + ox;
+          const ci = isJulia ? ji : cye + oy;
+          let zr = isJulia ? cxe + ox : 0;
+          let zi = isJulia ? cye + oy : 0;
+          let n = 0, m2 = 0, done = false;
+          let pr = 0, pi = 0;
+          let chkR = 0, chkI = 0, chkOn = false;
+
+          for (; n < maxIter; n++) {
+            let nr, ni;
+            switch (kc) {
+              case 0: {
+                if (power === 2) { nr = zr * zr - zi * zi; ni = 2 * zr * zi; }
+                else if (power === 3) {
+                  const a = zr * zr - zi * zi, b = 2 * zr * zi;
+                  nr = a * zr - b * zi; ni = a * zi + b * zr;
+                } else {
+                  let tr = zr, ti = zi;
+                  for (let k = 2; k <= power; k++) {
+                    const r2 = tr * zr - ti * zi, i2 = tr * zi + ti * zr;
+                    tr = r2; ti = i2;
+                  }
+                  nr = tr; ni = ti;
+                }
+                break;
+              }
+              case 1: nr = zr * zr - zi * zi; ni = -2 * zr * zi; break;
+              case 2: {
+                const ax = zr < 0 ? -zr : zr, ay = zi < 0 ? -zi : zi;
+                nr = ax * ax - ay * ay; ni = 2 * ax * ay; break;
+              }
+              case 3: {
+                const t = zr * zr - zi * zi;
+                nr = t < 0 ? -t : t; ni = 2 * zr * zi; break;
+              }
+              case 4: {
+                const ax = zr < 0 ? -zr : zr, ay = zi < 0 ? -zi : zi;
+                nr = zr * zr - zi * zi; ni = 2 * ax * ay; break;
+              }
+              case 5: {
+                nr = zr * zr - zi * zi + ph * pr;
+                ni = 2 * zr * zi + ph * pi;
+                pr = zr; pi = zi; break;
+              }
+              default: nr = zr * zr - zi * zi; ni = 2 * zr * zi;
+            }
+            zr = nr + cr; zi = ni + ci;
+            m2 = zr * zr + zi * zi;
+            if (m2 > BAIL2) { done = true; break; }
+
+            if (n === 6) { chkR = zr; chkI = zi; chkOn = true; }
+            else if (chkOn && (n & 31) === 0) {
+              const dx = zr - chkR, dy = zi - chkI;
+              if (dx * dx + dy * dy < 1e-26) { break; }  // 周期 -> 内部
+            }
+          }
+
+          let r, g, b;
+          if (!done) { r = INTERIOR[0]; g = INTERIOR[1]; b = INTERIOR[2]; }
+          else {
+            const t = smoothIter(n, m2, power) * bandScale + offset;
+            let u = t - Math.floor(t);
+            let ix = u * 512; let i0 = ix | 0; if (i0 >= 512) i0 = 511;
+            const f = ix - i0, j0 = (i0 + 1) & 511;
+            const a4 = i0 * 4, b4 = j0 * 4;
+            r = lut[a4] + (lut[b4] - lut[a4]) * f;
+            g = lut[a4 + 1] + (lut[b4 + 1] - lut[a4 + 1]) * f;
+            b = lut[a4 + 2] + (lut[b4 + 2] - lut[a4 + 2]) * f;
+          }
+          accR += r; accG += g; accB += b;
+        }
+      }
+      data[o] = accR * inv; data[o + 1] = accG * inv; data[o + 2] = accB * inv; data[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return { data, mode: 'direct', glitches: 0, refLen: 0 };
+}
+
+/* ---------------- 扰动渲染（多项式族） ---------------- */
+
+function renderPerturb(job, bits, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const power = job.spec.power | 0;
+  const isJulia = job.spec.mode === 'j';
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const orbit = getOrbit(job, bits);
+  const Zr = orbit.re, Zi = orbit.im, oLen = orbit.len;
+  const refPx = orbit.refPx, refPy = orbit.refPy;
+
+  // ---- 级数近似：把整幅视图统一到一个跳过步数，避免瓦片接缝 ----
+  let sa = null;
+  if (power === 2 && !job.noSeries) {
+    if (!orbit._series || orbit._serIter !== maxIter) {
+      orbit._series = buildSeries(orbit, maxIter, isJulia, ps);
+      orbit._serIter = maxIter;
+    }
+    const corners = [
+      [0, 0], [width, 0], [0, height], [width, height]
+    ];
+    let far = 0;
+    for (const [cx, cy] of corners) {
+      far = Math.max(far, Math.hypot(cx - refPx, cy - refPy));
+    }
+    sa = chooseSkip(orbit._series, (far + 1) * ps, maxIter);
+  }
+
+  const glitchList = [];
+  let glitchCount = 0;
+  let o = 0;
+  // Glitch budget per tile: a deep view can easily produce >10k glitching
+  // pixels in a 128x128 tile, so the budget must scale with the tile area.
+  const MAXFIX = 60000;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const gx = x + px, gy = y + py;
+      const poR = (gx + 0.5 - refPx) * ps;
+      const poI = -(gy + 0.5 - refPy) * ps;
+      const dcr = isJulia ? 0 : poR;
+      const dci = isJulia ? 0 : poI;
+      let dr = poR, di = poI;
+      let n = 0, m2 = 0, esc = 0, glitch = false;
+
+      // 级数近似：直接给出第 s 步的扰动值
+      if (sa) {
+        const d2r = poR * poR - poI * poI;
+        const d2i = 2 * poR * poI;
+        const d3r = d2r * poR - d2i * poI;
+        const d3i = d2r * poI + d2i * poR;
+        dr = sa.ar * poR - sa.ai * poI
+          + sa.br * d2r - sa.bi * d2i
+          + sa.cr * d3r - sa.ci * d3i;
+        di = sa.ar * poI + sa.ai * poR
+          + sa.br * d2i + sa.bi * d2r
+          + sa.cr * d3i + sa.ci * d3r;
+        n = sa.skip;
+      }
+
+      for (; n < maxIter; n++) {
+        if (n >= oLen) {
+          // 参考轨道已逃逸：像素随之逃逸，除非发生抵消
+          const zr = Zr[oLen] + dr, zi = Zi[oLen] + di;
+          m2 = zr * zr + zi * zi;
+          n = oLen - 1;
+          if (m2 > BAIL2) esc = 1; else { esc = 0; glitch = true; }
+          break;
+        }
+        const Zr0 = Zr[n], Zi0 = Zi[n];
+        const zr = Zr0 + dr, zi = Zi0 + di;
+        m2 = zr * zr + zi * zi;
+        if (m2 > BAIL2) { esc = 1; break; }
+        const d2 = dr * dr + di * di;
+        if (m2 < d2 * 1e-6) glitch = true;
+
+        if (power === 2) {
+          const t = 2 * Zr0 + dr, u = 2 * Zi0 + di;
+          const ndr = t * dr - u * di + dcr;
+          const ndi = t * di + u * dr + dci;
+          dr = ndr; di = ndi;
+        } else {
+          let zpr = 1, zpi = 0;
+          for (let k = 0; k < power - 1; k++) {
+            const r2 = zpr * Zr0 - zpi * Zi0, i2 = zpr * Zi0 + zpi * Zr0;
+            zpr = r2; zpi = i2;
+          }
+          let dkr = dr, dki = di;
+          let sr = 0, si = 0, binom = 1;
+          for (let k = 1; k <= power; k++) {
+            binom = (binom * (power - k + 1)) / k;
+            sr += binom * (zpr * dkr - zpi * dki);
+            si += binom * (zpr * dki + zpi * dkr);
+            if (k < power) {
+              const r2 = dkr * dr - dki * di, i2 = dkr * di + dki * dr;
+              dkr = r2; dki = i2;
+              const za = zpr * Zr0 - zpi * Zi0, zb = zpr * Zi0 + zpi * Zr0;
+              zpr = za; zpi = zb;
+            }
+          }
+          dr = sr + dcr; di = si + dci;
+        }
+      }
+
+      if (glitch) {
+        glitchCount++;
+        if (glitchList.length < MAXFIX * 2) glitchList.push(gx, gy);
+      }
+      if (job.debugN) { data[o] = n & 255; data[o + 1] = (n >> 8) & 255; data[o + 2] = Math.min(255, Math.log(m2) * 10) | 0; data[o + 3] = 255; }
+      else if (esc === 1) {
+        writeColor(lut, smoothIter(n, m2, power) * bandScale + offset, data, o);
+      } else {
+        data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2];
+      }
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+
+  let fixed = 0;
+  if (glitchList.length) fixed = fixGlitches(job, bits, lut, data, glitchList);
+
+  return { data, mode: 'perturb', glitches: glitchCount, fixed, refLen: oLen };
+}
+
+function fixGlitches(job, bits, lut, data, list, mask, maxClusters, preRefs) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const ps = job.pixelSize;
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const spec = job.spec, power = spec.power | 0;
+
+  const count = list.length / 2;
+  const CELL = 12;
+  const clusters = new Map();
+  for (let i = 0; i < count; i++) {
+    const px = list[i * 2], py = list[i * 2 + 1];
+    const key = (((px - x) / CELL) | 0) * 4096 + (((py - y) / CELL) | 0);
+    const e = clusters.get(key);
+    if (e) { e.n++; e.sx += px; e.sy += py; }
+    else clusters.set(key, { n: 1, sx: px, sy: py });
+  }
+  const picks = [...clusters.values()].sort((a, b) => b.n - a.n).slice(0, maxClusters || 4);
+  if (!picks.length) return 0;
+
+  const refs = [];
+  for (const c of picks) {
+    const cxp = c.sx / c.n, cyp = c.sy / c.n;
+    const centerHP = {
+      re: offsetCoord(job.center.re, (cxp + 0.5 - halfW) * ps, bits),
+      im: offsetCoord(job.center.im, -(cyp + 0.5 - halfH) * ps, bits)
+    };
+    const orb = buildReferenceOrbit(spec, centerHP, bits, maxIter, BAIL2);
+    orb.refPx = cxp; orb.refPy = cyp;
+    if (orb.len > 16) refs.push({ orbit: orb, px: cxp, py: cyp });
+  }
+  if (!refs.length) return 0;
+
+  let fixed = 0;
+  for (let i = 0; i < count; i++) {
+    const px = list[i * 2], py = list[i * 2 + 1];
+    for (const ref of refs) {
+      const orb = ref.orbit;
+      const dcr = (px + 0.5 - ref.px) * ps;
+      const dci = -(py + 0.5 - ref.py) * ps;
+      let dr = dcr, di = dci, n = 0, m2 = 0, esc = 0, bad = false;
+      for (; n < maxIter; n++) {
+        if (n >= orb.len) { esc = 2; break; }
+        const Zr0 = orb.re[n], Zi0 = orb.im[n];
+        const zr = Zr0 + dr, zi = Zi0 + di;
+        m2 = zr * zr + zi * zi;
+        if (m2 > BAIL2) { esc = 1; break; }
+        if (m2 < dr * dr + di * di) { bad = true; break; }
+        const t = 2 * Zr0 + dr, u = 2 * Zi0 + di;
+        const ndr = t * dr - u * di + dcr;
+        const ndi = t * di + u * dr + dci;
+        dr = ndr; di = ndi;
+      }
+      if (bad) continue;
+      if (power !== 2 && esc !== 1) { /* 高次幂仅接受幂 2 的修正 */ }
+      const oo = ((py - y) * w + (px - x)) * 4;
+      if (esc === 0) {
+        data[oo] = INTERIOR[0]; data[oo + 1] = INTERIOR[1]; data[oo + 2] = INTERIOR[2];
+      } else {
+        writeColor(lut, smoothIter(n, m2, power) * bandScale + offset, data, oo);
+      }
+      fixed++;
+      break;
+    }
+  }
+  return fixed;
+}
+
+/** 构造 (val × 2^exp) 的定点数，避免 double 下溢 */
+function scaledOffset(ctx, val, exp) {
+  return ctx.shl(ctx.fromNumber(val), exp);
+}
+
+function offsetCoord(baseStr, delta, bits) {
+  const ctx = contextFor(Math.max(bits, 128));
+  const b = ctx.fromString(baseStr);
+  const d = ctx.fromNumber(delta);
+  return ctx.toString(b + d, Math.ceil(bits * 0.32) + 8);
+}
+
+/* ---------------- 高精度直算 ---------------- */
+
+function renderHpDirect(job, bits, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const ctx = contextFor(bits);
+  const F = ctx.FB, HALF = ctx.HALF;
+  const mul = (a, b) => { const p = a * b; return p >= 0n ? (p + HALF) >> F : -((-p + HALF) >> F); };
+  const sq = (a) => mul(a, a);
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const spec = job.spec, kc = KIND_CODE[spec.kind] || 0;
+  const isJulia = spec.mode === 'j';
+  const cr0 = ctx.fromString(isJulia ? spec.julia.re : job.center.re);
+  const ci0 = ctx.fromString(isJulia ? spec.julia.im : job.center.im);
+  const zx0 = ctx.fromString(job.center.re), zy0 = ctx.fromString(job.center.im);
+  const bailSq = ctx.fromNumber(BAIL2);
+  const psMant = job.psMant != null ? job.psMant : ps;
+  const psExp = job.psExp != null ? job.psExp : 0;
+  const ph = ctx.fromNumber(spec.phoenixP != null ? spec.phoenixP : 0.5667);
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const sx = scaledOffset(ctx, (x + px + 0.5 - halfW) * psMant, psExp);
+      const sy = scaledOffset(ctx, (-(y + py + 0.5 - halfH)) * psMant, psExp);
+      let cr, ci, zr, zi, pr = 0n, pi = 0n;
+      if (isJulia) {
+        cr = cr0; ci = ci0;
+        zr = ctx.add(zx0, sx); zi = ctx.add(zy0, sy);
+      } else {
+        cr = ctx.add(cr0, sx); ci = ctx.add(ci0, sy);
+        zr = 0n; zi = 0n;
+      }
+      let n = 0, m2 = 0, done = false;
+      for (; n < maxIter; n++) {
+        const ar = sq(zr), bi = sq(zi);
+        if (ar + bi > bailSq) { m2 = ctx.toNumber(ar + bi); done = true; break; }
+        let nr, ni;
+        switch (kc) {
+          case 1: nr = ar - bi; ni = -2n * mul(zr, zi); break;
+          case 2: {
+            const ax = zr < 0n ? -zr : zr, ay = zi < 0n ? -zi : zi;
+            nr = mul(ax, ax) - mul(ay, ay); ni = 2n * mul(ax, ay); break;
+          }
+          case 3: {
+            let t = ar - bi; if (t < 0n) t = -t;
+            nr = t; ni = 2n * mul(zr, zi); break;
+          }
+          case 4: {
+            const ax = zr < 0n ? -zr : zr, ay = zi < 0n ? -zi : zi;
+            nr = ar - bi; ni = 2n * mul(ax, ay); break;
+          }
+          case 5: {
+            nr = ar - bi + mul(ph, pr); ni = 2n * mul(zr, zi) + mul(ph, pi);
+            pr = zr; pi = zi; break;
+          }
+          default: nr = ar - bi; ni = 2n * mul(zr, zi);
+        }
+        zr = nr + cr; zi = ni + ci;
+      }
+      if (job.debugN) { data[o] = n & 255; data[o + 1] = (n >> 8) & 255; data[o + 2] = Math.min(255, Math.log(m2) * 10) | 0; data[o + 3] = 255; }
+      else if (!done) {
+        data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2];
+      } else {
+        writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+      }
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return { data, mode: 'hp', glitches: 0, refLen: 0 };
+}
+
+/* ---------------- 牛顿集 ---------------- */
+
+function newtonCycle(n, dist, root, bandCount, offset, maxIter) {
+  return (n + 1 - Math.log2(Math.max(dist, 1e-15)) / 8) / Math.max(bandCount, 1) + root * 0.173 + offset;
+}
+
+function renderNewton(job, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const d = Math.max(2, job.spec.newtonDegree | 0);
+  const cxe = parseFloat(job.center.re), cye = parseFloat(job.center.im);
+  const roots = [];
+  for (let k = 0; k < d; k++) {
+    const a = (2 * Math.PI * k) / d;
+    roots.push([Math.cos(a), Math.sin(a)]);
+  }
+  const EPS = 1e-12;
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      let zr = cxe + (x + px + 0.5 - halfW) * ps;
+      let zi = cye - (y + py + 0.5 - halfH) * ps;
+      let n = 0, root = -1, dist = 1;
+      for (; n < maxIter; n++) {
+        let pr = 1, pi = 0;
+        for (let k = 0; k < d - 1; k++) {
+          const r2 = pr * zr - pi * zi, i2 = pr * zi + pi * zr;
+          pr = r2; pi = i2;
+        }
+        const qr = pr * zr - pi * zi - 1, qi = pr * zi + pi * zr;
+        const dr_ = d * pr, di_ = d * pi;
+        const den = dr_ * dr_ + di_ * di_;
+        if (den < 1e-300) break;
+        zr -= (qr * dr_ + qi * di_) / den;
+        zi -= (qi * dr_ - qr * di_) / den;
+        if (n > 3) {
+          for (let k = 0; k < d; k++) {
+            const ex = zr - roots[k][0], ey = zi - roots[k][1];
+            const dd = ex * ex + ey * ey;
+            if (dd < EPS) { root = k; dist = Math.sqrt(dd); break; }
+          }
+          if (root >= 0) break;
+        }
+      }
+      if (root >= 0) writeColor(lut, newtonCycle(n, dist, root, job.cycle, offset, maxIter), data, o);
+      else { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return { data, mode: 'newton', glitches: 0, refLen: 0 };
+}
+
+function renderNewtonHP(job, bits, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const ctx = contextFor(bits);
+  const F = ctx.FB, HALF = ctx.HALF;
+  const mul = (a, b) => { const p = a * b; return p >= 0n ? (p + HALF) >> F : -((-p + HALF) >> F); };
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const d = Math.max(2, job.spec.newtonDegree | 0);
+  const dBig = BigInt(d);
+  const one = ctx.ONE;
+  const cxe = ctx.fromString(job.center.re), cye = ctx.fromString(job.center.im);
+  const psMant = job.psMant != null ? job.psMant : ps;
+  const psExp = job.psExp != null ? job.psExp : 0;
+  const eps = ctx.fromNumber(1e-12);
+  const roots = [];
+  for (let k = 0; k < d; k++) {
+    const a = (2 * Math.PI * k) / d;
+    roots.push([ctx.fromNumber(Math.cos(a)), ctx.fromNumber(Math.sin(a))]);
+  }
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const sx = scaledOffset(ctx, (x + px + 0.5 - halfW) * psMant, psExp);
+      const sy = scaledOffset(ctx, (-(y + py + 0.5 - halfH)) * psMant, psExp);
+      let zr = ctx.add(cxe, sx), zi = ctx.add(cye, sy);
+      let n = 0, root = -1, dist = 1;
+      for (; n < maxIter; n++) {
+        let pr = one, pi = 0n;
+        for (let k = 0; k < d - 1; k++) {
+          const r2 = mul(pr, zr) - mul(pi, zi), i2 = mul(pr, zi) + mul(pi, zr);
+          pr = r2; pi = i2;
+        }
+        const qr = mul(pr, zr) - mul(pi, zi) - one;
+        const qi = mul(pr, zi) + mul(pi, zr);
+        const dr_ = mul(dBig, pr), di_ = mul(dBig, pi);
+        const den = mul(dr_, dr_) + mul(di_, di_);
+        if (den === 0n) break;
+        const numR = mul(qr, dr_) + mul(qi, di_);
+        const numI = mul(qi, dr_) - mul(qr, di_);
+        zr -= (numR << F) / den;
+        zi -= (numI << F) / den;
+        if (n > 3) {
+          for (let k = 0; k < d; k++) {
+            const ex = zr - roots[k][0], ey = zi - roots[k][1];
+            const dd = mul(ex, ex) + mul(ey, ey);
+            if (dd < eps) {
+              root = k;
+              dist = Math.sqrt(Math.max(0, ctx.toNumber(dd)));
+              break;
+            }
+          }
+          if (root >= 0) break;
+        }
+      }
+      if (root >= 0) writeColor(lut, newtonCycle(n, dist, root, job.cycle, offset, maxIter), data, o);
+      else { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return { data, mode: 'newton-hp', glitches: 0, refLen: 0 };
+}
+
+/* ---------------- 自定义公式 ---------------- */
+
+function renderCustom(job, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const cxe = parseFloat(job.center.re), cye = parseFloat(job.center.im);
+  const spec = job.spec;
+  const isJulia = spec.mode === 'j';
+  const jr = spec.julia ? parseFloat(spec.julia.re) : 0;
+  const ji = spec.julia ? parseFloat(spec.julia.im) : 0;
+  const fn = job.customFn;
+  if (!fn && !job.customStep) throw new Error('自定义公式未编译');
+  const step = job.customStep;
+  const OUT = job.customOut || (job.customOut = new Float64Array(4));
+  const P = job.customParams || new Float64Array(8);
+  const S = { zpr: 0, zpi: 0, cr: 0, ci: 0, on: 0 };
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const ox = (x + px + 0.5 - halfW) * ps;
+      const oy = -(y + py + 0.5 - halfH) * ps;
+      const cr = isJulia ? jr : cxe + ox;
+      const ci = isJulia ? ji : cye + oy;
+      const zr0 = isJulia ? cxe + ox : 0;
+      const zi0 = isJulia ? cye + oy : 0;
+      let n = 0, m2 = 0, escaped = false;
+
+      if (step) {
+        step(zr0, zi0, cr, ci, P, maxIter, S, OUT);
+        n = OUT[0] | 0;
+        m2 = OUT[1];
+        escaped = n < maxIter && m2 >= 0;
+      } else {
+        let zr = zr0, zi = zi0;
+        S.zpr = 0; S.zpi = 0;
+        for (; n < maxIter; n++) {
+          fn(zr, zi, cr, ci, P, n, S, OUT);
+          S.zpr = zr; S.zpi = zi;
+          zr = OUT[0]; zi = OUT[1];
+          m2 = zr * zr + zi * zi;
+          if (!(m2 === m2) || m2 > BAIL2) break;
+        }
+        escaped = n < maxIter;
+      }
+
+      if (!escaped) { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
+      else writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return { data, mode: 'custom', glitches: 0, refLen: 0 };
+}
+
+/* ---------------- 自定义公式 · 全高精度直算（参照/兜底） ---------------- */
+
+function renderCustomHpDirect(job, bits, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const spec = job.spec;
+  const K = makeBigContext(bits);
+  const ctx = K.ctx;
+  const dbl = compileDouble(spec.customExpr);
+  const evalBig = compileBig(dbl.ast, { bits, ctx: K, params: dbl.params });
+
+  const cp = spec.customParams || {};
+  const P = dbl.params.map((name) => {
+    const v = Number(cp[name]);
+    return [ctx.fromNumber(Number.isFinite(v) ? v : 0), 0n];
+  });
+
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const c0r = ctx.fromString(job.center.re), c0i = ctx.fromString(job.center.im);
+  const psMant = job.psMant != null ? job.psMant : job.pixelSize;
+  const psExp = job.psExp != null ? job.psExp : 0;
+  const bail = ctx.fromNumber(BAIL2);
+  const st = { z: [0n, 0n], c: [0n, 0n], n: 0, zp: [0n, 0n], P, loopVal: 0n };
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const dx = (x + px + 0.5 - halfW) * psMant;
+      const dy = -(y + py + 0.5 - halfH) * psMant;
+      st.c = [
+        c0r + ctx.shl(ctx.fromNumber(dx), psExp),
+        c0i + ctx.shl(ctx.fromNumber(dy), psExp)
+      ];
+      st.z = [0n, 0n];
+      let n = 0, m2 = 0, escaped = false;
+      for (; n < maxIter; n++) {
+        const zr = st.z[0], zi = st.z[1];
+        m2 = ctx.toNumber(K.mul(zr, zr) + K.mul(zi, zi));
+        if (m2 > BAIL2) { escaped = true; break; }
+        if (n === maxIter - 1) break;
+        st.n = n;
+        st.zp = st.z;
+        st.z = evalBig(st);
+      }
+      if (escaped) writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+      else { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return { data, mode: 'custom-hp', glitches: 0, refLen: 0, fixed: 0 };
+}
+
+/* ---------------- 自定义公式 · 二阶扰动 ---------------- */
+
+/**
+ * 对任意公式 F(z, c)，把像素写成参考点 + δ：
+ *   ε_{n+1} = A ε + B δ + ½C ε² + D εδ + ½E δ²
+ * 其中 A..E 是沿参考轨道的一阶/二阶偏导（在双精度下求得）。
+ * 对 z² + c 它自动退化成标准曼德勃罗扰动。
+ */
+function renderCustomPerturb(job, lut) {
+  const { x, y, w, h, width, height, maxIter, offset } = job;
+  const bandScale = 1 / Math.max(job.cycle, 1);
+  const data = makeTile(w, h);
+  const ps = job.pixelSize;
+  const halfW = width * 0.5, halfH = height * 0.5;
+  const env = job.customEnv;
+  const Zr = env.re, Zi = env.im, oLen = env.len;
+  const D = env.deriv;
+  const refPx = env.refPx, refPy = env.refPy;
+
+  const isJet = D.kind === 'jet';
+  const K = isJet ? D.order : 0;
+  const W = D.width;
+  const coef = D.coef;
+
+  let glitchCount = 0;
+  let o = 0;
+
+  for (let py = 0; py < h; py++) {
+    for (let px = 0; px < w; px++) {
+      const gx = x + px, gy = y + py;
+      const dx = (gx + 0.5 - refPx) * ps;
+      const dy = -(gy + 0.5 - refPy) * ps;
+      let er = 0, ei = 0;
+      let n = 0, m2 = 0, esc = 0, glitch = false;
+
+      for (; n < maxIter; n++) {
+        if (n >= oLen) {
+          const zr = Zr[oLen] + er, zi = Zi[oLen] + ei;
+          m2 = zr * zr + zi * zi;
+          n = oLen - 1;
+          if (m2 > BAIL2) esc = 1; else glitch = true;
+          break;
+        }
+        const ZR = Zr[n], ZI = Zi[n];
+        const zr = ZR + er, zi = ZI + ei;
+        m2 = zr * zr + zi * zi;
+        if (m2 > BAIL2) { esc = 1; break; }
+        const e2 = er * er + ei * ei;
+        if (m2 < e2 * 1e-6) glitch = true;
+        // 非多项式公式：|ε| 变大后截断级数会发散，标记出来
+        if (!D.exact && e2 > 0.36) { glitch = true; break; }
+
+        let ner, nei;
+        if (isJet) {
+          const base = n * W * 2;
+          // p(ε) = p1 + p2 ε + … + pK ε^{K-1}
+          let pr = 0, pi = 0;
+          for (let k = K; k >= 1; k--) {
+            const off = base + (k - 1) * 2;
+            const cr = coef[off], ci = coef[off + 1];
+            const nr = pr * er - pi * ei + cr;
+            const ni = pr * ei + pi * er + ci;
+            pr = nr; pi = ni;
+          }
+          // q(ε) = q0 + q1 ε + … + qK ε^K
+          let qr = 0, qi = 0;
+          for (let k = K; k >= 0; k--) {
+            const off = base + K * 2 + k * 2;
+            const cr = coef[off], ci = coef[off + 1];
+            const nr = qr * er - qi * ei + cr;
+            const ni = qr * ei + qi * er + ci;
+            qr = nr; qi = ni;
+          }
+          ner = (er * pr - ei * pi) + (dx * qr - dy * qi);
+          nei = (er * pi + ei * pr) + (dx * qi + dy * qr);
+        } else {
+          // 线性：ε' = A ε + B δ
+          const off = n * 4;
+          const Ar = coef[off], Ai = coef[off + 1], Br = coef[off + 2], Bi = coef[off + 3];
+          ner = (Ar * er - Ai * ei) + (Br * dx - Bi * dy);
+          nei = (Ar * ei + Ai * er) + (Br * dy + Bi * dx);
+        }
+        er = ner; ei = nei;
+        if (!Number.isFinite(er) || !Number.isFinite(ei)) { glitch = true; break; }
+      }
+
+      if (glitch) glitchCount++;
+      if (esc === 1) writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+      else { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
+      data[o + 3] = 255;
+      o += 4;
+    }
+  }
+
+  return {
+    data, mode: isJet ? 'custom-jet' : 'custom-linear',
+    glitches: glitchCount, refLen: oLen, fixed: 0
+  };
+}
+
+// 测试导出（不参与运行时逻辑）
+export const _internals = { renderDirect, renderPerturb, renderHpDirect, pickReference, fixGlitches, renderCustomHpDirect, renderCustomPerturb };

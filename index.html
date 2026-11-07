@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>MANDELBROT · 精密分形观测台</title>
+<meta name="description" content="MANDELBROT — a high-precision fractal observatory. Arbitrary-depth Mandelbrot, Julia, Newton and custom complex maps rendered with perturbation theory, series approximation and a WebAssembly kernel." />
+<meta name="theme-color" content="#08090b" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#e9ebef" media="(prefers-color-scheme: light)" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta property="og:title" content="MANDELBROT · 精密分形观测台" />
+<meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="css/app.css?v=3" />
+</head>
+<body class="booting">
+<canvas id="fractal"></canvas>
+
+<!-- 启动加载层（完成后淡出） -->
+<div class="boot" id="boot">
+  <div class="boot-inner">
+    <div class="boot-mark">
+      <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="0.9">
+        <circle cx="9" cy="12" r="7"/>
+        <circle cx="16" cy="12" r="4.2"/>
+        <circle cx="16" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+      </svg>
+    </div>
+    <div class="boot-title">MANDELBROT</div>
+    <div class="boot-sub" data-i18n="appSub">精密分形观测台</div>
+    <div class="boot-bar"><div class="boot-fill" id="boot-fill"></div></div>
+    <div class="boot-meta">
+      <span id="boot-status" class="mono" data-i18n="bootInit">初始化</span>
+      <span id="boot-pct" class="mono">0%</span>
+    </div>
+
+    <!-- 启动诊断：只有在无法启动时才出现（见页面底部内联守卫脚本） -->
+    <div class="boot-note" id="boot-note" hidden>
+      <div class="boot-note-head">
+        <span class="boot-note-dot" id="boot-note-dot"></span>
+        <span id="boot-note-title">需要以服务方式打开</span>
+      </div>
+      <p id="boot-note-desc"></p>
+      <div class="boot-cmd" id="boot-note-cmdwrap" hidden>
+        <code id="boot-note-cmd"></code>
+        <button class="boot-copy" id="boot-note-copy" type="button">复制</button>
+      </div>
+      <div class="boot-note-actions">
+        <button class="btn primary" id="boot-note-primary" type="button">我已启动，重新加载</button>
+        <a class="btn ghost" id="boot-note-docs" href="https://github.com/xiaoxu4452/mandelbrot-view" target="_blank" rel="noopener">文档 / Docs</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 顶栏 -->
+<header class="topbar glass" id="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><circle cx="9" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="16" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="16" cy="12" r="1.5" fill="currentColor"/></svg>
+    </span>
+    <span class="brand-name">MANDELBROT</span>
+    <span class="brand-sub" data-i18n="appSub">精密分形观测台</span>
+  </div>
+
+  <nav class="topnav">
+    <div class="menu-wrap">
+      <button class="topbtn" id="btn-sets"><span data-i18n="sets">集</span><svg class="chev" viewBox="0 0 10 6" width="10" height="6"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
+      <div class="dropdown glass" id="menu-sets" hidden>
+        <button data-mode="m"><b>曼德勃罗集</b><small>Mandelbrot</small></button>
+        <button data-mode="j"><b>朱丽叶集</b><small>Julia</small></button>
+        <button data-mode="n"><b>牛顿集</b><small>Newton</small></button>
+        <button data-mode="x"><b>自定义公式</b><small>Custom</small></button>
+      </div>
+    </div>
+    <button class="topbtn" id="btn-presets"><span data-i18n="presets">预设</span><span class="badge">512</span></button>
+    <button class="topbtn" id="btn-formula"><span data-i18n="formula">公式</span></button>
+    <button class="topbtn" id="btn-custom"><span data-i18n="custom">自定义</span></button>
+  </nav>
+
+  <div class="top-spacer"></div>
+
+  <div class="top-right">
+    <div class="chip" id="chip-precision" title="当前数值精度">— bit</div>
+    <button class="topbtn console-toggle on" id="btn-console" aria-expanded="true" aria-controls="panel" title="控制台 / Console (P)">
+      <svg class="ct-ico" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3">
+        <rect x="1.4" y="2.6" width="13.2" height="10.8" rx="2"/>
+        <path d="M1.4 5.4h13.2M5.2 8.2h5.6M5.2 10.4h3.4"/>
+      </svg>
+      <span data-i18n="console" class="ct-lbl">控制台</span>
+    </button>
+    <div class="menu-wrap">
+      <button class="iconbtn" id="btn-settings" title="设置">
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.3">
+          <circle cx="10" cy="10" r="2.6"/>
+          <path d="M10 2.2v2M10 15.8v2M2.2 10h2M15.8 10h2M4.5 4.5l1.4 1.4M14.1 14.1l1.4 1.4M15.5 4.5l-1.4 1.4M5.9 14.1l-1.4 1.4"/>
+        </svg>
+      </button>
+      <div class="dropdown glass right" id="menu-settings" hidden>
+        <div class="dd-group">
+          <span class="dd-label" data-i18n="language">语言</span>
+          <div class="segment mini" id="seg-lang">
+            <button data-lang="zh" class="on">中文</button>
+            <button data-lang="en">EN</button>
+          </div>
+        </div>
+        <div class="dd-group">
+          <span class="dd-label" data-i18n="theme">主题</span>
+          <div class="segment mini" id="seg-theme">
+            <button data-theme="dark" class="on" data-i18n="dark">深色</button>
+            <button data-theme="light" data-i18n="light">浅色</button>
+          </div>
+        </div>
+        <div class="dd-sep"></div>
+        <label class="dd-check"><input type="checkbox" id="chk-hd" /><span data-i18n="hdRender">高清渲染（2× 像素）</span></label>
+        <button class="dd-item" id="btn-core" data-i18n="coreTitle">渲染核心</button>
+        <button class="dd-item" id="btn-fullscreen" data-i18n="scFull">全屏</button>
+        <button class="dd-item" id="btn-about" data-i18n="about">关于</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- 控制台 -->
+<aside class="panel glass" id="panel" aria-label="控制台">
+  <div class="panel-grab" id="panel-grab" aria-hidden="true"><span></span></div>
+  <div class="panel-head" id="panel-drag">
+    <span class="panel-title" data-i18n="panelTitle">控制台</span>
+    <div class="panel-head-actions">
+      <button class="iconbtn tiny" id="btn-panel-reset" title="复位位置 / Reset position">
+        <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2.2 4.4V2.2h2.2M9.8 7.6v2.2H7.6"/><path d="M2.6 2.6l2.6 2.6M9.4 9.4L6.8 6.8"/></svg>
+      </button>
+      <button class="iconbtn tiny" id="btn-panel-collapse" title="最小化到顶栏 / Minimize to top bar">
+        <svg viewBox="0 0 12 12" width="11" height="11"><path d="M2 7.5h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="panel-body" id="panel-body">
+    <section class="grp">
+      <h4 data-i18n="target">观测对象</h4>
+      <div class="segment" id="seg-mode">
+        <button data-mode="m" class="on" data-i18n="modeM">曼德勃罗集</button>
+        <button data-mode="j" data-i18n="modeJ">朱丽叶集</button>
+        <button data-mode="n" data-i18n="modeN">牛顿集</button>
+        <button data-mode="x" data-i18n="modeX">自定义</button>
+      </div>
+      <div class="row" id="row-kind">
+        <label>族</label>
+        <select id="sel-kind" class="ctl"></select>
+      </div>
+    </section>
+
+    <section class="grp" id="grp-julia" hidden>
+      <h4 data-i18n="juliaSeed">朱丽叶常数 c</h4>
+      <div class="row two">
+        <label data-i18n="real">实部</label>
+        <input class="ctl mono" id="in-jr" value="-0.7435" spellcheck="false"/>
+      </div>
+      <div class="row two">
+        <label data-i18n="imag">虚部</label>
+        <input class="ctl mono" id="in-ji" value="0.1314" spellcheck="false"/>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="params">参数</h4>
+      <div class="row" id="row-power" hidden>
+        <label data-i18n="power">幂次</label>
+        <input type="range" id="rng-power" min="2" max="10" step="1" value="2"/>
+        <span class="val mono" id="val-power">2</span>
+      </div>
+      <div class="row" id="row-degree" hidden>
+        <label data-i18n="degree">次数</label>
+        <input type="range" id="rng-degree" min="3" max="9" step="1" value="3"/>
+        <span class="val mono" id="val-degree">3</span>
+      </div>
+      <div class="row" id="row-phoenix" hidden>
+        <label data-i18n="phoenix">p</label>
+        <input type="range" id="rng-phoenix" min="-1" max="1" step="0.01" value="0.5667"/>
+        <span class="val mono" id="val-phoenix">0.57</span>
+      </div>
+      <div class="row">
+        <label data-i18n="iterations">迭代</label>
+        <input type="range" id="rng-iter" min="100" max="200000" step="100" value="600"/>
+        <input class="ctl mono num" id="in-iter" value="600"/>
+      </div>
+      <label class="check"><input type="checkbox" id="chk-autoiter" checked/><span data-i18n="autoIter">自动</span></label>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="render">渲染</h4>
+      <div class="row">
+        <label data-i18n="precision">精度</label>
+        <select id="sel-bits" class="ctl">
+          <option value="auto" data-i18n="precisionAuto">自动</option>
+          <option value="64">64-bit (double)</option>
+          <option value="128">128-bit</option>
+          <option value="256">256-bit</option>
+          <option value="512">512-bit</option>
+          <option value="1024">1024-bit</option>
+          <option value="2048">2048-bit</option>
+          <option value="4096">4096-bit (10⁻¹⁰⁰⁰)</option>
+        </select>
+      </div>
+      <div class="row">
+        <label data-i18n="palette">配色</label>
+        <select id="sel-palette" class="ctl"></select>
+      </div>
+      <div class="palette-strip" id="palette-strip"></div>
+      <div class="row">
+        <label data-i18n="cycle">色带</label>
+        <input type="range" id="rng-cycle" min="2" max="256" step="1" value="8"/>
+        <span class="val mono" id="val-cycle">8</span>
+      </div>
+      <div class="row">
+        <label data-i18n="phase">相位</label>
+        <input type="range" id="rng-offset" min="0" max="1" step="0.005" value="0"/>
+        <span class="val mono" id="val-offset">0.00</span>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="view">视图</h4>
+      <div class="kv"><span data-i18n="center">中心</span><code id="kv-center">—</code></div>
+      <div class="kv"><span data-i18n="zoom">缩放</span><code id="kv-zoom">—</code></div>
+      <div class="btnrow">
+        <button class="btn" id="btn-reset" data-i18n="reset">重置</button>
+        <button class="btn" id="btn-fit" data-i18n="fit">适应窗口</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn" id="btn-link" data-i18n="copyLink">复制链接</button>
+        <button class="btn" id="btn-png" data-i18n="exportPng">导出 PNG</button>
+      </div>
+    </section>
+  </div>
+</aside>
+
+<!-- 状态栏 -->
+<div class="hud" id="hud">
+  <div class="hud-line"><span id="hud-depth">—</span><span class="dot"></span><span id="hud-center" class="mono">—</span></div>
+  <div class="hud-line dim"><span id="hud-engine">—</span><span class="dot"></span><span id="hud-progress">—</span></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<div class="modal-root" id="modal-root" hidden>
+  <div class="modal-scrim" data-close></div>
+  <div class="modal glass" id="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div>
+        <h3 id="modal-title">—</h3>
+        <p id="modal-sub" class="sub">—</p>
+      </div>
+      <button class="iconbtn" data-close title="关闭">
+        <svg viewBox="0 0 14 14" width="13" height="13"><path d="M2 2l10 10M12 2L2 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot" id="modal-foot"></div>
+  </div>
+</div>
+
+<script type="module" src="js/app.js?v=3"></script>
+
+<!-- ==================================================================
+     Bootstrap guard (classic script — runs even when ES modules fail).
+     ES modules and Web Workers are blocked on the file:// origin, so a
+     double-clicked index.html can never start the render pipeline.
+     Instead of hanging at "0%", we diagnose the failure and explain the
+     one-line fix.  app.js sets window.__mbModuleLoaded as soon as it runs.
+     ================================================================== -->
+<script>
+(function () {
+  'use strict';
+  var zh = /^zh/i.test(navigator.language || 'zh');
+  var note = document.getElementById('boot-note');
+  var titleEl = document.getElementById('boot-note-title');
+  var descEl = document.getElementById('boot-note-desc');
+  var cmdWrap = document.getElementById('boot-note-cmdwrap');
+  var cmdEl = document.getElementById('boot-note-cmd');
+  var copyBtn = document.getElementById('boot-note-copy');
+  var primary = document.getElementById('boot-note-primary');
+  var dot = document.getElementById('boot-note-dot');
+  var statusEl = document.getElementById('boot-status');
+  var pctEl = document.getElementById('boot-pct');
+  var bar = document.querySelector('.boot-bar');
+  var shown = false;
+
+  function cmd() {
+    return location.protocol === 'file:' && /^win/i.test(navigator.platform || '')
+      ? 'start.bat'
+      : 'python3 -m http.server 8777';
+  }
+
+  function show(opts) {
+    if (!note || shown) return;
+    shown = true;
+    note.hidden = false;
+    document.getElementById('boot').classList.add('failed');
+    if (opts.tone === 'error' && dot) dot.classList.add('bad');
+    if (titleEl) titleEl.textContent = opts.title;
+    if (descEl) descEl.innerHTML = opts.desc;
+    if (cmdWrap && cmdEl) {
+      if (opts.cmd) { cmdWrap.hidden = false; cmdEl.textContent = opts.cmd; }
+      else { cmdWrap.hidden = true; }
+    }
+    if (primary && opts.primary) primary.textContent = opts.primary;
+    if (statusEl) statusEl.textContent = opts.status || '';
+    if (pctEl) pctEl.textContent = '';
+    if (bar) bar.style.display = 'none';
+  }
+
+  if (copyBtn) {
+    copyBtn.addEventListener('click', function () {
+      var text = cmdEl ? cmdEl.textContent : cmd();
+      (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+        .then(function () { copyBtn.textContent = zh ? '已复制' : 'Copied'; })
+        .catch(function () { copyBtn.textContent = zh ? '请手动复制' : 'Copy manually'; });
+    });
+  }
+  if (primary) primary.addEventListener('click', function () { location.reload(); });
+
+  // Expose for app.js (fatal runtime errors, seen from inside the module).
+  window.__mbBootFail = show;
+
+  // 1) file:// — modules + workers are hard-blocked by the origin policy.
+  if (location.protocol === 'file:') {
+    setTimeout(function () {
+      show({
+        title: zh ? '需要以本地服务方式打开' : 'A local server is required',
+        desc: zh
+          ? '浏览器禁止 <code>file://</code> 页面加载 ES 模块与 Web Worker，因此渲染内核无法启动。'
+            + '在项目目录双击 <code>start.bat</code>（或执行下面的命令），然后访问 '
+            + '<code>http://127.0.0.1:8777</code>。'
+          : 'Browsers block ES modules and Web Workers on <code>file://</code> origins, so the render core cannot start. '
+            + 'Run <code>start.bat</code> (or the command below) inside the project folder, then open '
+            + '<code>http://127.0.0.1:8777</code>.',
+        cmd: cmd(),
+        primary: zh ? '重新加载' : 'Reload',
+        status: zh ? '启动中止：来源策略' : 'Halted: origin policy'
+      });
+    }, 80);
+    return;
+  }
+
+  // 2) Module never executed (404 / syntax error / blocked request).
+  window.__mbBootWatch = setTimeout(function () {
+    if (window.__mbModuleLoaded) return;
+    show({
+      title: zh ? '内核脚本未能加载' : 'Core scripts failed to load',
+      tone: 'error',
+      desc: zh
+        ? '页面 9 秒内没有进入启动流程，通常是脚本 404 或被网络策略拦截。'
+          + '请确认通过 <code>http://127.0.0.1:8777</code> 或 GitHub Pages 访问，并按 F12 查看控制台。'
+        : 'The boot sequence never started within 9 s — usually a 404 or a blocked script. '
+          + 'Make sure the page is served over <code>http://127.0.0.1:8777</code> or GitHub Pages, then check the console (F12).',
+      primary: zh ? '重新加载' : 'Reload',
+      status: zh ? '启动中止：脚本未加载' : 'Halted: script not loaded'
+    });
+  }, 9000);
+
+  // 3) Uncaught errors during module evaluation.
+  window.addEventListener('error', function (e) {
+    if (window.__mbModuleLoaded) return;
+    if (!e || !e.filename || e.filename.indexOf('.js') < 0) return;
+    show({
+      title: zh ? '内核初始化失败' : 'Core initialization failed',
+      tone: 'error',
+      desc: (zh ? '脚本抛出异常：' : 'The core script threw: ') + '<code>' + String(e.message || 'error').slice(0, 180) + '</code>',
+      primary: zh ? '重新加载' : 'Reload',
+      status: zh ? '启动中止：异常' : 'Halted: exception'
+    });
+  });
+})();
+</script>
+</body>
+</html>
