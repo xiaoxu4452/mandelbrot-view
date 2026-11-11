@@ -11,7 +11,11 @@ import path from 'node:path';
 
 const PORT = Number(process.env.MB_PORT || 8778);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const THREADS = Math.max(4, Math.min(32, (os.availableParallelism?.() || os.cpus().length) - 0));
+/* One worker per core, minus one: the browser, the compositor and whatever else
+ * the user is running need a slot, and a machine that stutters is not faster
+ * than one that does not.  MB_THREADS overrides it for measurement. */
+const CORES = os.availableParallelism?.() || os.cpus().length;
+const THREADS = Math.max(1, Math.min(64, Number(process.env.MB_THREADS) || (CORES - 1)));
 
 const pool = [];
 const queue = [];

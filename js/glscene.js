@@ -177,6 +177,12 @@ vec3 sampleAt(vec2 pix)
    * precision). */
   vec2 cr = dfAdd(dfTwoSum(uCen.x, d.x), dfSet(uCen.z));
   vec2 ci = dfAdd(dfTwoSum(uCen.y, d.y), dfSet(uCen.w));
+  /* The Julia constant is NOT the pixel: z0 is the pixel and c is the seed.
+   * Using the pixel as the constant (what this branch used to do) renders a
+   * different set entirely — at the dock's default zoom it collapses to a
+   * flat interior patch, i.e. a black window. */
+  vec2 kr = dfTwoSum(uSeed.x, uSeed.z);
+  vec2 ki = dfTwoSum(uSeed.y, uSeed.w);
   if (uDebug == 4) return vec3((cr.x + cr.y) * 0.25 + 0.5, (ci.x + ci.y) * 0.25 + 0.5, 0.0);
   if (uJulia == 0 && insideBulb(cr, ci)) return uInterior;
 
@@ -190,8 +196,8 @@ vec3 sampleAt(vec2 pix)
   for (; n < limit; ++n) {
     vec2 nr = dfSub(dfMul(zr, zr), dfMul(zi, zi));
     vec2 ni = dfMulF(dfMul(zr, zi), 2.0);
-    zr = dfAdd(nr, cr);
-    zi = dfAdd(ni, ci);
+    zr = dfAdd(nr, uJulia == 1 ? kr : cr);
+    zi = dfAdd(ni, uJulia == 1 ? ki : ci);
     m2 = zr.x * zr.x + zi.x * zi.x;
     if (m2 > ${BAIL2.toExponential(1)}) break;
     if (n == 7) { chR = zr; chI = zi; chkOn = true; }

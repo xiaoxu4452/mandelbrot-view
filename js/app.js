@@ -228,7 +228,12 @@ function sceneView() {
   if (spec.mode !== 'm' && spec.mode !== 'j') return null;
   if (state.traps > 0 || state.inverse) return null;
   if (state.scheme === 'distance') return null;
-  if (state.glsl && state.glsl.trim()) return null;
+  /* A preset that ships its own GLSL scheme still has a palette: the additive
+   * terms are registered under IMPORTED_PALETTE.  Refusing the shader here is
+   * what made every GLSL preset look like it "did nothing" — the frame fell
+   * through to the CPU tiles and took minutes, so the user saw the old picture
+   * under a new HUD.  The shader now draws the preset with its palette, and the
+   * exact GLSL look is applied when the CPU pass lands. */
   if (state.stops && state.stops.length >= 2) return null;
   const p = psPair();
   if (p.e < -1000) return null;
@@ -484,7 +489,13 @@ let pending = 0;
 function initWorkers() {
   // The desktop shell computes in C++ and only needs one worker as a fallback
   // for expression formulas; the browser build keeps the full pool.
-  const n = NATIVE ? 1 : clamp((navigator.hardwareConcurrency || 4) - 1, 2, 8);
+  /* Use every core the device reports, minus one: the page itself, its
+   * compositor and whatever else the user is running still need a slot, and an
+   * idle core is the difference between "fast" and "the whole machine stutters".
+   * 32 is a memory guard, not a performance one — each worker holds its own
+   * copy of the kernel plus a reference orbit. */
+  const cores = Math.max(2, navigator.hardwareConcurrency || 4);
+  const n = NATIVE ? 1 : clamp(cores - 1, 2, 32);
   for (let i = 0; i < n; i++) {
     const w = new Worker('js/worker.js', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
@@ -500,7 +511,9 @@ function idleWorker() {
 }
 
 /* ---------------- Out-of-browser render core ---------------- */
-const REMOTE_MAX = 24;
+/* Same rule as the worker pool: as many requests in flight as the machine has
+ * cores to serve them, one short so the OS stays responsive. */
+const REMOTE_MAX = Math.max(8, Math.min(32, (navigator.hardwareConcurrency || 4) - 1));
 let remoteInflight = 0;
 const remoteQueue = [];
 const remoteCtl = new Set();
@@ -1715,12 +1728,12 @@ function runPass(vId, plan, done, planList) {
   const pw = Math.max(8, Math.round(W * s * ss));
   const ph = Math.max(8, Math.round(H * s * ss));
   const iter = iterForPlan(plan);
-  /* The deep-zoom kernel works on one viewport-wide lattice, so splitting the
-   * frame into 48 px tiles makes every tile rebuild that lattice from the root
-   * cell — N tiles x (a few MB of vertex table) x per-tile tree walk.  It is
-   * both slower than one full-frame pass and prone to seams.  Above the
-   * perturbation threshold the pass therefore runs as a single tile and the
-   * native pool parallelises inside it. */
+  /* Tiles exist so the work can run in parallel; a deep pass is the exception.
+   * Above the perturbation threshold every tile elects its own reference point
+   * and builds its own high-precision orbit, which costs tens of seconds at
+   * 2^-57.  Splitting the frame there multiplied that by the tile count and
+   * made the pass slower than the single-tile version it replaced, so the deep
+   * pass stays one tile with the pool working *inside* it. */
   const deepPass = psLog2Now() <= -45;
   /* One tile must fit the shell's 1 MB shared slot (512x512 RGBA), so the
    * upper bound is a hard 512 even when supersampling asks for more. */
@@ -2181,7 +2194,30 @@ function startPinch() {
   drag = null;
   canvas.classList.remove('dragging');
   takeSnapshot();
-  pinch = { d0: m.d, cx0: m.cx, cy0: m.cy };
+  /* Remember the view the gesture started from: every pointer event rebuilds
+   * the view from these numbers instead of accumulating on the last one, so a
+   * pinch that wanders out to the zoom limit and back still lands exactly
+   * where the fingers are. */
+  pinch = {
+    d0: m.d, cx0: m.cx, cy0: m.cy,
+    spanM: state.span.m, spanE: state.span.e,
+    cre: state.center.re, cim: state.center.im
+  };
+}
+
+/** Rebuild the view from the pinch's starting state — no accumulation. */
+function applyPinch(m) {
+  const p0 = pinch;
+  if (!p0 || !m) return;
+  state.span = { m: p0.spanM, e: p0.spanE };
+  state.center = { re: p0.cre, im: p0.cim };
+  const vf = viewFit();
+  const s = 1 / vf.k;
+  const dx = (m.cx - p0.cx0) * s;
+  const dy = (m.cy - p0.cy0) * s;
+  if (Math.hypot(dx, dy) > 0.5) state.center = panCenter(state.center, dx, dy);
+  const factor = clamp(p0.d0 / Math.max(1, m.d), 0.2, 5);
+  zoomView((m.cx - vf.ox) * s, (m.cy - vf.oy) * s, factor);
 }
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -2219,6 +2255,16 @@ canvas.addEventListener('pointermove', (e) => {
   if (pinch && pointers.size >= 2) {
     const m = pinchMetrics();
     if (!m) return;
+    applyPinch(m);
+    /* Follow the fingers.  On the shader path the view itself has just moved,
+     * so redrawing it is both cheaper and sharper than transforming the old
+     * bitmap — this is why the picture now tracks the gesture instead of
+     * sitting still until the fingers lift. */
+    if (state.gpu && scene.ok) {
+      sceneLive();
+      updateHud();
+      return;
+    }
     const vf = viewFit();
     const s = 1 / vf.k;
     const scale = clamp(pinch.d0 / m.d, 0.2, 5);
@@ -2285,23 +2331,16 @@ canvas.addEventListener('pointercancel', (e) => {
   canvas.classList.remove('dragging');
 });
 
-/** Finish a pinch: apply the accumulated pan + zoom in one render pass. */
+/** Finish a pinch: the view was already following the fingers; commit it at
+ * full quality instead of applying the gesture a second time. */
 function finishPinch(m) {
   const p0 = pinch;
+  if (!p0 || !m) { pinch = null; return; }
+  applyPinch(m);
   pinch = null;
-  if (!p0 || !m) return;
-  const vf = viewFit();
-  const s = 1 / vf.k;
-  const factor = clamp(p0.d0 / Math.max(1, m.d), 0.25, 4);
-  const dx = (m.cx - p0.cx0) * s;
-  const dy = (m.cy - p0.cy0) * s;
-
-  if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
-    state.center = panCenter(state.center, dx, dy);
-  }
-  const ax = (m.cx - vf.ox) * s;
-  const ay = (m.cy - vf.oy) * s;
-  zoomAt(ax, ay, factor, false);
+  renderNow();
+  if (state.autoIter) syncIterUi();
+  updateHud();
 }
 
 function commitPan(base, dx, dy) {
@@ -2338,15 +2377,20 @@ canvas.addEventListener('dblclick', (e) => {
   zoomAt(x, y, e.shiftKey ? 2.4 : 1 / 2.4, true);
 });
 
-function zoomAt(px, py, factor, instant) {
+/** Zoom the view about a screen point, without drawing anything.
+ *
+ * Split out of zoomAt so a live gesture (pinch) can rebuild the view from its
+ * starting state on every pointer event and then let the shader redraw — the
+ * old code only transformed a snapshot, which is why the picture did not
+ * follow the fingers on the GPU path. */
+function zoomView(px, py, factor) {
   const W = canvas.width, H = canvas.height;
   const log2New = psLog2Now() + Math.log2(factor);
-  if (log2New < MIN_LOG2PS) return;
-  if (spanNum() * factor > MAX_SPAN) return;
-
-  /* Zoom about the cursor: the point under it must stay put, so the centre
-   * moves toward it by (1 - factor) of the offset — rotated, because the offset
-   * is measured on screen and applied on the plane. */
+  if (log2New < MIN_LOG2PS) return false;
+  if (spanNum() * factor > MAX_SPAN) return false;
+  /* Zoom about the point: it must stay put, so the centre moves toward it by
+   * (1 - factor) of the offset — rotated, because the offset is measured on
+   * screen and applied on the plane. */
   const cx = (px - W / 2), cy = (py - H / 2);
   const bits = Math.max(160, requiredBitsFromLog2(log2New) + 40);
   const d = planeDelta(cx, cy);
@@ -2357,6 +2401,11 @@ function zoomAt(px, py, factor, instant) {
   };
   state.span = { m: state.span.m * factor, e: state.span.e };
   normalizeSpan();
+  return true;
+}
+
+function zoomAt(px, py, factor, instant) {
+  if (!zoomView(px, py, factor)) return;
 
   if (instant) {
     // Zoom the previous frame around the cursor for immediate feedback, then refine progressively
@@ -3422,7 +3471,10 @@ function openPresets() {
           applyRefPresetPatch(patch, id);
           markCurrent(el, id);
         } catch (e) {
-          nativeLog('[preset] open failed: ' + (e && e.message));
+          /* A failure here used to be invisible: the toast said "preset ✗" and
+           * the console said nothing, so a preset that could not be opened
+           * looked like one that did nothing. */
+          console.error('[preset] open failed', e);
           toast('preset ✗');
         }
       };
@@ -3990,7 +4042,11 @@ function applyRefPresetPatch(patch, file) {
   state.presetName = patch.name || '';
   state.presetId = file || patch.id || null;
 
-  nativeLog(`[preset] open ${file || '-'} mode=${mode} ` +
+  /* `mode` here used to be a bare identifier that no longer existed after the
+   * spec was factored into `specOfPatch`: the template threw, the throw
+   * aborted the function *before* renderNow(), and every preset in the library
+   * therefore loaded its numbers but never repainted. */
+  nativeLog(`[preset] open ${file || '-'} mode=${state.spec.mode} ` +
             `center=${state.center.re},${state.center.im} ` +
             `span=${state.span.m}*2^${state.span.e} rot=${(state.rotation || 0).toFixed(3)} ` +
             `glsl=${state.glsl ? 'yes' : 'no'} colors=${patch.colors ? patch.colors.length : 0} ` +
@@ -4011,12 +4067,16 @@ function applyRefPresetPatch(patch, file) {
     $('sel-scheme').value = state.scheme;
   } catch (_) { /* the palette may not be in the dropdown yet */ }
 
-  syncColorUi();
-  syncModeUi(); syncIterUi(); syncRotationUi();
+  /* Anything below can throw on a preset that carries a field the controls do
+   * not know about, and an exception here used to abort the function before
+   * `renderNow()` — the state changed, the picture did not, and it looked like
+   * the preset had failed to load.  The view must be drawn regardless. */
+  try { syncColorUi(); syncModeUi(); syncIterUi(); syncRotationUi(); }
+  catch (e) { console.error('[preset] ui', e); }
   /* A preset that carries keyframes starts paused: playing is a deliberate act,
    * and a view that starts moving on its own is not what "open a file" means. */
-  stopAnimation();
-  syncAnimationButton();
+  try { stopAnimation(); syncAnimationButton(); }
+  catch (e) { console.error('[preset] anim', e); }
   viewId++;
   renderNow();
   toast(patch.name || patch.schemeName || t('saved'));
@@ -5685,6 +5745,11 @@ function boot() {
   juliaView = initJuliaView({
     mainCanvas: canvas,
     getScheme: () => lastDraw,
+    /* The dock shades with its own fragment program, so all it needs from the
+     * main view is colour: the live palette, band spacing and phase. */
+    getPalette: () => state.palette,
+    getCycle: () => effectiveCycle(),
+    getOffset: () => state.offset || 0,
     screenToPlane,
     planeToScreen,
     getCenter: () => ({ re: state.center.re, im: state.center.im }),
