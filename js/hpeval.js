@@ -1,25 +1,25 @@
 /* ------------------------------------------------------------------
- * hpeval.js — 高精度（BigInt 定点）复数表达式求值器
+ * hpeval.js — high-precision (BigInt fixed-point) complex expression evaluator
  *
- * 用途：自定义公式在深度放大时，双精度已经完全无法表示坐标
- *      （10^-16 以下就开始量化），因此参考轨道必须在高精度下迭代。
- *      每个像素仍然用双精度扰动递推，只有「一条参考轨道」需要高精度。
+ * Purpose: at deep zoom, double precision can no longer represent the coordinates of a
+ *      custom formula (quantisation starts below 10^-16), so the reference orbit must be
+ *      iterated at high precision; every pixel still uses the double perturbation recurrence.
  *
- * 支持：+ - * / 整数次幂、sin cos tan sinh cosh tanh exp log sqrt
- *      abs abs2 norm arg conj re im、Σ Π、piecewise、比较、参数
+ * Supports: + - * / integer powers, sin cos tan sinh cosh tanh exp log sqrt
+ *      abs abs2 norm arg conj re im, Σ Π, piecewise, comparisons, parameters
  *
- * 实数超越函数用定点级数实现（参数归约 + 泰勒展开），
- * 复数按标准恒等式组合。arg / atan2 走双精度（仅影响 log 的相位）。
+ * Real transcendental functions use fixed-point series (argument reduction + Taylor) for real
+ * arguments and the standard identities for complex ones; arg / atan2 use double precision.
  * ----------------------------------------------------------------*/
 
 import { contextFor } from './bigfixed.js';
 
-/* ---------------- 常量 ---------------- */
+/* ---------------- Constants ---------------- */
 
 const PI_STR = '3.14159265358979323846264338327950288419716939937510582097494459230781640628620899862803482534211706798';
 const LN2_STR = '0.693147180559945309417232121458176568075500134360255254120680009493393621969694715605863326996418687';
 
-/* ---------------- 编译期上下文 ---------------- */
+/* ---------------- Compile-time context ---------------- */
 
 export function makeBigContext(bits) {
   const ctx = contextFor(bits);
@@ -30,19 +30,30 @@ export function makeBigContext(bits) {
     const q = (a << FB) / b;
     return q;
   };
+  /** Divide a fixed-point value by a small integer, rounded to nearest:
+   *  truncating each of ~100 series terms would accumulate up to 100 ulp. */
+  const divRound = (a, i) => {
+    const q = a / i;
+    const r = a - q * i;
+    if (r === 0n) return q;
+    const twice = (r < 0n ? -r : r) << 1n;
+    const ii = i < 0n ? -i : i;
+    if (twice < ii) return q;
+    return q + ((a < 0n) !== (i < 0n) ? -1n : 1n);
+  };
   const PI = ctx.fromString(PI_STR);
   const TWO_PI = PI << 1n;
   const HALF_PI = PI >> 1n;
   const LN2 = ctx.fromString(LN2_STR);
-  const EPS = 1n;                       // 最小可表示单位
+  const EPS = 1n;                       // Smallest representable unit
 
   function fromInt(k) { return BigInt(k) << FB; }
 
-  /* ---- 实数函数 ---- */
+  /* ---- Real functions ---- */
 
   function sqrt(a) {
     if (a <= 0n) return 0n;
-    // 双精度初值
+    // Double-precision initial guess
     const approx = Math.sqrt(ctx.toNumber(a));
     let x = ctx.fromNumber(approx > 0 ? approx : 1);
     if (x <= 0n) x = ONE;
@@ -55,17 +66,17 @@ export function makeBigContext(bits) {
   }
 
   function expReal(a) {
-    // 范围保护
+    // Range guard
     const lim = fromInt(700);
     if (a > lim) return ctx.MAXV();
     if (a < -lim) return 0n;
     // k = round(a / ln2)
     const k = Number((a * 2n + LN2) / (LN2 << 1n));
     let r = a - BigInt(k) * LN2;
-    // e^r 泰勒
+    // e^r Taylor series
     let sum = ONE, term = ONE;
     for (let i = 1; i < 64; i++) {
-      term = mul(term, r) / BigInt(i);
+      term = divRound(mul(term, r), BigInt(i));
       if (term === 0n) break;
       sum += term;
       if (term < 0n ? -term < EPS : term < EPS) break;
@@ -74,16 +85,16 @@ export function makeBigContext(bits) {
   }
 
   function sinCosReal(a) {
-    // 归约到 [-π, π]：k = round((a + π) / 2π)
+    // Reduce to [-π, π]: k = round((a + π) / 2π)
     let r = a;
     if (r > PI || r < -PI) {
-      let k = (r + PI) / TWO_PI;                 // BigInt 除法（截断）
-      if ((r + PI) - k * TWO_PI > PI) k += 1n;   // 四舍五入
+      let k = (r + PI) / TWO_PI;                 // BigInt division (truncates)
+      if ((r + PI) - k * TWO_PI > PI) k += 1n;   // round to nearest
       r = r - k * TWO_PI;
       if (r > PI) r -= TWO_PI;
       if (r < -PI) r += TWO_PI;
     }
-    // 归约到 [-π/2, π/2]：
+    // Reduce to [-π/2, π/2]:
     //   r ∈ (π/2, π]  ->  sin = sin(π-r),  cos = -cos(π-r)
     //   r ∈ [-π,-π/2) ->  sin = sin(-π-r), cos = -cos(-π-r)
     let cosSign = 1n;
@@ -91,18 +102,18 @@ export function makeBigContext(bits) {
     else if (r < -HALF_PI) { r = -PI - r; cosSign = -1n; }
 
     const s2 = mul(r, r);
-    // sin 泰勒
+    // sin Taylor series
     let s = r, term = r;
     for (let i = 1; i < 80; i++) {
-      term = -mul(term, s2) / BigInt((2 * i) * (2 * i + 1));
+      term = -divRound(mul(term, s2), BigInt((2 * i) * (2 * i + 1)));
       if (term === 0n) break;
       s += term;
       if ((term < 0n ? -term : term) < EPS) break;
     }
-    // cos 泰勒
+    // cos Taylor series
     let c = ONE, ct = ONE;
     for (let i = 1; i < 80; i++) {
-      ct = -mul(ct, s2) / BigInt((2 * i - 1) * (2 * i));
+      ct = -divRound(mul(ct, s2), BigInt((2 * i - 1) * (2 * i)));
       if (ct === 0n) break;
       c += ct;
       if ((ct < 0n ? -ct : ct) < EPS) break;
@@ -112,7 +123,7 @@ export function makeBigContext(bits) {
 
   function lnReal(a) {
     if (a <= 0n) return -ctx.MAXV();
-    // 归一化到 [1,2)
+    // Normalise to [1,2)
     let v = a, e = 0;
     while (v >= (2n << FB)) { v >>= 1n; e++; }
     while (v < ONE) { v <<= 1n; e--; }
@@ -123,7 +134,7 @@ export function makeBigContext(bits) {
     let term = t, sum = t;
     for (let i = 3; i < 200; i += 2) {
       term = mul(term, t2);
-      const add = term / BigInt(i);
+      const add = divRound(term, BigInt(i));
       if (add === 0n) break;
       sum += add;
       if ((add < 0n ? -add : add) < EPS) break;
@@ -131,49 +142,49 @@ export function makeBigContext(bits) {
     return (BigInt(e) << FB) * LN2 / ONE + (sum << 1n);
   }
 
-  /** 定点 atan（半角归约两次 + 泰勒） */
+  /** Fixed-point atan (two half-angle reductions + Taylor series) */
   function atanReal(x) {
     if (x === 0n) return 0n;
     const neg = x < 0n;
     let a = neg ? -x : x;
     let big = false;
     if (a > ONE) { a = div(ONE, a); big = true; }
-    // atan(a) = 2 atan(a / (1 + sqrt(1 + a^2)))，两次把 |a| 压到 ~0.2
+    // atan(a) = 2 atan(a / (1 + sqrt(1 + a^2))); two rounds bring |a| down to ~0.2
     a = div(a, ONE + sqrt(ONE + mul(a, a)));
     a = div(a, ONE + sqrt(ONE + mul(a, a)));
     const a2 = mul(a, a);
     let term = a, sum = a;
     for (let k = 1; k < 300; k++) {
       term = -mul(term, a2);
-      const add = term / BigInt(2 * k + 1);
+      const add = divRound(term, BigInt(2 * k + 1));
       if (add === 0n) break;
       sum += add;
       if ((add < 0n ? -add : add) < EPS) break;
     }
-    sum <<= 2n;                    // 两次归约 => ×4
+    sum <<= 2n;                    // two reductions => ×4
     if (big) sum = HALF_PI - sum;
     return neg ? -sum : sum;
   }
 
-  /** 定点 atan2 */
+  /** Fixed-point atan2 */
   function atan2(y, x) {
     if (x === 0n && y === 0n) return 0n;
     if (x > 0n) return atanReal(div(y, x));
     if (x < 0n) {
       const base = x === 0n ? 0n : atanReal(div(y, x));
-      // atan(y/x) 在第三/四象限，需要 ±π 修正
+      // atan(y/x) lies in the third/fourth quadrant, so ±π correction is required
       return y >= 0n ? base + PI : base - PI;
     }
     return y > 0n ? HALF_PI : -HALF_PI;
   }
 
-  /** 定点 sinh / cosh */
+  /** Fixed-point sinh / cosh */
   function sinhCosh(x) {
     const e = expReal(x), ei = expReal(-x);
     return [(e - ei) >> 1n, (e + ei) >> 1n];
   }
 
-  /* ---- 复数辅助 ---- */
+  /* ---- Complex helpers ---- */
   const ZERO = [0n, 0n];
   const ONE_C = [ONE, 0n];
 
@@ -184,6 +195,15 @@ export function makeBigContext(bits) {
   function cSub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
   function cAbs2(a) { return mul(a[0], a[0]) + mul(a[1], a[1]); }
   function cAbs(a) { return sqrt(cAbs2(a)); }
+
+  /** csqrHF (00447ea0): z^2 as (x^2-y^2, 2xy), one multiply for the part. */
+  function cSqr(a) {
+    const x2 = mul(a[0], a[0]), y2 = mul(a[1], a[1]);
+    return [x2 - y2, mul(a[0], a[1]) << 1n];
+  }
+
+  /** csqrlenHF (00447430): the fused pair the reference returns: |z|^2 and z^2. */
+  function cSqrLen(a) { return [cAbs2(a), cSqr(a)]; }
 
   function cDiv(a, b) {
     const d = cAbs2(b);
@@ -202,7 +222,7 @@ export function makeBigContext(bits) {
     if (a[0] === 0n && a[1] === 0n) return [-ctx.MAXV(), 0n];
     const mod = cAbs(a);
     const re = lnReal(mod);
-    // 相位用双精度（只影响非常规公式）
+    // Phase via double precision (only matters for unconventional formulas)
     return [re, atan2(a[1], a[0])];
   }
 
@@ -228,13 +248,13 @@ export function makeBigContext(bits) {
     while (n > 0) {
       if (n & 1) res = cMul(res, base);
       n >>= 1;
-      if (n) base = cMul(base, base);
+      if (n) base = cSqr(base);
     }
     return neg ? cDiv([ONE, 0n], res) : res;
   }
 
   function cPow(a, b) {
-    // a^b = exp(b log a)；b 为实数时优先用 exp(b*ln|a|) 保持对称
+    // a^b = exp(b log a); when b is real, prefer exp(b*ln|a|) to keep symmetry
     if (b[1] === 0n) {
       const k = ctx.toNumber(b[0]);
       if (Number.isInteger(k) && Math.abs(k) <= 32) return cPowInt(a, k);
@@ -245,11 +265,12 @@ export function makeBigContext(bits) {
   return {
     ctx, bits, FB, ONE, ZERO, ONE_C, PI, HALF_PI, LN2,
     mul, div, sqrt, expReal, sinCosReal, lnReal, atanReal, atan2, sinhCosh,
-    cMul, cAdd, cSub, cDiv, cAbs, cAbs2, cExp, cLog, cSqrt, cPow, cPowInt
+    cMul, cAdd, cSub, cDiv, cAbs, cAbs2, cSqr, cSqrLen,
+    cExp, cLog, cSqrt, cPow, cPowInt
   };
 }
 
-/* ---------------- AST -> 闭包 ---------------- */
+/* ---------------- AST -> closures ---------------- */
 
 const REAL_FUNCS = new Set(['floor', 'ceil', 'round', 'sign']);
 
@@ -370,7 +391,7 @@ export function compileBig(ast, options = {}) {
                 return r;
               };
             }
-            throw new Error('高精度求值不支持函数 ' + f);
+            throw new Error('high-precision evaluation does not support function ' + f);
           }
         }
       }
@@ -453,7 +474,7 @@ export function compileBig(ast, options = {}) {
   const fn = build(ast, new Map());
 
   /**
-   * 单步求值
+   * Evaluate one step
    * @param {object} st { z:[re,im], c:[re,im], n:number, zp:[re,im], P:[[re,im]...] }
    * @returns {[bigint, bigint]}
    */
@@ -462,6 +483,6 @@ export function compileBig(ast, options = {}) {
   };
 }
 
-/* ---------------- 便捷封装 ---------------- */
+/* ---------------- Convenience wrappers ---------------- */
 
 export function bigFromNumber(K, x) { return K.ctx.fromNumber(x); }

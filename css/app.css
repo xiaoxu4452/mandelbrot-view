@@ -1,6 +1,6 @@
 /* ==========================================================
-   MANDELBROT · 精密分形观测台
-   风格：Fluent / 科研工具，玻璃拟态但克制，无花哨渐变
+   MANDELBROT · precision fractal observatory
+   Style: Fluent / research instrument, glassmorphism kept restrained, no gaudy gradients
    ========================================================== */
 
 :root {
@@ -20,7 +20,12 @@
   --radius: 14px;
   --radius-sm: 8px;
   --shadow: 0 18px 50px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
-  --blur: blur(22px) saturate(150%);
+  --blur: blur(10px) saturate(125%);
+  /* glass dropdown (v4) */
+  --dd-bg: rgba(15, 17, 22, 0.86);
+  --dd-line: rgba(255, 255, 255, 0.13);
+  --dd-item: rgba(255, 255, 255, 0.062);
+  --dd-hi: rgba(255, 255, 255, 0.10);
   --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: "Cascadia Mono", "Consolas", "SF Mono", ui-monospace, monospace;
 }
@@ -39,6 +44,10 @@
   --accent: #2f6fdb;
   --accent-dim: rgba(47, 111, 219, 0.12);
   --shadow: 0 18px 44px rgba(20, 26, 40, 0.16), 0 2px 8px rgba(20, 26, 40, 0.08);
+  --dd-bg: rgba(250, 250, 252, 0.88);
+  --dd-line: rgba(14, 18, 26, 0.15);
+  --dd-item: rgba(14, 18, 26, 0.06);
+  --dd-hi: rgba(255, 255, 255, 0.92);
 }
 
 * { box-sizing: border-box; }
@@ -68,6 +77,34 @@ html, body {
 }
 #fractal.dragging { cursor: grabbing; }
 
+/* GPU shading surface.
+ *
+ * A real, visible layer stacked *under* #fractal.  Two properties matter and
+ * both were learned the hard way:
+ *
+ *  - It has to be composited, not hidden.  A canvas with `visibility: hidden`
+ *    (or `display: none`) is not guaranteed to keep its drawing buffer, and
+ *    reading it back — with drawImage or with readPixels — can return an empty
+ *    surface.  So it is always laid out and always painted.
+ *  - It must not swallow input.  #fractal stays on top and receives every
+ *    pointer event; the shader layer only opts out of hit-testing.
+ *
+ * `html.gl-surface` hides #fractal with `opacity`, not `display`: the element
+ * keeps its layout and its event listeners, so panning and zooming keep
+ * working while the GPU picture is the one on screen.
+ */
+#glfractal {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 0;
+  pointer-events: none;
+}
+#fractal { z-index: 1; }
+html.gl-surface #fractal { opacity: 0; }
+
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
 .glass {
@@ -78,15 +115,15 @@ html, body {
   box-shadow: var(--shadow);
 }
 
-/* ---------------- 顶栏 ---------------- */
+/* ---------------- Top bar ---------------- */
 .topbar {
   position: fixed;
   top: 0; left: 0; right: 0;
-  height: 54px;
+  height: 40.5px;                 /* 54px × 0.75 */
   display: flex;
   align-items: center;
-  gap: 18px;
-  padding: 0 14px;
+  gap: 13.5px;
+  padding: 0 10px;
   border-left: 0; border-right: 0; border-top: 0;
   border-bottom: 1px solid var(--line);
   border-radius: 0;
@@ -95,22 +132,23 @@ html, body {
   user-select: none;
 }
 
-.brand { display: flex; align-items: center; gap: 9px; padding-right: 6px; }
+.brand { display: flex; align-items: center; gap: 6.5px; padding-right: 4px; }
 .brand-mark { display: grid; place-items: center; color: var(--text-2); }
-.brand-name { font-weight: 600; letter-spacing: 0.14em; font-size: 12.5px; }
+.brand-mark svg { width: 14px; height: 14px; }
+.brand-name { font-weight: 600; letter-spacing: 0.11em; font-size: 10.5px; }
 .brand-sub {
-  font-size: 11px; color: var(--text-3); letter-spacing: 0.06em;
-  border-left: 1px solid var(--line-strong); padding-left: 10px; margin-left: 2px;
+  font-size: 9.5px; color: var(--text-3); letter-spacing: 0.05em;
+  border-left: 1px solid var(--line-strong); padding-left: 8px; margin-left: 1px;
 }
 
 .topnav { display: flex; align-items: center; gap: 2px; }
 
 .topbtn {
-  display: inline-flex; align-items: center; gap: 6px;
-  height: 32px; padding: 0 11px;
+  display: inline-flex; align-items: center; gap: 4.5px;
+  height: 24px; padding: 0 8px;
   background: transparent; color: var(--text-2);
-  border: 1px solid transparent; border-radius: var(--radius-sm);
-  font: inherit; font-size: 12.5px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 6px;
+  font: inherit; font-size: 11.5px; cursor: pointer;
   transition: background .12s, color .12s, border-color .12s;
 }
 .topbtn:hover { background: var(--glass-soft); color: var(--text); }
@@ -119,21 +157,22 @@ html, body {
 .topbtn .chev { opacity: .55; }
 
 .badge {
-  font: 500 10px/1 var(--mono);
-  padding: 3px 5px; border-radius: 5px;
+  font: 500 9px/1 var(--mono);
+  padding: 2px 4px; border-radius: 4px;
   background: var(--accent-dim); color: var(--accent);
   letter-spacing: .02em;
 }
 
 .top-spacer { flex: 1; }
-.top-right { display: flex; align-items: center; gap: 10px; }
+.top-right { display: flex; align-items: center; gap: 11px; }
+#chip-precision { margin-right: 3px; }
 
 .chip {
-  font: 500 11px/1 var(--mono);
+  font: 500 10px/1 var(--mono);
   color: var(--text-2);
-  padding: 7px 9px;
+  padding: 5px 7px;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 5px;
   background: var(--glass-soft);
   white-space: nowrap;
 }
@@ -148,47 +187,112 @@ html, body {
 }
 .iconbtn:hover { background: var(--glass-soft); color: var(--text); }
 .iconbtn.tiny { width: 24px; height: 24px; }
+/* top bar shrinks to 75%: keep its icons inside the new 40.5px band */
+.topbar .iconbtn { width: 24px; height: 24px; }
+.topbar .iconbtn.tiny { width: 18px; height: 18px; }
+#btn-console .ct-ico { width: 12px; height: 12px; }
 
-/* ---------------- 下拉 ---------------- */
+/* ---------------- Dropdowns (glass v4) ----------------
+   Rebuilt from scratch: a real frosted slab (blur + saturation over
+   the fractal), a top sheen, a hairline bevel, and hover rows with
+   an accent rail. The old flat panel is gone.
+   ------------------------------------------------------- */
 .menu-wrap { position: relative; }
 
 .dropdown {
-  position: absolute; top: calc(100% + 8px); left: 0;
-  min-width: 208px; padding: 6px;
-  border-radius: 11px;
+  position: absolute; top: calc(100% + 10px); left: 0;
+  min-width: 216px; padding: 8px;
+  border-radius: 16px;
   z-index: 60;
-  display: flex; flex-direction: column; gap: 2px;
-  animation: pop .14s ease-out;
+  display: flex; flex-direction: column; gap: 3px;
+  color: var(--text);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,.06) 0%, rgba(255,255,255,.012) 46%, rgba(255,255,255,.022) 100%),
+    var(--dd-bg);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  backdrop-filter: blur(14px) saturate(130%);
+  border: 1px solid var(--dd-line);
+  box-shadow:
+    0 28px 64px -20px rgba(0, 0, 0, .74),
+    0 10px 26px -12px rgba(0, 0, 0, .46),
+    inset 0 1px 0 var(--dd-hi),
+    inset 0 -1px 0 rgba(0, 0, 0, .22);
+  transform-origin: 50% 0;
+  animation: ddIn .17s cubic-bezier(.2, .72, .3, 1) both;
+  isolation: isolate;
 }
-.dropdown.right { left: auto; right: 0; min-width: 232px; }
-@keyframes pop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.dropdown.right { left: auto; right: 0; min-width: 244px; }
+
+/* soft light falling in from the top edge */
+.dropdown::before {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(120% 62% at 50% -18%, rgba(255, 255, 255, .14), transparent 68%);
+  opacity: .9;
+}
+[data-theme="light"] .dropdown::before { opacity: .55; }
+
+@keyframes ddIn {
+  from { opacity: 0; transform: translateY(-7px) scale(.972); }
+  to   { opacity: 1; transform: none; }
+}
 
 .dropdown > button {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
-  padding: 8px 10px; border: 0; border-radius: 7px;
+  position: relative;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 9px 12px;
+  border: 1px solid transparent; border-radius: 10px;
   background: transparent; color: var(--text); font: inherit; text-align: left; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, transform .12s ease;
 }
-.dropdown > button:hover { background: var(--glass-soft); }
+.dropdown > button::before {
+  content: "";
+  position: absolute; left: 3px; top: 50%;
+  width: 2px; height: 0; border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-dim);
+  transform: translateY(-50%);
+  transition: height .14s ease;
+}
+.dropdown > button:hover { background: var(--dd-item); border-color: var(--dd-line); }
+.dropdown > button:hover::before { height: 20px; }
+.dropdown > button:active { transform: scale(.99); }
 .dropdown > button b { font-weight: 500; font-size: 12.5px; }
-.dropdown > button small { color: var(--text-3); font-size: 10.5px; letter-spacing: .04em; }
+.dropdown > button small { color: var(--text-3); font-size: 10.5px; letter-spacing: .045em; }
 
-.dd-group { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; }
+.dd-group {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 7px 9px;
+}
 .dd-label { color: var(--text-2); font-size: 11.5px; }
-.dd-sep { height: 1px; background: var(--line); margin: 5px 4px; }
+.dd-sep {
+  height: 1px; margin: 6px 6px;
+  background: linear-gradient(90deg, transparent, var(--dd-line) 12%, var(--dd-line) 88%, transparent);
+}
 .dd-item {
-  padding: 8px 10px; border: 0; border-radius: 7px; background: transparent;
+  padding: 9px 12px; border: 1px solid transparent; border-radius: 10px; background: transparent;
   color: var(--text); font: inherit; text-align: left; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
 }
-.dd-item:hover { background: var(--glass-soft); }
+.dd-item:hover { background: var(--dd-item); border-color: var(--dd-line); }
 .dd-check {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px; border-radius: 7px; color: var(--text);
-  font-size: 12px; cursor: pointer;
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 12px; border: 1px solid transparent; border-radius: 10px;
+  color: var(--text); font-size: 12px; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
 }
-.dd-check:hover { background: var(--glass-soft); }
+.dd-check:hover { background: var(--dd-item); border-color: var(--dd-line); }
 .dd-check input { accent-color: var(--accent); }
+/* The label stays on one line; the select takes the remaining width instead of
+ * squeezing the text into a vertical stack (AA「原版 High res（4 采样）」). */
+.dd-check > span { flex: 0 0 auto; white-space: nowrap; }
+.dd-check > select { flex: 1 1 auto; min-width: 0; }
+/* Effective appdata\mandelbrot.json readout (see applyConfig). */
+.dd-note { padding: 2px 9px 6px; font-size: 10.5px; line-height: 1.45; opacity: .62; }
 
-/* ---------------- 分段控件 ---------------- */
+/* ---------------- Segmented control ---------------- */
 .segment {
   display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
   background: var(--glass-soft);
@@ -213,12 +317,12 @@ html, body {
 .segment.mini { width: 108px; }
 .segment.mini button { font-size: 11px; padding: 4px; }
 
-/* ---------------- 控制台 ---------------- */
+/* ---------------- Console ---------------- */
 .panel {
   position: fixed;
-  top: 72px; right: 18px;
+  top: 55px; right: 18px;
   width: 318px;
-  max-height: calc(100vh - 100px);
+  max-height: calc(100vh - 78px);
   border-radius: var(--radius);
   display: flex; flex-direction: column;
   z-index: 30;
@@ -292,6 +396,221 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
   opacity: .9;
 }
 
+/* ---------------- gradient editor ----------------
+ * Three full-width ramps stacked vertically, each showing one third of the
+ * palette.  Three bars of the same width = three times the ramp length and
+ * three times the pixels per unit of position, which is what makes a stop at
+ * 0.334 distinguishable from one at 0.333 with a mouse. */
+.grad-ed { margin: 3px 0 10px; }
+.grad-stack { display: flex; flex-direction: column; gap: 22px; }
+.grad-lane { position: relative; }
+.grad-bar {
+  position: relative; height: 17px; border-radius: 5px;
+  border: 1px solid var(--line); cursor: copy;
+  background-color: var(--glass-soft);
+  touch-action: none;
+}
+.grad-fill {
+  position: absolute; inset: 0; border-radius: 4px;
+  pointer-events: none;
+  /* The full ramp is painted three bars wide; each lane pans to its own third. */
+  background-repeat: no-repeat;
+  background-size: 300% 100%;
+}
+.grad-bar[data-zone="1"] .grad-fill { background-position: 0% 0; }
+.grad-bar[data-zone="2"] .grad-fill { background-position: 50% 0; }
+.grad-bar[data-zone="3"] .grad-fill { background-position: 100% 0; }
+.grad-lane-tag {
+  position: absolute; left: 6px; top: 50%; transform: translateY(-50%);
+  z-index: 2; pointer-events: none;
+  font-size: 9px; letter-spacing: .4px; font-weight: 600;
+  color: rgba(255,255,255,.82); text-shadow: 0 1px 3px rgba(0,0,0,.9);
+}
+.grad-handles { position: absolute; inset: 0; }
+/* Little house whose apex sits exactly on the ramp's lower edge — it never
+ * intrudes into the colour strip.  A rounded path dulls the roof tip, the two
+ * shoulders and the bottom corners; polygon() is the fallback for engines
+ * without clip-path: path(). */
+.grad-handle {
+  position: absolute; top: 100%; width: 10px; height: 15px;
+  margin-left: -5px;
+  clip-path: polygon(50% 0%, 100% 34%, 100% 100%, 0% 100%, 0% 34%);
+  clip-path: path("M 4.3 0.7 Q 5 -0.1 5.7 0.7 L 9.55 4.35 Q 10 4.8 10 5.4 L 10 13.7 Q 10 15 8.8 15 L 1.2 15 Q 0 15 0 13.7 L 0 5.4 Q 0 4.8 0.45 4.35 Z");
+  cursor: ew-resize;
+  transition: box-shadow .1s;
+}
+.grad-handle::after {
+  content: ''; position: absolute; inset: 0;
+  clip-path: polygon(50% 0%, 100% 34%, 100% 100%, 0% 100%, 0% 34%);
+  clip-path: path("M 4.3 0.7 Q 5 -0.1 5.7 0.7 L 9.55 4.35 Q 10 4.8 10 5.4 L 10 13.7 Q 10 15 8.8 15 L 1.2 15 Q 0 15 0 13.7 L 0 5.4 Q 0 4.8 0.45 4.35 Z");
+  box-shadow: inset 0 0 0 1px var(--text);
+}
+/* Selected handles are highlighted by the outline only: scaling them would
+ * lift the apex back into the ramp. */
+.grad-handle.sel { z-index: 3; }
+.grad-handle.sel::after { box-shadow: inset 0 0 0 1.8px var(--accent); }
+/* Extra breathing room below the last lane: its handles hang 15px past the
+ * ramp, so the colour/position buttons must clear them, not just the ramp. */
+.grad-row { display: flex; align-items: center; gap: 6px; margin-top: 28px; flex-wrap: wrap; }
+.grad-color {
+  width: 30px; height: 24px; padding: 0; border: 1px solid var(--line);
+  border-radius: 6px; background: transparent; cursor: pointer;
+}
+.grad-color::-webkit-color-swatch-wrapper { padding: 2px; }
+.grad-color::-webkit-color-swatch { border: none; border-radius: 4px; }
+.grad-row .ctl.num { width: 62px; }
+.btn.tiny { height: 24px; padding: 0 7px; font-size: 11px; flex: 1 1 auto; }
+.grad-row .btn.tiny { min-width: 0; }
+
+/* One control per row: a 2x4 grid put two sliders on every line, which made
+ * the value you were dragging hard to read and the labels easy to mis-click. */
+/* Official GLSL schemes: exactly nparam sliders, one row each, generated
+ * from the scheme's own JSON.  Kept visually separate from the tone stage so
+ * it is obvious these belong to the colour recipe, not to the view. */
+.scheme-params {
+  margin: 6px 0 10px; padding: 8px 10px 6px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--glass-soft);
+}
+.scheme-params[hidden] { display: none; }
+.scheme-title {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 8px; font-size: 11.5px; color: var(--text); margin-bottom: 4px;
+}
+.scheme-hint { font-size: 10px; color: var(--text-2); opacity: .8; }
+.scheme-params .row.tight { margin-bottom: 2px; gap: 8px; }
+.scheme-params .row.tight > label { width: 76px; font-size: 11.5px; }
+.scheme-params input[type="range"] { min-width: 0; flex: 1 1 auto; }
+.scheme-params .row.tight .val { width: 40px; font-size: 11px; }
+.scheme-view-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line);
+}
+.scheme-view-row .chk {
+  display: flex; align-items: center; gap: 4px; flex: 1 1 auto;
+  font-size: 10.5px; color: var(--text-2); cursor: pointer;
+}
+.scheme-view-row .chk input { margin: 0; }
+.scheme-view-row .btn { flex: 0 0 auto; }
+
+/* ---- official Julia preview window -------------------------------------
+ * The reference pins a 56x56 viewport top-right (004169c0.c:130-155).  Here
+ * it is the first block of the console and scrolls with everything else, so
+ * it belongs to the settings rather than floating over the picture.
+ * It is a real WebGL surface, not a screenshot of the main canvas: it has
+ * its own iteration field and shares only the shader and Params. */
+.julia-dock { padding-top: 10px; }
+.julia-dock[hidden] { display: none; }
+.julia-dock-head {
+  display: flex; align-items: center; gap: 6px; margin: 0 0 8px;
+  font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--text-3); user-select: none;
+}
+.julia-dock-title { color: var(--text-3); }
+.julia-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 6px var(--accent);
+}
+/* In focus mode the caption is the way back to the previous view. */
+.julia-back {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 8px 1px 5px; margin-left: -2px;
+  font-size: 10.5px; letter-spacing: .04em; text-transform: none;
+  border: 1px solid var(--accent); border-radius: 999px;
+  background: var(--accent-dim); color: var(--text); cursor: pointer;
+}
+.julia-back[hidden] { display: none; }
+.julia-back:hover { background: var(--accent); color: #05060a; }
+.julia-btn {
+  margin-left: auto; padding: 1px 7px; font-size: 10px;
+  letter-spacing: 0; text-transform: none;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: var(--glass-soft); color: var(--text-2); cursor: pointer;
+}
+.julia-btn:hover { color: var(--text); border-color: var(--accent); }
+/* The reference's small window is a plain rectangle in the picture, not a
+ * white card: the frame here is the panel's own line colour.  The fill follows
+ * the theme (`--bg`), not a fixed near-black: in the light theme a hardcoded
+ * #050609 left a black hole in the middle of the console while every other
+ * surface turned light. */
+.julia-frame {
+  width: 168px; height: 168px; margin: 0 auto; padding: 0;
+  box-sizing: border-box; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+  transition: width .12s, height .12s;
+}
+.julia-frame:hover { border-color: var(--accent); }
+.julia-dock.big .julia-frame { width: 100%; height: auto; aspect-ratio: 1; }
+#julia-canvas { display: block; width: 100%; height: 100%; cursor: zoom-in; }
+.julia-seed {
+  margin-top: 6px; font-size: 9.5px; color: var(--text-2); text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.julia-dock-ctl { margin-top: 9px; }
+.julia-dock-ctl .btnrow { gap: 6px; margin-bottom: 7px; }
+.julia-dock-ctl .btnrow .btn { flex: 1 1 0; height: 24px; font-size: 11px; }
+.julia-dock-ctl .btnrow .btn.on {
+  border-color: var(--accent); color: var(--text); background: var(--accent-dim);
+}
+.julia-dock-ctl .chk {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-2); margin-bottom: 6px; cursor: pointer;
+}
+.julia-dock-ctl .chk input { margin: 0; }
+.julia-dock-ctl .row.tight { gap: 6px; margin-bottom: 4px; }
+.julia-dock-ctl .row.tight > label { width: 40px; font-size: 11px; }
+.julia-dock-ctl .row.tight input[type="range"] { min-width: 0; flex: 1 1 auto; }
+.julia-dock-ctl .row.tight .val { width: 40px; font-size: 10px; }
+
+/* The pinned seed, marked in the Mandelbrot plane. */
+.julia-mark {
+  position: fixed; z-index: 8; width: 22px; height: 22px;
+  margin: -11px 0 0 -11px; pointer-events: none;
+}
+.julia-mark[hidden] { display: none; }
+.julia-mark i, .julia-mark b {
+  position: absolute; inset: 0; display: block;
+  border: 1px solid rgba(255,255,255,.85);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0,0,0,.55), inset 0 0 0 1px rgba(0,0,0,.45);
+}
+.julia-mark b {
+  inset: 9px; border-radius: 50%; background: rgba(255,255,255,.9);
+  box-shadow: 0 0 6px rgba(255,255,255,.9);
+}
+.julia-pick-hint {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  z-index: 45; padding: 7px 14px; border-radius: 999px;
+  font-size: 12px; color: var(--text);
+  background: var(--glass); border: 1px solid var(--accent);
+  box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+}
+.julia-pick-hint[hidden] { display: none; }
+body.julia-picking #fractal { cursor: crosshair; }
+
+.tone-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px;
+  margin-top: 4px; padding-top: 8px; border-top: 1px dashed var(--line);
+}
+.tone-grid .row.tight { margin-bottom: 2px; gap: 8px; }
+.tone-grid input[type="range"] { min-width: 0; flex: 1 1 auto; }
+.tone-grid .row.tight > label { width: 34px; font-size: 11.5px; }
+.tone-grid .row.tight .val { width: 40px; font-size: 11px; }
+.tone-grid .row.gain > label.gain-lab {
+  width: 34px; padding-left: 10px; font-family: var(--mono); font-weight: 700;
+  font-size: 11.5px;
+}
+.tone-grid .row.gain:nth-of-type(2) > label.gain-lab { color: #e8746f; }
+.tone-grid .row.gain:nth-of-type(3) > label.gain-lab { color: #79c98a; }
+.tone-grid .row.gain:nth-of-type(4) > label.gain-lab { color: #6ea8fe; }
+.tone-grid > .btn { grid-column: 1 / -1; margin-top: 2px; }
+
+/* Rows the active scheme cannot consume are shown dimmed and non-interactive
+ * rather than left as controls that do nothing. */
+.row.inert { opacity: 0.42; }
+#grad-ed.inert { opacity: 0.42; pointer-events: none; }
+
 .kv { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
 .kv > span { color: var(--text-2); font-size: 12px; flex: none; }
 .kv code {
@@ -342,7 +661,7 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
 .hud .dot { width: 2px; height: 2px; border-radius: 50%; background: currentColor; opacity: .6; flex: none; }
 .hud .mono { font-size: 10.5px; text-overflow: ellipsis; overflow: hidden; }
 
-/* ---------------- 弹窗 ---------------- */
+/* ---------------- Modals ---------------- */
 .modal-root { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; }
 .modal-scrim { position: absolute; inset: 0; background: rgba(4,5,7,.55); backdrop-filter: blur(3px); }
 [data-theme="light"] .modal-scrim { background: rgba(220,225,235,.55); }
@@ -374,7 +693,7 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
 }
 .modal-foot:empty { display: none; }
 
-/* 预设库 */
+/* Preset library */
 .preset-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
 .preset-toolbar .ctl { max-width: 300px; }
 .cats { display: flex; gap: 4px; }
@@ -408,7 +727,25 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
 .pcard .nm { font-size: 11.5px; line-height: 1.35; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pcard .tag { font: 500 9.5px/1 var(--mono); color: var(--text-3); letter-spacing: .05em; margin-top: 4px; display: block; }
 
-/* 公式编辑器 */
+/* user presets: same card, distinct delete affordance */
+.pcard-wrap { position: relative; }
+.pcard-wrap .pcard { width: 100%; display: block; }
+.pcard-del {
+  position: absolute; top: 6px; right: 6px;
+  width: 20px; height: 20px; padding: 0;
+  display: grid; place-items: center;
+  border: 1px solid var(--line-strong); border-radius: 50%;
+  background: rgba(10, 12, 16, .62);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  color: var(--text-2); font: 12px/1 var(--mono); cursor: pointer;
+  opacity: .55; transition: opacity .12s, color .12s, border-color .12s;
+}
+.pcard-wrap:hover .pcard-del, .pcard-del:focus-visible { opacity: 1; }
+.pcard-del:hover { color: var(--danger); border-color: rgba(242, 119, 122, .45); }
+.preset-count { margin-left: auto; color: var(--text-3); font-size: 11px; }
+.preset-empty { color: var(--text-3); font-size: 12px; padding: 20px 4px; }
+
+/* Formula editor */
 .formula-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 18px; }
 @media (max-width: 780px) { .formula-grid { grid-template-columns: 1fr; } }
 .expr-box {
@@ -454,7 +791,7 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
   border: 1px solid var(--line); background: #07080b; display: block;
 }
 
-/* 自定义预设 */
+/* Custom presets */
 .saved-list { display: flex; flex-direction: column; gap: 8px; }
 .saved-item {
   display: flex; align-items: center; gap: 12px;
@@ -467,7 +804,7 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
 .save-row { display: flex; gap: 8px; margin-bottom: 14px; }
 .save-row .ctl { max-width: 320px; }
 
-/* 关于 */
+/* About */
 .about-body { font-size: 12.5px; color: var(--text-2); line-height: 1.75; white-space: pre-line; }
 .about-stats { display: flex; gap: 22px; margin: 16px 0 4px; }
 .about-stats div { display: flex; flex-direction: column; gap: 2px; }
@@ -491,7 +828,7 @@ input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--ac
 }
 @keyframes toastIn { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
-/* 滚动条 */
+/* Scrollbars */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: rgba(140,150,165,.28); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(140,150,165,.45); background-clip: padding-box; }
@@ -588,7 +925,7 @@ body.panel-closed .panel { display: none; }
 .boot-note-actions { display: flex; gap: 8px; margin-top: 14px; }
 .boot-note-actions .btn { flex: 1; height: 32px; display: grid; place-items: center; text-decoration: none; }
 .boot-note-actions .btn.ghost { flex: none; padding: 0 12px; color: var(--text-2); }
-/* LaTeX 排版显示 */
+/* LaTeX typesetting display */
 .latex-view {
   margin: 2px 0 14px;
   padding: 12px 14px;
@@ -622,14 +959,53 @@ body.panel-closed .panel { display: none; }
 .latex-view .cases { font-size: 1.5em; vertical-align: middle; }
 .latex-view .cases-body { display: inline-flex; flex-direction: column; font-size: .9em; vertical-align: middle; }
 
-/* ---------------- 公式面板（Desmos 风格） ---------------- */
+/* ---------------- Formula panel (Desmos style) ---------------- */
 .modal.wide { width: min(1240px, calc(100vw - 40px)); }
 
 .fx-wrap {
   display: grid;
-  grid-template-columns: minmax(360px, 460px) 1fr;
+  /* Left column: expression, hints, parameter sliders.  Right column: the
+   * preview, deliberately narrower than the list and pinned to the dialog's
+   * right edge.  At `1fr` it grew to ~716px, whose 16:10 height (448px)
+   * exceeded the body's 422px — the branch caption sits at the bottom of the
+   * stage, so it was the first thing cut off.  The cap also follows the
+   * viewport height, so a short window shrinks the picture instead of
+   * cropping it. */
+  /* The picture is the working surface, so it takes the larger share; only the
+   * detail inset stays small.  The cap follows the viewport height, so a short
+   * window shrinks the picture instead of cropping its caption. */
+  --fx-pv: min(700px, calc((100vh - 330px) * 1.6));
+  grid-template-columns: minmax(300px, 420px) minmax(200px, var(--fx-pv));
   gap: 20px;
   align-items: start;
+  justify-content: space-between;
+}
+/* The preview is flush with the dialog's edge: the body's own 18px inset is
+ * cancelled here, and the picture keeps its rounded corners only on the side
+ * that touches the list. */
+.modal-body.fx-fit .fx-preview { margin-right: -18px; }
+
+/* The formula panel fills the dialog instead of scrolling as a whole: the
+ * expression box, hint and example chips stay put, and only the parameter
+ * sliders — the one part whose length depends on the formula — scroll, in the
+ * narrow left column.  Scrolling the whole dialog meant the preview drifted
+ * out of view exactly when you were adjusting a parameter to look at it. */
+.modal-body.fx-fit {
+  overflow: hidden; display: flex; flex-direction: column; min-height: 0;
+  padding-bottom: 4px;
+}
+.modal-body.fx-fit .fx-wrap { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.modal-body.fx-fit .fx-list { max-height: none; height: 100%; overflow: hidden; }
+.modal-body.fx-fit .fx-list > .fx-row,
+.modal-body.fx-fit .fx-list > .fx-hint,
+.modal-body.fx-fit .fx-list > .fx-examples { flex: 0 0 auto; }
+.modal-body.fx-fit #fx-params {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding-right: 6px;
+}
+.modal-body.fx-fit #fx-params::-webkit-scrollbar { width: 7px; }
+.modal-body.fx-fit #fx-params::-webkit-scrollbar-thumb {
+  background: var(--line-strong); border-radius: 4px;
 }
 @media (max-width: 900px) { .fx-wrap { grid-template-columns: 1fr; } }
 
@@ -665,8 +1041,11 @@ body.panel-closed .panel { display: none; }
 
 .fx-expr {
   width: 100%;
-  min-height: 52px;
-  resize: vertical;
+  height: 81px;            /* exactly 3 lines of 13.5px/1.55 + padding */
+  min-height: 81px;
+  max-height: 81px;
+  overflow-y: auto;
+  resize: none;
   padding: 8px 10px;
   background: rgba(0,0,0,.22);
   border: 1px solid var(--line);
@@ -679,6 +1058,12 @@ body.panel-closed .panel { display: none; }
 .fx-expr:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
 
 .fx-hint { font-size: 11px; color: var(--text-3); padding: 8px 4px 6px; line-height: 1.6; }
+.fx-deep {
+  font: 500 10.5px/1.6 var(--mono);
+  color: var(--text-3);
+  padding: 2px 4px 10px;
+}
+.fx-deep.warn { color: var(--warn, #d9a441); }
 
 .fx-param .fx-cell { display: flex; flex-direction: column; gap: 2px; }
 .fx-slider { display: flex; align-items: center; gap: 8px; }
@@ -697,29 +1082,108 @@ body.panel-closed .panel { display: none; }
 .fx-examples button:hover { color: var(--text); border-color: var(--line-strong); }
 
 .fx-preview { display: flex; flex-direction: column; gap: 8px; }
+.fx-stage { position: relative; }
 #formula-preview {
   width: 100%;
   aspect-ratio: 16 / 10;
-  border-radius: 12px;
+  /* Square on the right: this edge is the dialog's own border (see .fx-wrap). */
+  border-radius: 12px 0 0 12px;
   border: 1px solid var(--line);
-  background: #06070a;
+  border-right: 0;
+  background: var(--bg);
   display: block;
   image-rendering: auto;
 }
+.fx-insetbox {
+  /* A third of the old 12px inset: the detail window sits on the picture's
+   * corner rather than floating inside it. */
+  position: absolute; right: 4px; bottom: 4px; width: 31.5%;
+  border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden;
+  background: var(--bg); box-shadow: 0 10px 30px rgba(0,0,0,.65);
+}
+.fx-insetbox canvas { display: block; width: 100%; height: auto; }
+.fx-inset-cap {
+  position: absolute; left: 6px; bottom: 5px;
+  font: 500 10px/1 var(--mono); color: #fff;
+  background: rgba(0,0,0,.6); padding: 4px 6px; border-radius: 4px;
+}
+.fx-marker {
+  position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px;
+  border: 1.5px solid #fff; border-radius: 50%;
+  box-shadow: 0 0 0 1px #000, 0 0 8px rgba(255,255,255,.8);
+  pointer-events: none;
+}
+.fx-zoomrow {
+  display: flex; align-items: center; gap: 8px;
+  font: 500 11px/1 var(--mono); color: var(--text-3);
+}
+.fx-branch-btn { position: absolute; right: 10px; top: 10px; z-index: 3; }
+.fx-branch-info {
+  position: absolute; left: 12px; bottom: 10px; z-index: 3;
+  font: 500 10px/1.2 var(--mono); color: #cfd3dc;
+  background: rgba(0,0,0,.5); padding: 5px 7px; border-radius: 4px;
+  max-width: 58%; pointer-events: none;
+}
 .fx-meta { font: 500 11px/1.5 var(--mono); color: var(--text-3); min-height: 18px; }
+.fx-expr.bad { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger) inset; }
 .fx-meta.ok { color: var(--text-2); }
 .fx-meta.err { color: var(--danger); }
 
 /* ==========================================================
-   启动加载层
+   Palette editor (user colour sets)
+   ========================================================== */
+.pal-edit { display: flex; flex-direction: column; gap: 10px; }
+
+.pal-preview {
+  position: relative; height: 34px; border-radius: 8px;
+  border: 1px solid var(--line);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .18);
+  /* Room for the stop handles, which hang below the ramp without intruding. */
+  margin-bottom: 18px;
+  touch-action: none;
+}
+
+.pal-stops {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 42vh; overflow-y: auto; padding-right: 4px;
+}
+
+.pal-stop {
+  display: grid;
+  grid-template-columns: 22px 34px 1fr 24px;
+  align-items: center; gap: 10px;
+  padding: 5px 8px;
+  background: var(--glass-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.pal-stop:hover { border-color: var(--line-strong); }
+.pal-idx { font-size: 10px; color: var(--text-3); text-align: right; }
+.pal-hex { font-size: 11px; color: var(--text-2); letter-spacing: .2px; }
+
+.pal-stop input[type="color"] {
+  width: 34px; height: 24px; padding: 0;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.pal-stop input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
+.pal-stop input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
+
+.btn.danger { color: var(--danger); border-color: rgba(242, 119, 122, .35); }
+.btn.danger:hover { background: rgba(242, 119, 122, .12); }
+
+/* ==========================================================
+   Boot splash
    ========================================================== */
 .boot {
   position: fixed; inset: 0; z-index: 900;
   display: grid; place-items: center;
   background:
     radial-gradient(60% 55% at 50% 45%, rgba(12, 14, 18, 0.55), rgba(6, 7, 10, 0.86) 78%);
-  backdrop-filter: blur(26px) saturate(115%);
-  -webkit-backdrop-filter: blur(26px) saturate(115%);
+  backdrop-filter: blur(12px) saturate(125%);
+  -webkit-backdrop-filter: blur(12px) saturate(125%);
   transition: opacity .55s cubic-bezier(.4, 0, .2, 1), visibility .55s;
 }
 [data-theme="light"] .boot {
@@ -727,7 +1191,7 @@ body.panel-closed .panel { display: none; }
 }
 .boot.hide { opacity: 0; visibility: hidden; pointer-events: none; }
 
-/* 主界面在加载时也做一层高斯模糊 */
+/* The main UI is blurred while the splash is up */
 body.booting #fractal,
 body.booting .topbar,
 body.booting .panel,
@@ -760,7 +1224,7 @@ body.booting .hud {
   color: var(--text-3);
 }
 
-/* 细渐变进度条 */
+/* Thin gradient progress bar */
 .boot-bar {
   position: relative;
   margin-top: 30px;
@@ -777,7 +1241,7 @@ body.booting .hud {
   box-shadow: 0 0 10px rgba(110, 168, 254, .55);
   transition: width .38s cubic-bezier(.3, .8, .3, 1);
 }
-/* 滑动光效 */
+/* Sweeping highlight */
 .boot-fill::after {
   content: '';
   position: absolute; top: 0; bottom: 0; right: 0;
@@ -893,7 +1357,6 @@ body.booting .hud {
   @keyframes sheetIn { from { transform: translateY(16px); opacity: 0; } to { transform: none; opacity: 1; } }
   body.panel-open .hud { opacity: 0; transform: translateY(6px); pointer-events: none; }
 
-  #btn-panel-reset { display: none; }
   #btn-console .ct-lbl { display: none; }
   #btn-console { width: 34px; padding: 0; justify-content: center; }
 
@@ -967,3 +1430,172 @@ body.booting .hud {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* ---- Parameter sliders (Desmos style) ---- */
+#grp-params h4 { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.prm { margin-bottom: 10px; }
+.prm:last-child { margin-bottom: 2px; }
+.prm-top { display: flex; align-items: center; gap: 8px; }
+.prm-name { width: 18px; text-align: center; font-size: 13px; }
+.prm-name i { font-style: italic; font-weight: 600; }
+.prm-val { width: 76px; margin-left: auto; text-align: right; }
+.prm-gear { flex: 0 0 auto; opacity: .6; }
+.prm-gear:hover { opacity: 1; }
+.prm-slider { width: 100%; margin: 6px 0 0; }
+.prm-range { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 6px; }
+.prm-range label { display: flex; flex-direction: column; gap: 3px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); }
+.prm-range input { width: 100%; }
+
+/* ---- desktop-only: self-drawn frosted <select> (kept with the native controller) ---- */
+/* ==========================================================
+   Self-drawn glass select
+   Native <select> pop-ups are OS-drawn and cannot be frosted, so the
+   native control is kept only as the data model (hidden, 1px) and every
+   visible part is drawn here: a frosted trigger plus a portal pop-up with
+   blur, translucency, rounded corners, fade-in, hover/keyboard highlight
+   and both light/dark palettes.
+   ========================================================== */
+.gsel {
+  position: relative;
+  flex: 1 1 auto; min-width: 0;
+  display: flex;
+}
+.gsel-native {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  opacity: 0; pointer-events: none;
+  border: 0; padding: 0;
+}
+.gsel-btn {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; height: 28px;
+  padding: 0 7px 0 10px;
+  background: var(--glass-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text); font: inherit; font-size: 12px;
+  text-align: left; cursor: pointer;
+  transition: background .12s, border-color .12s, box-shadow .12s;
+}
+.gsel-btn:hover { border-color: var(--line-strong); }
+.gsel-btn.open,
+.gsel-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.gsel-label {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gsel-chev {
+  flex: none; opacity: .55;
+  transition: transform .18s cubic-bezier(.2,.72,.3,1);
+}
+.gsel-btn.open .gsel-chev { transform: rotate(180deg); }
+
+.gsel-pop {
+  position: fixed; z-index: 95;
+  max-height: 300px; overflow-y: auto;
+  padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  border-radius: 13px;
+  color: var(--text);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,.06) 0%, rgba(255,255,255,.012) 46%, rgba(255,255,255,.022) 100%),
+    var(--dd-bg);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  backdrop-filter: blur(14px) saturate(130%);
+  border: 1px solid var(--dd-line);
+  box-shadow:
+    0 28px 64px -20px rgba(0, 0, 0, .74),
+    0 10px 26px -12px rgba(0, 0, 0, .46),
+    inset 0 1px 0 var(--dd-hi),
+    inset 0 -1px 0 rgba(0, 0, 0, .22);
+  transform-origin: 50% 0;
+  animation: gselIn .16s cubic-bezier(.2,.72,.3,1) both;
+  overscroll-behavior: contain;
+}
+.gsel-pop[hidden] { display: none !important; }
+@keyframes gselIn {
+  from { opacity: 0; transform: translateY(-6px) scale(.98); }
+  to   { opacity: 1; transform: none; }
+}
+.gsel-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid transparent; border-radius: 8px;
+  background: transparent; color: var(--text);
+  font: inherit; font-size: 12px; text-align: left; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background .1s ease, border-color .1s ease, color .1s ease;
+}
+.gsel-item.active,
+.gsel-item:hover { background: var(--dd-item); border-color: var(--dd-line); }
+.gsel-item.on { color: var(--accent); }
+.gsel-item.on::after {
+  content: ""; flex: none;
+  width: 5px; height: 5px; margin-left: auto;
+  border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-dim);
+}
+.gsel-group {
+  padding: 7px 10px 4px;
+  font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--text-3);
+  user-select: none;
+}
+@media (max-width: 900px) { .gsel-btn { height: 32px; font-size: 13px; } }
+
+/* ------------------------------------------------------------------
+ * Native surface mode.
+ *
+ * The product image is presented by a D3D child window that sits UNDER the
+ * WebView2, so the page has to be see-through: an opaque html/body (or the
+ * 2D canvas, which is created with alpha:false) would hide every frame that
+ * the shell commits.  `app.js` adds this class only after a pass has actually
+ * been committed to the swapchain, and removes it whenever a pass takes the
+ * JS fallback path (custom formulas), so the screen always shows the most
+ * recent surface.
+ * ---------------------------------------------------------------- */
+html.native-surface,
+html.native-surface body { background: transparent; }
+html.native-surface #fractal { opacity: 0; }
+
+/* ------------------------------------------------------------------
+ * Presets panel: library toolbar, colour footer.
+ *
+ * The colour block is a footer of the panel rather than another modal: the
+ * point of the sliders is to watch the picture change, so they have to stay on
+ * screen while the user drags them, and the modal's scrim is cleared for the
+ * same reason (see .previewing below).
+ * ---------------------------------------------------------------- */
+.modal-root.previewing .modal-scrim,
+#modal-root.previewing .modal-scrim { background: rgba(4, 5, 7, .16); backdrop-filter: none; }
+
+.preset-grow { flex: 1 1 auto; }
+.preset-toolbar .btn.tiny { flex: 0 0 auto; }
+.pcard.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+
+.pce {
+  position: sticky; bottom: -14px; z-index: 3;
+  margin: 14px -18px -14px; padding: 10px 18px 12px;
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--glass-strong, rgba(16,18,24,.92)) 92%, transparent);
+  backdrop-filter: blur(14px);
+}
+.pce-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.pce-title { font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--text-3); }
+.pce-hint { font: 500 10.5px/1 var(--mono); color: var(--text-3); }
+.pce-head .btn.tiny { flex: 0 0 auto; }
+
+/* Three lanes, but flatter than the console's: the panel is about the picture. */
+.pce-stack { gap: 14px; }
+.pce-stack .grad-bar { height: 14px; }
+.pce-stack .grad-lane-tag { font-size: 8.5px; }
+
+.pce-rgb { display: flex; gap: 14px; margin-top: 22px; flex-wrap: wrap; }
+.pce-slide { flex: 1 1 150px; display: flex; align-items: center; gap: 8px; min-width: 130px; }
+.pce-ch { font: 600 10px/1 var(--mono); color: var(--text-3); width: 8px; }
+.pce-slide input[type="range"] { flex: 1 1 auto; min-width: 40px; accent-color: var(--accent); }
+.pce-slide b { font: 500 10.5px/1 var(--mono); color: var(--text-2); width: 26px; text-align: right; }

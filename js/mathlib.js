@@ -1,18 +1,18 @@
 /* ------------------------------------------------------------------
- * mathlib.js — 复数表达式数学库
+ * mathlib.js — complex-expression math library
  *
- * 设计参考 Desmos / mathjs / math.js 的表达式前端，为分形迭代做了专门优化：
- *   1. 词法 + Pratt 优先级解析（含隐式乘法、右结合幂、后缀阶乘）
- *   2. 语义分析：变量/函数/元数检查，带位置的错误信息
- *   3. 公共子表达式消除（CSE）+ 临时变量代码生成 -> 单次遍历的 JS 闭包
- *   4. 内置复数函数库（分支切割、稳定 hypot、log1p 近似等）
- *   5. 求和 Σ / 连乘 Π / 分段 piecewise / 用户自定义函数 f(x)=…
- *   6. LaTeX 序列化，用于公式窗口的科学排版
+ * The expression front end follows Desmos / mathjs / math.js, specialised for fractal iteration:
+ *   1. Lexer + Pratt precedence parser (implicit multiplication, right-associative powers, postfix factorial)
+ *   2. Semantic analysis: variable/function/arity checks, with position-aware error messages
+ *   3. Common-subexpression elimination (CSE) + temporary-variable codegen -> a JS closure evaluated in one pass
+ *   4. Built-in complex function library (branch cuts, stable hypot, log1p approximations, …)
+ *   5. Summation Σ / product Π / piecewise / user-defined functions f(x)=…
+ *   6. LaTeX serialisation, for scientific typesetting in the formula panel
  *
- * 变量：z 当前值，c 常数项，n 迭代序号，z_1 上一轮值；其余单字母均为参数（自动生成滑块）
+ * Variables: z current value, c constant term, n iteration index, z_1 previous value; any other single letter is a parameter (a slider is generated automatically)
  * ----------------------------------------------------------------*/
 
-/* ============ 1. 词法 ============ */
+/* ============ 1. Lexer ============ */
 
 const OPS3 = ['<=', '>=', '==', '!='];
 const OPS1 = '+-*/^!(),<>=';
@@ -24,7 +24,7 @@ export function tokenize(src) {
   while (i < n) {
     const ch = src[i];
     if (/\s/.test(ch)) { i++; continue; }
-    if (ch === '#' || (ch === '/' && src[i + 1] === '/')) { // 注释
+    if (ch === '#' || (ch === '/' && src[i + 1] === '/')) { // comment
       while (i < n && src[i] !== '\n') i++;
       continue;
     }
@@ -41,7 +41,7 @@ export function tokenize(src) {
       }
       const text = src.slice(i, j);
       const v = Number(text);
-      if (!isFinite(v)) throw err(`数字无法解析：${text}`, i);
+      if (!isFinite(v)) throw err(`cannot parse number: ${text}`, i);
       out.push({ t: 'num', v, p: i, text });
       i = j;
       continue;
@@ -49,7 +49,7 @@ export function tokenize(src) {
     if (/[A-Za-z\u03b1-\u03c9\u0391-\u03a9]/.test(ch)) {
       let j = i;
       while (j < n && /[A-Za-z0-9\u03b1-\u03c9\u0391-\u03a9]/.test(src[j])) j++;
-      // 下标：z_1、f_2
+      // Subscripts: z_1, f_2
       if (src[j] === '_') {
         let k = j + 1;
         if (src[k] === '{') {
@@ -74,7 +74,7 @@ export function tokenize(src) {
     }
     if (matched) continue;
     if (OPS1.includes(ch)) { out.push({ t: ch, p: i }); i++; continue; }
-    throw err(`无法识别的字符 “${ch}”`, i);
+    throw err(`unrecognised character “${ch}”`, i);
   }
   out.push({ t: 'eof', p: n });
   return out;
@@ -86,7 +86,7 @@ function err(msg, pos) {
   return e;
 }
 
-/* ============ 2. 语法（Pratt） ============ */
+/* ============ 2. Parser (Pratt) ============ */
 
 const CONST = {
   pi: Math.PI, 'π': Math.PI, tau: 2 * Math.PI, e: Math.E,
@@ -110,7 +110,7 @@ export function parse(src, options = {}) {
   const peek = () => toks[p];
   const next = () => toks[p++];
   const expect = (t, what) => {
-    if (peek().t !== t) throw err(`此处应为 ${what}`, peek().p);
+    if (peek().t !== t) throw err(`expected ${what} here`, peek().p);
     return next();
   };
 
@@ -151,7 +151,7 @@ export function parse(src, options = {}) {
       if (t === '*') { next(); left = { k: 'bin', op: '*', a: left, b: parseUnary() }; }
       else if (t === '/') { next(); left = { k: 'bin', op: '/', a: left, b: parseUnary() }; }
       else if (startsPrimary(t)) {
-        // 隐式乘法：2z、3(z+1)、(z)(c)、z sin(z)
+        // Implicit multiplication: 2z, 3(z+1), (z)(c), z sin(z)
         left = { k: 'bin', op: '*', a: left, b: parseUnary(), implicit: true };
       } else break;
     }
@@ -168,7 +168,7 @@ export function parse(src, options = {}) {
     const base = parsePostfix();
     if (peek().t === '^') {
       next();
-      return { k: 'pow', a: base, b: parseUnary() }; // 右结合
+      return { k: 'pow', a: base, b: parseUnary() }; // right-associative
     }
     return base;
   }
@@ -188,14 +188,14 @@ export function parse(src, options = {}) {
       args.push(parseExpr());
       while (peek().t === ',') { next(); args.push(parseExpr()); }
     }
-    expect(')', '右括号 )');
+    expect(')', 'closing parenthesis )');
     return args;
   }
 
   function parsePrimary() {
     const tk = peek();
     if (tk.t === 'num') { next(); return { k: 'num', v: tk.v }; }
-    if (tk.t === '(') { next(); const e = parseExpr(); expect(')', '右括号 )'); return e; }
+    if (tk.t === '(') { next(); const e = parseExpr(); expect(')', 'closing parenthesis )'); return e; }
     if (tk.t === 'id') {
       next();
       const name = tk.v;
@@ -203,19 +203,19 @@ export function parse(src, options = {}) {
         name === 'sum' || name === 'prod' || name === 'piecewise';
       if (peek().t === '(' && callable) {
         next();
-        // Σ / Π：sum(k, a, b, body)
+        // Σ / Π: sum(k, a, b, body)
         if (name === 'sum' || name === 'prod') {
           const idxTok = next();
-          if (idxTok.t !== 'id') throw err(`${name} 的第一个参数必须是索引变量`, idxTok.p);
-          expect(',', '逗号');
+          if (idxTok.t !== 'id') throw err(`${name}: the first argument must be an index variable`, idxTok.p);
+          expect(',', 'comma');
           const from = parseExpr();
-          expect(',', '逗号');
+          expect(',', 'comma');
           const to = parseExpr();
-          expect(',', '逗号');
+          expect(',', 'comma');
           loopVars.add(idxTok.v);
           const body = parseExpr();
           loopVars.delete(idxTok.v);
-          expect(')', '右括号 )');
+          expect(')', 'closing parenthesis )');
           return { k: name, v: idxTok.v, from, to, body };
         }
         if (name === 'piecewise') {
@@ -231,18 +231,18 @@ export function parse(src, options = {}) {
       if (VARIABLES.includes(name) || loopVars.has(name)) return { k: 'var', name };
       if (/^[A-Za-z]$/.test(name)) { params.add(name); return { k: 'var', name, param: true }; }
       if (userFns[name]) {
-        // 零元用户函数
+        // Zero-argument user function
         return expandUser(userFns[name], []);
       }
-      throw err(`未知标识符 “${name}”（可用：${VARIABLES.join(' ')}）`, tk.p);
+      throw err(`unknown identifier “${name}” (available: ${VARIABLES.join(' ')})`, tk.p);
     }
-    throw err('表达式不完整', tk.p);
+    throw err('incomplete expression', tk.p);
   }
 
-  // 用户函数展开（宏替换）
+  // User-function expansion (macro substitution)
   function expandUser(def, argNodes) {
     if (argNodes.length !== def.params.length) {
-      throw err(`函数 ${def.name} 需要 ${def.params.length} 个参数`, 0);
+      throw err(`function ${def.name} expects ${def.params.length} argument(s)`, 0);
     }
     const map = {};
     def.params.forEach((pn, i) => { map[pn] = argNodes[i]; });
@@ -250,7 +250,7 @@ export function parse(src, options = {}) {
   }
 
   const ast = parseExpr();
-  if (peek().t !== 'eof') throw err('多余的内容', peek().p);
+  if (peek().t !== 'eof') throw err('trailing content', peek().p);
   ast.params = [...params];
   return ast;
 }
@@ -266,7 +266,7 @@ function subst(node, map) {
   return out;
 }
 
-/* ============ 3. 代码生成（CSE + 临时变量） ============ */
+/* ============ 3. Code generation (CSE + temporaries) ============ */
 
 const REAL_FUNCS = new Set(['abs', 'arg', 're', 'im', 'floor', 'ceil', 'round', 'sign', 'fact']);
 
@@ -332,7 +332,7 @@ export function generate(ast, opts = {}) {
       }
       case 'cmp': {
         const a = emit(node.a), b = emit(node.b);
-        // 用实部比较（虚部不参与），返回 1/0
+        // Compare real parts only (the imaginary part is ignored); returns 1/0
         res = { r: `((${a.r}) ${cmp(node.op)} (${b.r}) ? 1 : 0)`, i: '0' };
         break;
       }
@@ -354,7 +354,7 @@ export function generate(ast, opts = {}) {
       case 'call': res = emitCall(node); break;
       case 'sum': case 'prod': res = emitLoop(node); break;
       case 'piecewise': res = emitPiecewise(node); break;
-      default: throw new Error('未知节点 ' + node.k);
+      default: throw new Error('unknown node ' + node.k);
     }
     cache.set(k, res);
     return res;
@@ -377,7 +377,7 @@ export function generate(ast, opts = {}) {
       }
       return cur;
     }
-    // 一般复数幂 exp(w·log z)
+    // General complex power exp(w·log z)
     const b = emit(node.b);
     const n = T();
     lines.push(`const ${n}mag = Math.hypot(${a.r}, ${a.i}) || 1e-300;`);
@@ -452,7 +452,7 @@ export function generate(ast, opts = {}) {
       lines.push(`const ${n}d = ${c.r} * ${c.r} + ${c.i} * ${c.i} || 1e-300;`);
       return { r: `((${s.r} * ${c.r} + ${s.i} * ${c.i}) / ${n}d)`, i: `((${s.i} * ${c.r} - ${s.r} * ${c.i}) / ${n}d)` };
     }
-    throw new Error('未实现的函数 ' + name);
+    throw new Error('unimplemented function ' + name);
   }
 
   function emitLoop(node) {
@@ -509,7 +509,7 @@ export function generate(ast, opts = {}) {
   // eslint-disable-next-line no-new-func
   const fn = new Function('zr', 'zi', 'cr', 'ci', 'P', 'NI', 'S', 'OUT', src);
 
-  // ---- 整段迭代版本：把 for 循环一起生成，JIT 可把状态放进寄存器 ----
+  // ---- Whole-loop variant: the for loop is generated too, so the JIT can keep state in registers ----
   const loopSrc = [
     '"use strict";',
     'let zr = zr0, zi = zi0, n = 0, m2 = 0;',
@@ -523,7 +523,7 @@ export function generate(ast, opts = {}) {
     '  if (n === 12) { S.cr = zr; S.ci = zi; S.on = 1; }',
     '  else if (S.on && ((n & 31) === 0)) {',
     '    const dx = zr - S.cr, dy = zi - S.ci;',
-    '    if (dx * dx + dy * dy < 1e-26) { n = maxIter; m2 = -1; break; }',
+    '    if (dx * dx + dy * dy < 1e-30) { n = maxIter; m2 = -1; break; }',
     '  }',
     '}',
     'OUT[0] = n; OUT[1] = m2;'
@@ -538,7 +538,7 @@ function numLit(v) {
   return v.toPrecision(17);
 }
 
-/* ============ 4. LaTeX 序列化 ============ */
+/* ============ 4. LaTeX serialisation ============ */
 
 const LATEX_FUNC = {
   abs: ['\\left|', '\\right|', 1], arg: ['\\arg', '', 1], re: ['\\operatorname{Re}', '', 1],
@@ -599,47 +599,95 @@ function fmtNum(v) {
   return s;
 }
 
-/* ============ 5. 对外 API ============ */
+/* ============ 5. Public API ============ */
 
 /**
- * 编译多行公式：前面若干行可定义 f(x)=…，最后一行是迭代式
+ * Compile a multi-line formula: the leading lines may define f(x)=…, the last line is the iteration
  * @returns {{ok:boolean, fn?:Function, latex?:string, error?:string, src?:string, defs:number}}
  */
+/* Complexity budget for one iteration formula.
+ *
+ * The expression is expanded (user functions are macro-substituted) and inlined
+ * into a single JS closure that runs per pixel, per iteration, so a formula
+ * with N nodes costs N flops times pixels times iterations.  z^2+c is 4 nodes;
+ * a hand-written "artistic" formula is 50–150.  Past a few hundred the picture
+ * stops being a fractal and becomes a way to lock the renderer up, so the
+ * compiler refuses it with an explanation instead of freezing the window. */
+const kMaxNodes = 600;
+const kMaxDepth = 48;
+
+function measureAst(node) {
+  let nodes = 0, depth = 0;
+  const walk = (n, d) => {
+    if (!n || d > 256) return;
+    nodes++;
+    if (d > depth) depth = d;
+    for (const k of Object.keys(n)) {
+      const v = n[k];
+      if (Array.isArray(v)) { for (const c of v) if (c && c.k) walk(c, d + 1); }
+      else if (v && v.k) walk(v, d + 1);
+    }
+  };
+  walk(node, 1);
+  return { nodes, depth };
+}
+
 export function compile(source) {
-  const lines = String(source || '')
-    .split('\n')
-    .map(s => s.trim())
-    .filter(s => s && !s.startsWith('#') && !s.startsWith('//'));
+  /* Keep the original line number with each line: an error message that only
+   * says "column 7" is useless in a multi-line formula, and silently throwing
+   * away the position would turn a real syntax error into a flat colour. */
+  const raw = String(source || '').split('\n');
+  const lines = [];
+  raw.forEach((s, i) => {
+    const txt = s.trim();
+    if (txt && !txt.startsWith('#') && !txt.startsWith('//')) lines.push({ txt, no: i + 1 });
+  });
 
   const userFns = {};
   let main = null;
   let defs = 0;
 
-  for (const line of lines) {
-    const m = /^([A-Za-z]\w*)\s*\(\s*([A-Za-z]\w*)\s*\)\s*=\s*(.+)$/.exec(line);
+  /** Re-throw a parse error with the source line it came from. */
+  const at = (e, no) => { if (e && e.pos != null && e.line == null) e.line = no; return e; };
+
+  for (const { txt, no } of lines) {
+    const m = /^([A-Za-z]\w*)\s*\(\s*([A-Za-z]\w*)\s*\)\s*=\s*(.+)$/.exec(txt);
     if (m && !['sum', 'prod', 'piecewise'].includes(m[1])) {
       const [, name, param, bodySrc] = m;
-      const body = parse(bodySrc, { functions: userFns });
+      let body;
+      try { body = parse(bodySrc, { functions: userFns }); } catch (e) { throw at(e, no); }
       userFns[name] = { name, params: [param], body };
       defs++;
       continue;
     }
     if (main !== null) {
-      throw err('只能有一行迭代公式（其余行需写成 f(x)=…）', 0);
+      throw err('only one iteration formula is allowed (other lines must be written as f(x)=…)', 0);
     }
-    main = line;
+    main = { txt, no };
   }
-  if (main === null) throw err('缺少迭代公式', 0);
+  if (main === null) throw err('missing iteration formula', 0);
 
-  const ast = parse(main, { functions: userFns });
+  let ast;
+  try { ast = parse(main.txt, { functions: userFns }); } catch (e) { throw at(e, main.no); }
+  /* A formula is expanded and inlined into one JS function, so its cost is
+   * paid per pixel per iteration.  An expression of a few hundred nodes is
+   * already 20x the work of z^2 + c; one with thousands is not a fractal any
+   * more, it is a way to hang the renderer for minutes with no warning.  Refuse
+   * it up front, with a message the formula dialog can show. */
+  const budget = measureAst(ast);
+  if (budget.nodes > kMaxNodes) {
+    throw err(`formula too complex: ${budget.nodes} operations (limit ${kMaxNodes}) — simplify it, or split it with f(x)=… helpers`, 0);
+  }
+  if (budget.depth > kMaxDepth) {
+    throw err(`formula nested too deeply (${budget.depth} levels, limit ${kMaxDepth}) — flatten the nesting`, 0);
+  }
   const params = (ast.params || []).filter(n => !VARIABLES.includes(n));
   const allParams = (ast.params || []);
   const { fn, step } = generate(ast, { params: allParams, loop: true });
   return { ok: true, fn, step, ast, latex: toLatex(ast), params: allParams, defs };
 }
 
-/** 仅校验，返回 latex 或抛出错误 */
-export function preview(source) {
+/** Validate only: returns the LaTeX or throws */export function preview(source) {
   try {
     const r = compile(source);
     return { ok: true, latex: r.latex, defs: r.defs };

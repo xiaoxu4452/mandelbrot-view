@@ -1,10 +1,10 @@
 /* ------------------------------------------------------------------
- * formulas.js — 分形族定义、高精度参考轨道、复平面辅助
+ * formulas.js — fractal family definitions, high-precision reference orbits, complex-plane helpers
  * ----------------------------------------------------------------*/
 
 import { contextFor } from './bigfixed.js';
 
-/* 逃逸时间族的“多项式核心”（z -> F(z) + c） */
+/* "Polynomial core" of the escape-time families (z -> F(z) + c) */
 export const KINDS = {
   mandelbrot: {
     id: 'mandelbrot', en: 'Mandelbrot', zh: '曼德勃罗',
@@ -36,7 +36,7 @@ export const KINDS = {
   }
 };
 
-/* 全集类型（用于 UI 分段控件） */
+/* Set types (used by the UI segmented control) */
 export const MODES = {
   m: { id: 'm', en: 'Mandelbrot', zh: '曼德勃罗集' },
   j: { id: 'j', en: 'Julia', zh: '朱丽叶集' },
@@ -44,24 +44,24 @@ export const MODES = {
   x: { id: 'x', en: 'Custom', zh: '自定义' }
 };
 
-/* ---------- 高精度参考轨道 ---------- */
+/* ---------- High-precision reference orbit ---------- */
 
 /**
- * 计算参考轨道（高精度迭代，结果截断为 double 数组）。
+ * Compute the reference orbit (high-precision iteration, result truncated to a double array).
  * @param {object} spec  {mode:'m'|'j', kind, power, phoenix, julia:{re,im}}
- * @param {{re:string, im:string}} center 复平面中心（十进制字符串）
- * @param {number} bits 精度位宽
- * @param {number} maxIter 最大迭代
- * @param {number} bail 逃逸半径平方（double，如 1e10）
+ * @param {{re:string, im:string}} center complex-plane centre (decimal string)
+ * @param {number} bits precision width in bits
+ * @param {number} maxIter maximum iteration count
+ * @param {number} bail squared escape radius (double, e.g. 1e10)
  * @returns {{re:Float64Array, im:Float64Array, len:number, escaped:boolean, ms:number}}
  */
-export function buildReferenceOrbit(spec, center, bits, maxIter, bail) {
+export function buildReferenceOrbit(spec, center, bits, maxIter, bail, pairs = false) {
   const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
   const ctx = contextFor(bits);
   const F = ctx.FB;
   const HALF = ctx.HALF;
 
-  // 用于 double 化的快速转换：value ≈ Number(v >> (F-60)) * 2^-60
+  // Fast conversion to double: value ≈ Number(v >> (F-60)) * 2^-60
   const SH = BigInt(Math.max(0, ctx.F - 60));
   const SHIFT_BACK = Math.pow(2, -60);
   const toN = (v) => Number(v >> SH) * SHIFT_BACK;
@@ -73,7 +73,7 @@ export function buildReferenceOrbit(spec, center, bits, maxIter, bail) {
   const p = spec.power | 0;
   const isJulia = spec.mode === 'j';
 
-  // 常数额 c 与初始 z0
+  // Constant term c and initial z0
   const cr = isJulia ? ctx.fromString(spec.julia.re) : ctx.fromString(center.re);
   const ci = isJulia ? ctx.fromString(spec.julia.im) : ctx.fromString(center.im);
   let zr = 0n, zi = 0n;
@@ -83,18 +83,30 @@ export function buildReferenceOrbit(spec, center, bits, maxIter, bail) {
   }
 
   const phoenixP = ctx.fromNumber(spec.phoenixP != null ? spec.phoenixP : 0.5667);
-  let pr = 0n, pi = 0n;      // phoenix 的上一轮值
+  let pr = 0n, pi = 0n;      // previous-iteration values for phoenix
 
-  const bailSq = ctx.fromNumber(1e20);  // |z|^2 > 1e20 视为逃逸
+  const bailSq = ctx.fromNumber(1e20);  // |z|^2 > 1e20 counts as escaped
 
   const re = new Float64Array(maxIter + 1);
   const im = new Float64Array(maxIter + 1);
+  // Optional double-double low words: the plain doubles are only a 53-bit
+  // truncation of the reference orbit, and once the pixel scale drops below
+  // ~1e-16 that truncation (η ≈ 1e-16, amplified by the orbit's derivative)
+  // dominates the perturbation and tiles turn into mosaics.
+  const reLo = pairs ? new Float64Array(maxIter + 1) : null;
+  const imLo = pairs ? new Float64Array(maxIter + 1) : null;
   let len = maxIter;
   let escaped = false;
 
   for (let n = 0; n <= maxIter; n++) {
-    re[n] = toN(zr);
-    im[n] = toN(zi);
+    if (pairs) {
+      const pr = ctx.toPair(zr), pi = ctx.toPair(zi);
+      re[n] = pr[0]; reLo[n] = pr[1];
+      im[n] = pi[0]; imLo[n] = pi[1];
+    } else {
+      re[n] = toN(zr);
+      im[n] = toN(zi);
+    }
 
     const ar = sq(zr), bi = sq(zi);
     if (ar + bi > bailSq) { len = n; escaped = true; break; }
@@ -159,10 +171,10 @@ export function buildReferenceOrbit(spec, center, bits, maxIter, bail) {
   }
 
   const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-  return { re, im, len: Math.min(len, maxIter), escaped, ms: t1 - t0 };
+  return { re, im, reLo, imLo, len: Math.min(len, maxIter), escaped, ms: t1 - t0 };
 }
 
-/* ---------- 牛顿法根 ---------- */
+/* ---------- Newton roots ---------- */
 
 export function newtonRoots(degree) {
   const roots = [];
@@ -173,13 +185,13 @@ export function newtonRoots(degree) {
   return roots;
 }
 
-/* ---------- 缩放尺度 ---------- */
+/* ---------- Zoom scale ---------- */
 
 export function pixelSize(span, width) {
   return (span.m * Math.pow(2, span.e)) / width;
 }
 
-/** 深度（十进制指数，越大越深） */
+/** Depth (decimal exponent; larger means deeper) */
 export function zoomDepth(span, width) {
   const ps = pixelSize(span, width);
   return -Math.log10(ps);

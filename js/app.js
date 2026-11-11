@@ -1,21 +1,48 @@
-/* ------------------------------------------------------------------
- * app.js — 主控制器：视图状态 / 瓦片调度 / 交互 / 界面
+﻿/* ------------------------------------------------------------------
+ * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PRESETS } from './presets-data.js';
-import { PALETTE_LIST, paletteGradientCSS } from './palettes.js';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js';
+import { SCHEME_LIB, findScheme } from './schemes-data.js';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js';
 import { setLang, t, getLang } from './i18n.js';
 import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js';
 import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js';
 import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js';
 import { openCorePanel } from './corepanel.js';
+import { initGlassSelects } from './glass-select.js';
+import { composeTile } from './drawlib.js';
+import { SceneRenderer } from './glscene.js';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasExport, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig } from './native.js';
+import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js';
+import { initJuliaView } from './juliaview.js';
+import { PRESET_THUMBS } from './preset-thumbs.js';
+import { importRefPreset, glslToHlsl } from './refpreset.js';
+import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js';
 
-/* ---------------- 常量 ---------------- */
-const TILE = 128;
-const MIN_LOG2PS = -3322;       // 最细像素尺度 2^-3322 ≈ 10^-1000
-const MAX_SPAN = 8;             // 最宽视野
+/* Any uncaught exception inside a pass callback aborts the progressive chain
+ * silently: the canvas keeps showing the coarse pass and never reaches the
+ * final one.  Surface it in the shell log instead of failing invisible. */
+window.addEventListener('error', (e) => {
+  try { nativeLog(`[js-error] ${e.message} @${e.filename}:${e.lineno}:${e.colno}`); } catch (_) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { nativeLog(`[js-reject] ${e.reason && e.reason.message ? e.reason.message : e.reason}`); } catch (_) {}
+});
 
-/* ---------------- 状态 ---------------- */
+/* ---------------- Constants ---------------- */
+/* Tile size.  Each tile is one render call, and a call has to pay a
+ * thread-pool dispatch; at 128px a tile is only 16k pixels, so a 190-tile
+ * frame spent more time in dispatch than in pixels (measured 1.7ms per tile
+ * against 0.57ms of work).  256px quarters the number of dispatches and the
+ * pass gets correspondingly cheaper. */
+const TILE = 512;
+const MIN_LOG2PS = -3322;       // finest pixel scale, 2^-3322 ≈ 10^-1000
+const MAX_SPAN = 8;             // widest field of view
+
+/* ---------------- State ---------------- */
 const state = {
   spec: {
     mode: 'm',
@@ -29,16 +56,95 @@ const state = {
   },
   center: { re: '-0.6', im: '0' },
   span: { m: 1.6, e: 1 },
+  /* Rotation, in radians, exactly as the reference stores it.  It is carried
+   * through import/export even before the kernel can render it, so a preset
+   * that arrives rotated does not silently lose the angle on the way back. */
+  rotation: 0,
+  /* Which library file the view came from, and what it was called.  Both are
+   * what "save" writes back into, so opening a preset and saving it again
+   * updates that file instead of piling up near-duplicates. */
+  presetFile: '',
+  presetName: '',
+  /* `parameters.inverse` inverts the palette (white minus colour). */
+  inverse: false,
+  /* Keyframes, when the open preset carries them (see presetlib.sampleAnimation). */
+  animation: null,
   maxIter: 600,
   autoIter: true,
+  autoRank: 100,        // percent of the automatic iteration budget (1..100)
   bits: 'auto',
-  palette: 'ice',
-  cycle: 8,
-  cycleAuto: true,
+  /* The reference colours by the raw iteration count through a fixed-period
+   * palette (its `pal(smoothiter)` with a frequency in radians per
+   * iteration), so a slow ramp period is what makes the colours keep moving
+   * as the view zooms instead of the same bands being rescaled to the frame.
+   * 140 iterations per cycle is its 0.045 rad/iteration. */
+  palette: 'orchid',
+  scheme: 'bands',      // 'bands' = smooth palette bands (vivid, default); 'distance' = rim-only
+  /* A GLSL `vec4 color(Data)` body imported from a reference preset's
+   * `parameters.colorscheme.codegl`.  When set it replaces the built-in
+   * schemes on the GPU path — that is the only way to reproduce the presets
+   * whose look is a shader (Amethyst Crown, Nebula Bloom, Rainbow Veins, ...). */
+  glsl: null,
+  /* An embedded official GLSL scheme (see schemes-data.js).  `glsl` is the
+   * shader that actually runs; these fields carry the rest of the recipe the
+   * reference stores alongside it: its UniformsColor table, the neutral
+   * values of its `params.param[]` sliders, its brightness pair and samples.
+   * Keeping them together is what makes a scheme switch reversible and a
+   * link shareable. */
+  schemeId: null,
+  schemeFollowView: true,   // an official scheme was authored at its own view
+  schemeMeta: null,         // { nparam, paramLabels, samples, name } — also for imports
+  schemeParams: [],
+  schemeColors: [],
+  schemeBri: { finite: 1, infinite: 1, factor: 1 },
+  /* Shade the iteration field on the GPU.  Off falls back to the CPU
+   * palette path, which is what the browser build and old drivers get. */
+  gpu: true,
+  shade: 0,             // band-density policy: 0 legacy / 1 stretched / 2 multi-cycle / 3 dense+dither
+  bands: 0,             // 0 = authored frequency (the reference has no band-fit control)
+  detail: 3,            // 0..3: smallest feature the renderer resolves (3 = one pixel)
+  /* Fixed period, like the reference's per-iteration frequencies: the palette
+   * is a function of the iteration count, not of the frame, so zooming slides
+   * the colours instead of re-fitting the same bands to the new view. */
+  cycleAuto: false,     // fit the cycle to the frame (false = use `cycle`)
+  cycle: 140,           // explicit iterations per palette cycle
   offset: 0,
-  hd: false,
+  /* A gradient the user edited.  null = follow the selected palette; once the
+   * handles have been touched this table is the colour set, and it is what the
+   * renderer receives instead of a palette name. */
+  stops: null,
+  /* Tone stage.  Identity values reproduce the palette exactly, so the
+   * default view is untouched by any of this. */
+  tone: { bri: 1, gr: 1, gg: 1, gb: 1 },
+  /* Render resolution as a multiple of CSS pixels, independent of the device's
+   * own scale factor: 1 = CSS (fastest), 1.5, 2 = device pixels on this screen.
+   * The gesture cadence already renders well below this (livePlan), so a lower
+   * setting only trims the final frame, never the preview. */
+  renderScale: 2,
+  /* Measurement only: 1 disables the field cache (and therefore the copy that
+   * keeping a field requires), so the copy's cost can be measured on the same
+   * view instead of being guessed from its byte count. */
+  noFieldCache: false,
+  /* Measurement only: 1 restores the old unconditional field copy, so the copy
+   * that was removed can be timed on the same view. */
+  forceCopy: false,
+  /* Measurement only: work-dispatch tile upper bound, in pass pixels.  The
+   * reference uploads each canvas node as a 2^canvassize texture (128 px by
+   * default), which is a different layer; this knob only answers "would our
+   * dispatch granularity change the frame time on the same view?".  Capped at
+   * 512 by the shell's 1 MB shared slot. */
+  tilePx: 512,
+  aa: 3,          // supersampling factor for the final pass (1 = off, 4 = maximum)
   lang: 'zh',
   theme: 'dark',
+  /* Orbit trap, 0 = off, 1../4 = point / line / circle / TIA.  A trap colours
+   * by where the orbit travelled rather than how long it took to escape, which
+   * is what draws filigree that survives a deep zoom (Ctx::wantTrap). */
+  traps: 0,
+  /* Trap density.  Both live only in the fragment shader, so they repaint the
+   * cached field instead of re-iterating anything. */
+  trapGain: 0.45,
+  trapRings: 0.40,
   presetId: null
 };
 
@@ -51,7 +157,239 @@ const snapCtx = snap.getContext('2d');
 const prevCanvas = document.createElement('canvas');
 const prevCtx = prevCanvas.getContext('2d');
 
-/* ---------------- 数值工具 ---------------- */
+/* ---------------- GPU shading surface ----------------
+ *
+ * The core sends the iteration field; this surface turns it into pixels with
+ * the reference program's own GLSL.  It is a separate canvas rather than a
+ * second context on `#fractal` because the 2D context is how the CPU path,
+ * the snapshot and the export all work — drawing through WebGL into the same
+ * element would break every one of them.
+ *
+ * Exactly one of the two surfaces is visible at a time (`html.gl-surface`).
+ */
+const glCanvas = document.createElement('canvas');
+glCanvas.id = 'glfractal';
+canvas.parentNode.insertBefore(glCanvas, canvas.nextSibling);
+const gpu = new FieldRenderer(glCanvas);
+let gpuOk = !!(gpu.ok && NATIVE);
+let glSurface = false;
+/* The last Params/color set the main GPU pass used.  The Julia preview is a
+ * second viewport of the same program, so it must be shaded by the very same
+ * shader and uniform values rather than a second colour implementation. */
+let lastDraw = null;
+let juliaView = null;
+/* The one shader source that failed to compile, if any. */
+let badSchemeSrc = '';
+
+/* ---------------- scene renderer (whole fractal in a fragment shader) ----------------
+ *
+ * Everything above this line is the *field* pipeline: a CPU kernel produces
+ * smooth iteration / distance / escape count and a shader colours them.  The
+ * scene renderer is the benchmark-style route — the orbit itself is evaluated
+ * per pixel on the GPU, so a frame costs one draw call and no CPU work at all.
+ *
+ * It owns the same canvas as the field renderer (a canvas has exactly one
+ * WebGL context; two `getContext` calls return the same object), and it hands
+ * the surface back to the 2D canvas whenever the view needs something a
+ * fragment shader cannot do: a custom formula, a Newton set, an orbit trap,
+ * the distance scheme, or a zoom past double-float precision.
+ *
+ * Division of labour, and why:
+ *   - Live frames (pan / wheel / pinch) always use the scene: 60 fps beats
+ *     exactness for a picture that is about to be replaced anyway.
+ *   - The committed frame uses the scene only above MIN_PIXEL, where its
+ *     coordinates are exact to ~1e-9 of a pixel; below that the CPU kernel
+ *     (reference orbit + series approximation) owns the pixels.
+ */
+const scene = new SceneRenderer(gpu.ok ? gpu.gl : null);
+const SCENE_KIND = {
+  mandelbrot: 0, multibrot: 0, tricorn: 1, burningship: 2,
+  celtic: 3, perpendicular: 4, phoenix: 5
+};
+/* 1e-6 plane units per pixel: at 2000 px that is a 2e-3 wide frame.  Above it
+ * the shader's double-float coordinates are exact enough that a committed
+ * frame is indistinguishable from the CPU's. */
+const SCENE_MIN_PIXEL = 1e-6;
+/* Past this one frame stops being interactive; the CPU path has the series
+ * approximation that makes those views affordable. */
+const SCENE_MAX_ITER = 20000;
+let sceneLast = null;            // last view the scene drew
+let sceneResult = null;          // { program, ms } of the last scene draw
+let sceneFail = '';              // why the shader last declined
+let sceneDrawAt = 0;
+
+/** True when the current view is one the fragment shader can draw exactly. */
+function sceneView() {
+  if (!scene.ok || !state.gpu) return null;
+  if (nativeCanvasMode()) return null;
+  const spec = state.spec;
+  /* Only the polynomial families live in the shader; formulas, Newton sets
+   * and anything the colour stage post-processes stay on the CPU side. */
+  if (spec.mode !== 'm' && spec.mode !== 'j') return null;
+  if (state.traps > 0 || state.inverse) return null;
+  if (state.scheme === 'distance') return null;
+  if (state.glsl && state.glsl.trim()) return null;
+  if (state.stops && state.stops.length >= 2) return null;
+  const p = psPair();
+  if (p.e < -1000) return null;
+  const pixel = p.m * Math.pow(2, p.e);
+  if (!(pixel > 0)) return null;
+  const julia = spec.mode === 'j';
+  return {
+    centerRe: Number(state.center.re) || 0,
+    centerIm: Number(state.center.im) || 0,
+    pixel,
+    rot: state.rotation || 0,
+    width: canvas.width, height: canvas.height,
+    maxIter: effectiveIterTotal(),
+    power: spec.power | 0 || 2,
+    kind: SCENE_KIND[spec.kind] == null ? 0 : SCENE_KIND[spec.kind],
+    julia,
+    seedRe: julia ? Number(spec.julia.re) || 0 : 0,
+    seedIm: julia ? Number(spec.julia.im) || 0 : 0,
+    cycle: effectiveCycle(),
+    offset: state.offset || 0,
+    phoenix: spec.phoenixP == null ? 0.5667 : spec.phoenixP,
+    samples: 1
+  };
+}
+
+/** Palette table for the shader.  The key is what the LUT cache compares. */
+function scenePaletteKey() {
+  return String(state.palette) + '|' + (state.stops ? state.stops.length : 0) +
+         '|' + (state.paletteVersion || 0);
+}
+
+/** Draw the current view with the shader.  Returns true when it painted. */
+function sceneDraw(v, opts = {}) {
+  if (!v) return false;
+  if (opts.final) {
+    if (v.maxIter > SCENE_MAX_ITER) { sceneFail = 'iter'; return false; }
+    if (v.pixel < SCENE_MIN_PIXEL) { sceneFail = 'depth'; return false; }
+  }
+  glCanvas.width = v.width;
+  glCanvas.height = v.height;
+  scene.setPalette(paletteLUT(state.palette), scenePaletteKey());
+  const r = scene.draw(v);
+  if (!r.ok) { sceneFail = r.why; setGlSurface(false); return false; }
+  sceneFail = '';
+  sceneLast = v;
+  sceneResult = r;
+  sceneDrawAt = performance.now();
+  setGlSurface(true);
+  return true;
+}
+
+/** Committed frame through the shader, or false to let the CPU pass run. */
+function scenePass() {
+  const v = sceneView();
+  if (!v || !sceneDraw(v, { final: true })) return false;
+  /* The splash screen is driven by the pass index of the CPU plan; a shader
+   * frame has no passes, so it has to close the curtain itself or the page
+   * sits at "68%" forever. */
+  if (!splash.finished) {
+    splash.set(0.68, 'bootFirst');
+    splash.finish();
+  }
+  /* The HUD reports the engine that produced this frame, and its precision.
+   * Claiming the selected 512-bit setting here would be a lie: the shader's
+   * coordinates are 24 bits wide (float) or 48 (double-float). */
+  lastMeta = {
+    engine: 'gpu',
+    mode: state.spec.mode === 'j' ? 'julia' : 'mandelbrot',
+    bits: sceneResult && sceneResult.program === 'df' ? 48 : 24,
+    ms: sceneResult ? sceneResult.ms : 0,
+    glitches: 0, refLen: 0
+  };
+  frameMs = performance.now() - frameStartAt;
+  frameSeq++;
+  updateHud(true);
+  takeSnapshot();
+  return true;
+}
+
+/** Live frame while a gesture is running: one draw per input event.
+ *
+ * A gesture used to be a CSS-style blit of the last frame, which on the web
+ * build meant a stretched bitmap for as long as the wheel kept turning.  One
+ * fragment pass per event is both cheaper and sharp, so the shader takes the
+ * gesture whenever it can and the blit remains the fallback. */
+function sceneLive() {
+  if (performance.now() - sceneDrawAt < 6) return false;
+  const v = sceneView();
+  if (!v || !sceneDraw(v)) { setGlSurface(false); return false; }
+  return true;
+}
+
+/* ---------------- shader clock ----------------
+ * `params.time` is part of the reference's `Params` and four of its shipped
+ * schemes read it: Amethyst Crown breathes, Nebula Bloom drifts, Rainbow Veins
+ * pulses, the Chinese Remainder Clock ticks.  We always passed 0, so every
+ * "colour that moves on its own" was frozen at t = 0 — the animation is part
+ * of those presets, not a decoration.
+ *
+ * Re-shading is cheap on purpose: the iteration field does not change with
+ * time, so a tick is one fragment pass over the field already on the GPU — the
+ * same trade the reference makes with its 128x128 iteration texture.  Nothing
+ * here re-iterates. */
+let animRaf = 0;
+let animT0 = performance.now();
+let animPaused = false;
+const ANIM_MIN_MS = 55;              // ~18 fps: enough for a slow breathing effect
+let animLastAt = 0;
+function schemeTime() { return (performance.now() - animT0) / 1000; }
+function schemeWantsTime(src) { return !!src && src.indexOf('params.time') >= 0; }
+function stopShadeAnimation() {
+  if (animRaf) { cancelAnimationFrame(animRaf); animRaf = 0; }
+}
+function startShadeAnimation() {
+  if (animRaf || animPaused || document.visibilityState === 'hidden') return;
+  if (!lastDraw || !lastDraw.final || !schemeWantsTime(lastDraw.src)) return;
+  animLastAt = 0;
+  animRaf = requestAnimationFrame(animTick);
+}
+function animTick(t) {
+  animRaf = 0;
+  const d = lastDraw;
+  if (animPaused || !d || !d.final || !schemeWantsTime(d.src)) return;
+  /* Never fight a gesture or a fresh render: the field on the GPU is about to
+   * be replaced, and a tick would paint the old one over the new picture. */
+  if (glide || !d.fieldLive) { animRaf = requestAnimationFrame(animTick); return; }
+  if (t - animLastAt < ANIM_MIN_MS) { animRaf = requestAnimationFrame(animTick); return; }
+  animLastAt = t;
+  d.time = schemeTime();
+  gpu.draw(d);
+  /* The preview shares this exact Params object, so it advances with the main
+   * view instead of drifting to its own clock. */
+  if (juliaView) juliaView.redraw();
+  animRaf = requestAnimationFrame(animTick);
+}
+
+function setGlSurface(on) {
+  if (on === glSurface) return;
+  glSurface = !!on;
+  document.documentElement.classList.toggle('gl-surface', on);
+}
+
+/** The GLSL source the GPU path runs.  A user-supplied scheme wins, then the
+ *  reference's Distance scheme, then its Smooth scheme (the default). */
+function activeSchemeSrc() {
+  if (state.glsl && state.glsl.trim()) return state.glsl;
+  if (state.scheme === 'distance') return GLSL_BUILTIN.distance.src;
+  return GLSL_BUILTIN.smooth.src;
+}
+
+/** The channel contract that belongs with `activeSchemeSrc()`. */
+function activeSchemeChannels() {
+  if (state.glsl && state.glsl.trim()) {
+    return state.schemeChannels != null ? state.schemeChannels
+                                        : inferChannels(state.glsl);
+  }
+  return state.scheme === 'distance' ? GLSL_BUILTIN.distance.channels
+                                     : GLSL_BUILTIN.smooth.channels;
+}
+
+/* ---------------- Numeric helpers ---------------- */
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 function spanNum() {
@@ -72,7 +410,7 @@ function psLog2Now() {
   return Math.log2(Math.abs(p.m)) + p.e;
 }
 
-/** 近似 double 像素尺度（深度超过 1e-300 时为 0，仅用于兼容路径） */
+/** Approximate double pixel scale (0 beyond 1e-300 depth; only used by compatibility paths) */
 function psNow() {
   const p = psPair();
   return p.e < -1000 ? 0 : p.m * Math.pow(2, p.e);
@@ -86,12 +424,6 @@ function bitsNow() {
   return resolveBitsFromLog2(state.bits, psLog2Now());
 }
 
-function spanFromDecimal(exp) {
-  const v = Math.pow(10, exp);
-  const e = Math.floor(Math.log2(v));
-  return { m: v / Math.pow(2, e), e };
-}
-
 function shiftCoord(baseStr, delta, bits) {
   const ctx2 = contextFor(Math.max(128, bits));
   const b = ctx2.fromString(baseStr);
@@ -99,7 +431,7 @@ function shiftCoord(baseStr, delta, bits) {
   return ctx2.toString(b + d, Math.ceil(bits * 0.32) + 10);
 }
 
-/** 用 mant×2^exp 标度平移坐标，避免 double 下溢 */
+/** Shift a coordinate by a mant×2^exp offset so that doubles cannot underflow */
 function shiftCoordScaled(baseStr, val, exp, bits) {
   const ctx2 = contextFor(Math.max(128, bits));
   const b = ctx2.fromString(baseStr);
@@ -108,13 +440,17 @@ function shiftCoordScaled(baseStr, val, exp, bits) {
 }
 
 /**
- * 自动迭代次数：深层需要的迭代增长远快于浅层（每深入一个数量级，
- * 边界附近的逃逸时间大致再多一两千次），否则深放大只会得到一片"内部色"。
+ * Automatic iteration count: the count grows far faster with depth than in shallow views (roughly another one
+ * to two thousand iterations near the boundary per extra decade), otherwise a deep zoom is just "interior colour".
  */
 function autoIterFor(depth) {
   const d = Math.max(0, depth);
   const base = 600 + 350 * Math.min(d, 10);
-  const extra = d > 10 ? 1200 * (d - 10) : 0;
+  /* Measured escape counts on a boundary tile (2^-67 at 1e-17, 2^-90 at
+   * 1e-24, 2^-104 at 1e-28) are ~11k / 23k / 42k, so 1200 per decade left
+   * entire regions unescaped (rendered as interior black).  2600 tracks the
+   * measured growth while staying below the 200k clamp. */
+  const extra = d > 10 ? 2600 * (d - 10) : 0;
   return Math.round(clamp(base + extra, 400, 200000));
 }
 
@@ -138,7 +474,7 @@ function trimNum(s, n = 14) {
   return str.slice(0, n + 2) + '…';
 }
 
-/* ---------------- Worker 池 ---------------- */
+/* ---------------- Worker pool ---------------- */
 const workers = [];
 let wasmEnabled = null;
 const mainQueue = [];
@@ -146,7 +482,9 @@ const thumbQueue = [];
 let pending = 0;
 
 function initWorkers() {
-  const n = clamp((navigator.hardwareConcurrency || 4) - 1, 2, 8);
+  // The desktop shell computes in C++ and only needs one worker as a fallback
+  // for expression formulas; the browser build keeps the full pool.
+  const n = NATIVE ? 1 : clamp((navigator.hardwareConcurrency || 4) - 1, 2, 8);
   for (let i = 0; i < n; i++) {
     const w = new Worker('js/worker.js', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
@@ -161,7 +499,7 @@ function idleWorker() {
   return workers.find(w => w.ready && !w.busy);
 }
 
-/* ---------------- 本地渲染核心（浏览器之外） ---------------- */
+/* ---------------- Out-of-browser render core ---------------- */
 const REMOTE_MAX = 24;
 let remoteInflight = 0;
 const remoteQueue = [];
@@ -182,9 +520,9 @@ function remoteDispatch(job) {
     .catch((err) => {
       remoteCtl.delete(ctl);
       remoteInflight--;
-      // 视图切换导致的主动取消：不算失败，也不影响后续请求
+      // Deliberate cancellation from a view change: not a failure, and harmless to later requests
       if (err && err.name === 'AbortError') { pumpRemote(); return; }
-      // 服务没起来 / 中途崩溃：退回浏览器内渲染
+      // Service not up / crashed mid-flight: fall back to in-browser rendering
       disableRemote();
       dispatchLocal(job);
       updateEngineLabel();
@@ -210,11 +548,28 @@ function cancelRemote() {
 }
 
 function dispatch(job) {
+  // User palettes carry their stop table with the job: workers / the remote
+  // renderer never read localStorage, so the definition must travel along.
+  const pl = job.payload;
+  if (pl) {
+    const stops = customPaletteStops(pl.palette);
+    if (stops) pl.paletteStops = stops;
+    /* The worker LUT has no notion of handle positions, so an edited ramp is
+     * resampled for it.  The native kernel gets the real stops and does not
+     * come through here. */
+    else if (Array.isArray(state.stops)) pl.paletteStops = resampleStops(state.stops, 64);
+  }
   if (!job.thumb && remoteEnabled()) return remoteDispatch(job);
   return dispatchLocal(job);
 }
 
 function dispatchLocal(job) {
+  // Desktop shell: the native C++ engine renders the tile and streams it back
+  // through a shared buffer.  Custom expressions / deep non-z^2 families keep
+  // the worker path because the native kernel does not evaluate them.
+  if (nativeUsable() && nativeCapable(job.payload.spec, job.payload.psLog2)) {
+    return nativeRender(job.payload, job.onDone);
+  }
   const rec = idleWorker();
   if (!rec) { (job.thumb ? thumbQueue : mainQueue).push(job); return false; }
   rec.busy = true;
@@ -252,7 +607,7 @@ function onWorkerMessage(rec, msg) {
     return;
   }
   if (msg.type === 'error') {
-    console.warn('渲染错误', msg.message);
+    console.warn('render error', msg.message);
     rec.busy = false; pending--; pump(); return;
   }
   if (msg.type === 'tile') {
@@ -264,54 +619,561 @@ function onWorkerMessage(rec, msg) {
   }
 }
 
-/* ---------------- 渲染调度（渐进式多趟） ---------------- */
+/* Reference palettes are not LUTs: the native kernel evaluates pal() itself.
+ * This maps the selected palette id to that model (0 = use the LUT instead). */
+function palettePalId(id) {
+  const entry = PALETTE_LIST.find(p => p.id === id);
+  return entry && entry.pal ? entry.pal : 0;
+}
+
+/* Which colour model the native kernel should use for this view.
+ *
+ * Built-in schemes keep their own additive `pal()` — that is what they were
+ * tuned against, and a ramp sampled from them would change the look.  Anything
+ * else (a preset naming a palette the core does not have, or a ramp the user
+ * has edited) travels as a gradient. */
+function nativeColourSet() {
+  if (Array.isArray(state.stops) && state.stops.length >= 2) {
+    return { pal: 0, stops: stopsPayload() };
+  }
+  const entry = PALETTE_LIST.find(p => p.id === state.palette);
+  if (entry && entry.pal != null) return { pal: entry.pal, stops: null };
+  return { pal: 0, stops: stopsPayload() };
+}
+
+/* The colour set actually sent to the renderer.
+ *
+ * `state.stops` is the user's edited ramp; when it is null the selected
+ * palette's own table is used, which is how a preset or a built-in scheme
+ * reaches the native kernel.  Positions are real (not evenly spaced) because
+ * the editor lets a handle sit anywhere. */
+function effectiveStops() {
+  if (Array.isArray(state.stops) && state.stops.length >= 2) {
+    return state.stops.map(s => ({ pos: +s.pos, r: +s.r, g: +s.g, b: +s.b }));
+  }
+  return paletteStopList(state.palette);
+}
+
+/* Flat [pos,r,g,b] x n for the shell's tiny parser. */
+function stopsPayload() {
+  const out = [];
+  for (const s of effectiveStops()) {
+    out.push(+s.pos.toFixed(5), +s.r.toFixed(5), +s.g.toFixed(5), +s.b.toFixed(5));
+  }
+  return out;
+}
+
+/* The 区间 slider is logarithmic: 0 means "fit the cycle to the frame", and
+ * everything above it maps to 0.05 … 2000 iterations per palette cycle. */
+const SPAN_MIN = 0.05;
+const SPAN_MAX = 2000;
+function spanToCycle(v) {
+  return v <= 0 ? 0 : SPAN_MIN * Math.pow(SPAN_MAX / SPAN_MIN, clamp(v, 0, 100) / 100);
+}
+function cycleToSpan(c) {
+  if (!(c > 0)) return 0;
+  return clamp(Math.round(100 * Math.log(c / SPAN_MIN) / Math.log(SPAN_MAX / SPAN_MIN)), 1, 100);
+}
+
+function fmtCycle(c) {
+  if (!(c > 0)) return t('auto');
+  return c < 10 ? c.toFixed(2) : String(Math.round(c));
+}
+
+/* Install one of the reference's own GLSL recipes.  The shader is only half
+ * of a scheme: the JSON also carries its UniformsColor table, the neutral
+ * values of the `params.param[]` sliders, the two region brightnesses and a
+ * samples count.  All of them have to travel together or the same codegl
+ * paints a different picture here than it did in the original program. */
+/** Move the view to the coordinates an official scheme was authored at. */
+function applySchemeView(v) {
+  if (!v || v.re == null || v.im == null) return false;
+  state.center = { re: String(v.re), im: String(v.im) };
+  state.span = { m: +v.m || 1.6, e: v.e | 0 };
+  state.rotation = +v.rotation || 0;
+  state.presetId = null;
+  if (typeof syncRotationUi === 'function') syncRotationUi();
+  return true;
+}
+
+/* ---- the scheme dictionary ----------------------------------------------
+ *
+ * The reference keeps a library of Colorschemes: readColorschemes (00547860)
+ * seeds it with the five built-ins when the key is missing and writes it
+ * straight back through writeColorschemes (00545cb0); every scheme the program
+ * creates is added by name (addjdict replaces on a duplicate key).  The store
+ * here is the same JSON array under a localStorage key instead of a path, so
+ * the library survives a restart with the reference's round-trip semantics.
+ * ------------------------------------------------------------------------- */
+/* v2: the library now starts from the reference's own colorschemes.json.  The
+ * old key held a five-entry hand-built seed plus whatever was added on top of
+ * it, so it has to be left behind rather than merged — its numbers are not the
+ * reference's. */
+const SCHEME_STORE_KEY = 'mb.colorschemes.v2';
+let schemeDict = null;
+
+function schemeStoreSave() {
+  if (!schemeDict) return false;
+  try {
+    localStorage.setItem(SCHEME_STORE_KEY, writeColorschemes(schemeDict));
+    return true;
+  } catch { return false; }
+}
+
+function schemeStoreLoad() {
+  let text = '';
+  try { text = localStorage.getItem(SCHEME_STORE_KEY) || ''; } catch { /* private mode */ }
+  const r = readColorschemes(text);
+  schemeDict = r.dict;
+  refreshReferenceSchemes();
+  /* An absent (or unusable) library is written back immediately, which is what
+   * readColorschemes does before it returns the seeded dictionary. */
+  if (r.seeded) schemeStoreSave();
+  return schemeDict;
+}
+
+/** Add one scheme to the library; the name is the key, as addjdict's is. */
+function schemeStoreAdd(name, codegl, opts = {}) {
+  if (!schemeDict || !name || !codegl) return null;
+  const cs = newColorscheme({
+    name,
+    codegl,
+    nparam: Math.max(0, opts.nparam | 0),
+    samples: Math.max(1, opts.samples | 0 || 1),
+    channels: opts.channels != null ? (opts.channels >>> 0) : inferChannels(codegl),
+    auxfile: opts.auxfile || null
+  });
+  schemeDict.set(name, cs);
+  schemeStoreSave();
+  return cs;
+}
+
+/* ---- the reference's own built-in schemes -------------------------------
+ *
+ * `colorschemes.json` seeds the library, but a library entry is not selectable
+ * on its own: the palette dropdown lists *recipes* (shader + params + colour
+ * table).  These records are the bridge, so the six entries from that file
+ * appear in the UI with the codegl, `channels`, `samples` and `nparam` the file
+ * gives them.
+ *
+ * The file carries no colour table of its own — the reference colours these
+ * schemes with the program's current `params.color` table — so each record
+ * starts on the program's own default three terms (initParams) rather than an
+ * invented palette.  `params.param[]` is likewise not in the file; 0.33 is the
+ * neutral value the shipped presets use for their single distance/scale slider.
+ * ------------------------------------------------------------------------ */
+const REF_PARAM_LABELS = {
+  'Distance': [{ zh: '距离缩放', en: 'Distance scale' }],
+  'Distance and iteration levels': [{ zh: '距离缩放', en: 'Distance scale' },
+                                    { zh: '层级缩放', en: 'Level scale' }],
+  'Texture': [{ zh: '纹理尺度', en: 'Texture scale' }]
+};
+let refSchemeRecords = [];
+
+function refreshReferenceSchemes() {
+  refSchemeRecords = [];
+  if (!schemeDict) return;
+  for (const d of REFERENCE_COLORSCHEMES) {
+    const cs = schemeDict.get(d.name);
+    if (!cs) continue;
+    const nparam = cs.nparam | 0;
+    refSchemeRecords.push({
+      id: 'glsl:ref:' + cs.name,
+      name: cs.name, nameZh: cs.name,
+      group: 'reference',
+      nparam,
+      params: Array.from({ length: nparam }, () => 0.33),
+      paramLabels: (REF_PARAM_LABELS[cs.name]
+        || Array.from({ length: nparam }, (_, i) => ({ zh: `参数 ${i + 1}`, en: `Param ${i + 1}` }))
+      ).slice(0, nparam),
+      colors: TRAP_DEFAULT_COLORS.map(c => [c.r, c.g, c.b, c.frequency, c.initial]),
+      gf: REF_DEFAULT_LOG_FREQ, gi: 0,
+      briFinite: 1, briInfinite: 1, briFactor: 1,
+      samples: cs.samples | 0 || 1,
+      channels: cs.channels >>> 0,
+      glsl: cs.codegl
+    });
+  }
+}
+
+/* The reference's five built-ins are not part of the preset library, but
+ * `Texture` is the only user-visible consumer of the auxfile image, so it is
+ * offered next to the presets.  Its one parameter is the reference's own
+ * `params.param[0]` (texture scale), and its three pal() terms are the
+ * program's default table (initParams). */
+const TEXTURE_SCHEME = {
+  id: 'glsl:builtin-texture',
+  name: 'Texture', nameZh: '纹理',
+  glsl: GLSL_BUILTIN.texture.src,
+  channels: GLSL_BUILTIN.texture.channels,
+  nparam: 1, paramLabels: ['纹理尺度'], samples: 1,
+  params: [0.33, 0.3],
+  colors: [
+    [1, 0, 0, -2.1202635765075684, -1.0],
+    [0, 1, 0, -1.1363141536712646, -1.5],
+    [0, 0, 1, -0.023268627002835274, -0.5]
+  ],
+  gf: REF_DEFAULT_LOG_FREQ, gi: 0,
+  briFinite: 1, briInfinite: 1, briFactor: 1
+};
+const SCHEME_LIB_ALL = [TEXTURE_SCHEME, ...SCHEME_LIB];
+
+function findSchemeAny(id) {
+  if (id === TEXTURE_SCHEME.id) return TEXTURE_SCHEME;
+  return findScheme(id) || refSchemeRecords.find(s => s.id === id) || null;
+}
+
+/* ---- auxfile image -------------------------------------------------------
+ * The Texture scheme maps (log|z|, arg z) onto a 4x4 grid of 512 px tiles in
+ * texturesgl.jpg.  Shipping the scheme without the image made it render pure
+ * white — present but wrong — so the image travels with the exe (assets/,
+ * bundled by tools/gen-ui-resources.mjs) and is uploaded on first need. */
+let auxImageState = 0;   // 0 untouched, 1 loading, 2 ready, 3 failed
+function ensureAuxTexture() {
+  if (auxImageState) return;
+  auxImageState = 1;
+  const img = new Image();
+  img.onload = () => {
+    auxImageState = (gpu && gpu.uploadAuxImage(img)) ? 2 : 3;
+    /* The field is untouched; only the colour pass has to run again. */
+    if (auxImageState === 2 && lastDraw && lastDraw.fieldLive) {
+      gpu.draw(lastDraw);
+      if (juliaView) juliaView.redraw();
+    }
+    nativeLog('[aux] ' + (auxImageState === 2 ? 'texturesgl.jpg ' + img.width + 'x' + img.height : 'upload failed'));
+    if (auxImageState !== 2) auxMissing();
+  };
+  img.onerror = () => { auxImageState = 3; nativeLog('[aux] texturesgl.jpg missing'); auxMissing(); };
+  img.src = 'assets/texturesgl.jpg';
+}
+
+/* The Texture scheme samples the atlas for every exterior pixel.  With the
+ * atlas missing the sampler returns a flat colour — a blank picture with no
+ * clue why.  Keep a real picture instead: fall back to the smooth scheme's
+ * shader (same colour table, same brightness), keep the selection in the
+ * dropdown so the state stays visible, and say what happened. */
+function auxMissing() {
+  if (state.glsl && /\btex_aux\b/.test(state.glsl)) {
+    state.glsl = GLSL_BUILTIN.smooth.src;
+    state.schemeChannels = GLSL_BUILTIN.smooth.channels;
+    state.schemeMeta = Object.assign({}, state.schemeMeta,
+                                     { nparam: 0, paramLabels: [], samples: 2 });
+    state.schemeParams = [];
+    syncSchemeParams();
+    renderNow();
+  }
+  toast(getLang() === 'en' ? 'texturesgl.jpg missing — showing Smooth'
+                           : '缺少 texturesgl.jpg — 改用平滑着色');
+}
+
+function installScheme(id) {
+  const s = findSchemeAny(id);
+  if (!s) {
+    state.glsl = null;
+    state.schemeId = null;
+    state.schemeChannels = null;
+    state.schemeMeta = null;
+    state.schemeParams = [];
+    state.schemeColors = [];
+    state.schemeBri = { finite: 1, infinite: 1, factor: 1 };
+    return false;
+  }
+  state.schemeId = s.id;
+  state.schemeMeta = { nparam: s.nparam, paramLabels: s.paramLabels,
+                       samples: s.samples, name: s.name, nameZh: s.nameZh };
+  state.glsl = s.glsl;
+  state.schemeChannels = s.channels == null ? null : s.channels;
+  /* Most of the reference's custom schemes paint the exterior a flat colour
+   * and put all their detail on the boundary.  At the home view that is just
+   * a solid rectangle, so follow the authored view unless the user opts out. */
+  if (s.view && state.schemeFollowView) applySchemeView(s.view);
+  state.schemeParams = s.params.slice();
+  /* The scheme library stores the file's literal (log-domain) tuples.
+   * loadParams converts them with exp(f_i + F) / init_i + I before pal()
+   * ever sees them (00546630.c:79/:87); do it once here. */
+  state.schemeColors = shaderTerms(s.colors.map(c => ({
+    r: c[0], g: c[1], b: c[2], frequency: c[3], initial: c[4]
+  })), s.gf, s.gi);
+  state.schemeBri = {
+    finite: s.briFinite, infinite: s.briInfinite, factor: s.briFactor
+  };
+  return true;
+}
+
+/* The original UI shows exactly `nparam` sliders for a scheme, each bound
+ * to one `params.param[i]`.  Generate them here rather than shipping a fixed
+ * set of controls: a scheme with one parameter must not show two sliders.
+ * Moving one re-shades the remembered iteration field, so it never pays for
+ * another iteration pass (FIELD_MEM hit). */
+function syncSchemeParams() {
+  const box = $('scheme-params');
+  if (!box) return;
+  const s = state.schemeMeta || findSchemeAny(state.schemeId);
+  if (!s || !s.nparam) { box.hidden = true; box.innerHTML = ''; return; }
+  const en = getLang() === 'en';
+  const lib = findSchemeAny(state.schemeId);
+  const viewRow = lib && lib.view
+    ? `<div class="scheme-view-row">` +
+      `<label class="chk"><input type="checkbox" id="chk-scheme-view"` +
+      `${state.schemeFollowView ? ' checked' : ''}/>` +
+      `<span>${t('schemeFollowView')}</span></label>` +
+      `<button class="btn tiny" id="btn-scheme-view" type="button">${t('schemeGotoView')}</button>` +
+      `</div>`
+    : '';
+  box.hidden = false;
+  box.innerHTML =
+    `<div class="scheme-title">${t('schemeParams')}` +
+    `<span class="scheme-hint">${t('schemeParamsHint')}</span></div>` +
+    s.paramLabels.map((lab, i) => {
+      const v = Number.isFinite(+state.schemeParams[i]) ? +state.schemeParams[i] : 0;
+      return `<div class="row tight"><label>${en ? lab.en : lab.zh}</label>` +
+        `<input type="range" data-sp="${i}" min="0" max="1" step="0.005" value="${v}"/>` +
+        `<span class="val mono" data-spv="${i}">${v.toFixed(2)}</span></div>`;
+    }).join('') + viewRow;
+  const followChk = box.querySelector('#chk-scheme-view');
+  if (followChk) followChk.onchange = (e) => { state.schemeFollowView = !!e.target.checked; };
+  const gotoBtn = box.querySelector('#btn-scheme-view');
+  if (gotoBtn) gotoBtn.onclick = () => {
+    if (lib && lib.view && applySchemeView(lib.view)) {
+      state.schemeFollowView = true;
+      syncColorUi();
+      renderNow();
+    }
+  };
+  for (const inp of box.querySelectorAll('input[data-sp]')) {
+    inp.oninput = (e) => {
+      const i = +e.target.dataset.sp;
+      const v = +e.target.value;
+      state.schemeParams[i] = v;
+      const out = box.querySelector(`[data-spv="${i}"]`);
+      if (out) out.textContent = v.toFixed(2);
+      scheduleRender(90);
+    };
+  }
+}
+
+/* The trap row's own two sliders are only meaningful while a trap is on. */
+function syncTrapUi() {
+  const sel = $('sel-trap');
+  if (sel) sel.value = String(state.traps | 0);
+  const box = $('trap-params');
+  if (box) box.hidden = !(state.traps > 0);
+  const g = $('rng-trapgain');
+  if (g) { g.value = state.trapGain; $('val-trapgain').textContent = (+state.trapGain).toFixed(2); }
+  const r = $('rng-traprings');
+  if (r) { r.value = state.trapRings; $('val-traprings').textContent = (+state.trapRings).toFixed(2); }
+}
+
+/* Push the whole colour state into the controls: used at boot and whenever a
+ * preset or a saved link replaces the view. */
+function syncColorUi() {
+  const psel = $('sel-palette');
+  if (psel) psel.value = state.schemeId || state.palette;
+  syncSchemeParams();
+  const of = $('rng-offset');
+  if (of) { of.value = state.offset; $('val-offset').textContent = state.offset.toFixed(2); }
+  syncTrapUi();
+  const toneRows = [
+    ['rng-bri', 'val-bri', 'bri'],
+    ['rng-gr', 'val-gr', 'gr'], ['rng-gg', 'val-gg', 'gg'], ['rng-gb', 'val-gb', 'gb']
+  ];
+  for (const [id, vid, key] of toneRows) {
+    if ($(id)) $(id).value = state.tone[key];
+    if ($(vid)) $(vid).textContent = (+state.tone[key]).toFixed(2);
+  }
+  syncPaletteStrip();
+  /* With a GLSL scheme active the shader takes its table from the scheme, so
+   * the band ramp and its phase cannot affect the picture.  They are dimmed and
+   * made non-interactive instead of silently doing nothing, and come back the
+   * moment a band palette is selected. */
+  const schemeOn = !!state.glsl;
+  const ed = $('grad-ed');
+  if (ed) ed.classList.toggle('inert', schemeOn);
+  if (of) {
+    of.disabled = schemeOn;
+    const row = of.closest('.row');
+    if (row) row.classList.toggle('inert', schemeOn);
+  }
+}
+
+/* The native renderer implements the reference's four `color(Data)` bodies.
+ * These values are the indices of that switch (mb_core.cpp, shade()). */
+const COLOR_MODES = { bands: 0, iteration: 1, distance: 2, levels: 3 };
+function colorModeNow() {
+  const m = COLOR_MODES[state.scheme];
+  return m === undefined ? 0 : m;
+}
+
+/* ---------------- Render scheduling (progressive passes) ---------------- */
 let viewId = 0;
 let tileTotal = 0;
 let tileDone = 0;
 let lastMeta = null;
+/* Escape-count span over EVERY tile of the current pass.  `lastMeta` alone is
+ * whatever tile arrived last — often a uniform one at deep zoom — and reading
+ * "no structure" off it told the user a detailed frame had none. */
+let passStats = null;
+/* A pass can spend minutes inside one tile at deep zoom (every pixel runs the
+ * full iteration budget), and the HUD only repaints when a tile lands — so the
+ * elapsed clock used to freeze at "0% · 4712 ms" and look like a hang. */
+let passTick = 0, passStartAt = 0;
+function startPassClock(t0) {
+  passStartAt = t0;
+  if (passTick) return;
+  passTick = setInterval(updateHud, 500);
+}
+function stopPassClock() {
+  passStartAt = 0;
+  if (!passTick) return;
+  clearInterval(passTick);
+  passTick = 0;
+}
+function resetPassStats() { passStats = null; }
+function addPassStats(m) {
+  if (!m) return;
+  if (!passStats) passStats = { escMin: Infinity, escMax: -Infinity, bounded: 0 };
+  if (typeof m.escMin === 'number' && isFinite(m.escMin)) passStats.escMin = Math.min(passStats.escMin, m.escMin);
+  if (typeof m.escMax === 'number' && isFinite(m.escMax)) passStats.escMax = Math.max(passStats.escMax, m.escMax);
+  passStats.bounded += m.bounded | 0;
+}
 let renderTimer = 0;
 let quickTimer = 0;
 let wheelTimer = 0;
 let lastQuickAt = 0;
+/* Accumulated gesture transform since the last committed pass, in normalised
+ * units (src = sx*dst + ox).  Mirrors nc::Preview's composition exactly, so a
+ * live pass can be committed WITH this transform instead of snapping back. */
+let liveXform = { sx: 1, ox: 0, sy: 1, oy: 0 };
+function liveApply(ndx, ndy, scale, ncx, ncy) {
+  const inv = 1 / scale;
+  const nsx = inv, nox = ncx * (1 - inv) - ndx * inv;
+  const nsy = inv, noy = ncy * (1 - inv) - ndy * inv;
+  const L = liveXform;
+  liveXform = {
+    sx: L.sx * nsx, ox: L.sx * nox + L.ox,
+    sy: L.sy * nsy, oy: L.sy * noy + L.oy
+  };
+}
+function liveReset() { liveXform = { sx: 1, ox: 0, sy: 1, oy: 0 }; }
 let currentPass = 0;
 let frameStartAt = 0;
 let frameMs = 0;
+let frameSeq = 0;   // completed progressive chains, for measurement scripts
+
+/* ------------------------------------------------------------------
+ * Measurement: frame time breakdown.
+ *
+ * Where the work runs has to be decided by numbers, so the numbers stay
+ * reproducible: `__mb.seg(true)` logs one `[seg]` line per shaded pass with
+ * the four segments that split talks about —
+ *   field  CPU iteration field (reference orbit + per pixel, from the host)
+ *   copy   host shared buffer -> our own copy (it is reused next pass)
+ *   upload field -> texture (WebGL texSubImage2D / D3D11 UpdateSubresource)
+ *   shade  the fragment program, synchronised with gl.finish()
+ *   post   hand-over to the compositor (surface swap, HUD, snapshot copy)
+ * The host->page hop is `arrive` minus `field`; it is reported, not hidden.
+ * ------------------------------------------------------------------ */
+let segOn = false;
+let segCopyMs = 0;
+function segBegin() {
+  if (!segOn) return null;
+  return { t: performance.now(), copy: segCopyMs, upload: 0, shade: 0, post: 0 };
+}
+function segMark(rec, k, t0) { if (rec) rec[k] += performance.now() - t0; }
+function segReport(rec, meta, tag, w, h, arriveMs) {
+  if (!rec) return;
+  const m = meta || {};
+  const wall = performance.now() - rec.t;
+  const field = +m.ms || 0;
+  const arrive = +arriveMs || 0;
+  nativeLog(`[seg] ${tag} ${w}x${h} samples=${m.samples || 1} mode=${m.mode || '-'} ` +
+            `iter=${m.maxIterUsed || 0} refLen=${m.refLen || 0} ` +
+            `field=${field.toFixed(1)} (orbit=${(+(m.orbitMs) || 0).toFixed(1)} ` +
+            `px=${(+(m.renderMs) || 0).toFixed(1)}) ` +
+            `hop=${(arrive - field).toFixed(1)} ` +
+            `copy=${rec.copy.toFixed(1)} upload=${rec.upload.toFixed(1)} ` +
+            `shade=${rec.shade.toFixed(1)} post=${rec.post.toFixed(1)} ` +
+            `wall=${wall.toFixed(1)} total=${(arrive + wall).toFixed(1)}`);
+  const t1 = performance.now();
+  requestAnimationFrame(() =>
+    nativeLog(`[seg] paint ${tag} ${(performance.now() - t1).toFixed(1)}ms`));
+}
 
 /**
- * 渐进渲染：先粗后细。每一趟用更少的像素与更少的迭代，
- * 画面在所有趟里持续变清晰，而不是每次缩放都清屏重画。
+ * Progressive rendering: coarse first, then fine. Each pass uses fewer pixels and fewer iterations,
+ * so the image keeps sharpening across passes instead of clearing the canvas on every zoom.
  */
+/* Two passes, not three: a coarse frame to look at, then the real one.  The
+ * middle 0.5 pass cost a quarter of the final frame's pixels and was replaced
+ * within a second anyway — it only delayed the sharp frame. */
 const PASS_PLAN = [
-  { scale: 0.13, iter: 1 },
-  { scale: 0.38, iter: 1 },
-  { scale: 0.68, iter: 1 },
+  { scale: 0.16, iter: 1 },
   { scale: 1.0, iter: 1 }
 ];
-/* 缩放过程中的快速趟：只做两趟，够看清结构即可 */
-const QUICK_PLAN = [
-  { scale: 0.13, iter: 1 },
-  { scale: 0.38, iter: 1 }
+/* LIVE gesture rendering: one medium-resolution pass, re-issued while the
+ * gesture runs.  The old 0.13/0.38 pair replaced a sharp GPU preview with a
+ * visibly blurry thumbnail every 110 ms ("move -> blurry -> re-render").
+ * A single 0.62 pass keeps the structure readable, the C++ core's cross-frame
+ * vertex cache makes it cheap, and the committed frame keeps the accumulated
+ * gesture transform so the picture never snaps back mid-gesture. */
+const LIVE_PLAN = [
+  { scale: 0.62, iter: 1 }
 ];
-/* 各趟的权重（按像素量估算的完成度占比） */
-const PASS_WEIGHT = [0.02, 0.14, 0.46, 1.0];
+const QUICK_PLAN = LIVE_PLAN;
+/* Deep views commit in seconds, so a middle pass would only delay the final
+ * one: the same two-pass plan serves every depth. */
+const DEEP_PASS_PLAN = PASS_PLAN;
+/* Measurement only: a plan forced through `__mb.plan([...])` so the old
+ * three-pass plan and this one can be timed on the same view, same session. */
+let planOverride = null;
+function passPlanForNow() {
+  return planOverride || PASS_PLAN;
+}
+/* Weight of each pass (share of completion, estimated from pixel counts) */
+const PASS_WEIGHT = [0.04, 1.0];
 
 function passProgress(idx, frac) {
-  const a = idx === 0 ? 0 : PASS_WEIGHT[idx - 1];
-  const b = PASS_WEIGHT[idx];
+  const w = PASS_WEIGHT;
+  const a = idx === 0 ? 0 : w[Math.min(idx - 1, w.length - 1)];
+  const b = w[Math.min(idx, w.length - 1)];
   return Math.round((a + (b - a) * frac) * 100);
+}
+
+/* Native surface: true = the image lives in the shell's D3D child window and
+ * the page must be see-through; false = the page canvas is the visible one.
+ * Only ever turned on after a commit actually landed (see the flush handler),
+ * so a broken swapchain can never leave the window blank. */
+let nativeSurface = false;
+function setNativeSurface(on) {
+  if (!NATIVE || !nativeCanvasMode() || nativeSurface === on) return;
+  nativeSurface = on;
+  if (document.documentElement)
+    document.documentElement.classList.toggle('native-surface', on);
+  nativeLog(`[surface] native=${on ? 1 : 0}`);
 }
 
 const tileCv = document.createElement('canvas');
 const tileCtx = tileCv.getContext('2d');
+/* Whole-pass surface used by the native single-buffer path. */
+const frameCv = document.createElement('canvas');
+const frameCtx = frameCv.getContext('2d');
 
 function cancelAll() {
   mainQueue.length = 0;
   cancelRemote();
   viewId++;
+  if (NATIVE) nativeCancel(viewId);
+  // A superseded pass never settles (its tiles are dropped by the viewId
+  // check), so the live-pass latch has to be released here or the gesture
+  // pipeline stalls after the first full render.
+  liveBusy = false;
+  liveQueued = false;
+  /* A cancelled pass never reaches its "got === total" branch. */
+  stopPassClock();
 }
 
 function iterForPlan(plan) {
-  const total = state.autoIter ? autoIterNow() : state.maxIter;
+  const total = effectiveIterTotal();
   if (plan.iter >= 1) return total;
   return Math.max(48, Math.round(total * plan.iter));
 }
@@ -334,62 +1196,538 @@ function buildPayload(rect, W, H, iter) {
     },
     center: { ...state.center },
     span: { ...state.span },
+    /* The shell reads flat fields (centerRe/centerIm/spanMant/spanExp); the
+     * nested objects above are for the page's own bookkeeping.  Without these
+     * four the host silently kept its defaults, i.e. every frame was rendered
+     * at the start view no matter how far the user zoomed. */
+    centerRe: state.center.re,
+    centerIm: state.center.im,
+    spanMant: Math.abs(state.span.m),
+    spanExp: state.span.e,
     pixelSize: ps,
     psMant: pm,
     psExp: pe,
     psLog2: Math.log2(Math.abs(pm)) + pe,
-    maxIter: iter != null ? iter : (state.autoIter ? autoIterNow() : state.maxIter),
+    maxIter: iter != null ? iter : effectiveIterTotal(),
     bits: state.bits,
     palette: state.palette,
+    ...nativeColourSet(),
+    /* Colour set: the ramp (with real handle positions) and the tone stage.
+     * Without these three the shell kept its own default palette, which is why
+     * editing colours appeared to do nothing. */
+    /* The reference drives band spacing from each scheme's own frequency;
+     * a fitted band count would re-phase the whole frame on every zoom. */
+    bands: Math.max(0, state.bands | 0),
+    /* Detail: how small a feature the frame is asked to draw.  This is the
+     * knob that decides whether a deep view reads as lines or as speckle. */
+    detail: clamp(state.detail | 0, 0, 3),
+    /* The trap statistic is accumulated by the iteration pass itself; the host
+     * hands it back in the field's fourth channel. */
+    traps: state.traps | 0,
+    ncycle: state.cycleAuto ? 0 : Math.max(0.02, state.cycle),   // 0 = fit to frame
+    tone: { ...state.tone },
+    colorMode: colorModeNow(),
     cycle: effectiveCycle(),
     offset: state.offset,
+    rotation: state.rotation || 0,
+    // Distance-estimate rim: outlines the body/branches so they read against
+    // the iteration bands instead of dissolving into them.
+    de: { on: true, width: 1.0, strength: 0.55 },
+    // Reference colour scheme (see colorschemes.json in the reference app):
+    // 1 = "Distance" — empty field black, one-pixel white rim, interior colour.
+    scheme: state.scheme === 'distance' ? 1 : 0,
+    shade: state.shade | 0,
+    dither: state.shade === 3,
+    /* Tile-slot diagnostic (see worker.js `job.dbg`): opt-in only. */
+    dbg: !!window.__mbDbgWasm,
     samples: 1
   };
 }
 
+/* Multiply a binary-exponent span, keeping the mantissa in [1, 2). */
+function scaleSpan(sp, k) {
+  let m = sp.m * k, e = sp.e;
+  while (m >= 2) { m /= 2; e += 1; }
+  while (m > 0 && m < 1) { m *= 2; e -= 1; }
+  return { m, e };
+}
+
 function autoIterNow() {
-  const it = autoIterFor(depthNow());
-  // 自定义公式走 JS 路径（高精度环境 + 级数扰动），迭代贵得多，上限收紧
-  if (state.spec.mode === 'x') return Math.min(it, 6000);
+  let it = autoIterFor(depthNow());
+  // Custom formulas take the JS path (high-precision environment + series perturbation); iterations cost far more, so tighten the cap
+  if (state.spec.mode === 'x') it = Math.min(it, 6000);
+  /* The rank scales the automatic budget: 100 is the full count, 1 is one per
+   * cent of it.  Fewer iterations loses the finest filigree first, which is
+   * exactly what makes the body of the shape read more clearly — and it is
+   * also proportionally faster, so the slider doubles as a speed control. */
+  const rank = clamp(state.autoRank | 0 || 100, 1, 100);
+  return Math.max(16, Math.round(it * rank / 100));
+}
+
+/* Iteration budget for one pass.
+ *
+ * A preset stores a fixed count that suits *its own* framing.  Zooming into a
+ * preset with that count frozen is exactly how "it works at 10^10 and dies at
+ * 10^15" happens: the frame needs tens of thousands of iterations and is only
+ * allowed the preset's 1150, so everything is painted as interior.  While a
+ * preset is the current view the count therefore follows the depth, with a
+ * floor so the preset's own look is preserved at its own scale.  Any manual
+ * edit of the iteration control clears the preset and takes over again.
+ */
+function effectiveIterTotal() {
+  const auto = autoIterNow();
+  if (state.autoIter) return auto;
+  let it = state.maxIter;
+  if (state.presetId && state.spec.mode !== 'x') it = Math.max(it, Math.round(auto * 0.6));
   return it;
 }
 
 function effectiveCycle() {
   if (!state.cycleAuto) return Math.max(2, state.cycle);
-  const it = state.autoIter ? autoIterNow() : state.maxIter;
-  return clamp(Math.round(it / 180), 6, 400);
+  const it = effectiveIterTotal();
+  /* Bands per *frame*, and only logarithmically dependent on depth.
+   *
+   * Two failures were measured here.  `it / 180` gave ~9 cycles on the default
+   * view, so the palette's white mid-band covered the whole exterior (flat
+   * halo).  `it / 18` fixed that view but at 1e-15 (it = 16000) it asked for
+   * 890 cycles; the iteration range *across the screen* there is only a few
+   * hundred, so every one-iteration difference flipped the hue — the purple /
+   * teal speckle people see as "colours went wrong and overflowed".
+   *
+   * The band count has to track the visible iteration *range*, which grows like
+   * log(depth), not like maxIter.  6 cycles per octave of depth keeps 60-120
+   * bands at every zoom level: thin white filigree up close, smooth field far
+   * out, and no hue noise where the field is nearly constant. */
+  return clamp(Math.round(6 * Math.log2(Math.max(2, it))), 24, 200);
 }
 
-/** 把一趟瓦片画到画布：低分辨率趟用平滑放大，避免出现马赛克块 */
+/** Draw one pass of tiles onto the canvas: low-resolution passes are smoothly upscaled so no mosaic blocks appear */
 function drawTile(msg, scale) {
+  /* `tailKept` is the worker's workspace self-check: bytes of the tile slot the
+   * kernel failed to write (always 0 on a healthy layout). */
   if (window.__mbDebug) {
     (window.__mbTiles = window.__mbTiles || []).push({
       x: msg.x, y: msg.y, w: msg.w, h: msg.h, s: scale,
-      mode: msg.meta && msg.meta.mode, gl: msg.meta && msg.meta.glitches
+      mode: msg.meta && msg.meta.mode, gl: msg.meta && msg.meta.glitches,
+      tailKept: msg.meta && msg.meta.tailKept
     });
   }
-  const img = new ImageData(new Uint8ClampedArray(msg.data), msg.w, msg.h);
-  if (scale >= 1) {
-    ctx.putImageData(img, msg.x, msg.y);
-    return;
+  composeTile(ctx, { canvas: tileCv, ctx: tileCtx }, msg, scale);
+}
+
+/**
+ * Paint a whole pass that arrived in one buffer.  One putImageData plus one
+ * scaled drawImage replaces N per-tile composites; AA reduction and smooth
+ * upscaling still go through the same drawlib path, so the look is identical.
+ */
+function paintFrame(f, scale) {
+  if (!f || !f.data) return;
+  composeTile(ctx, { canvas: frameCv, ctx: frameCtx },
+    { x: 0, y: 0, w: f.w, h: f.h, data: f.data }, scale);
+}
+
+/* ------------------------------------------------------------------
+ * GPU pass.
+ *
+ * One request for the whole frame, and the shell returns the iteration field
+ * rather than pixels.  Everything after that is one draw call.
+ *
+ * Why this is worth a second pipeline: the field does not depend on the
+ * colours, so a scheme change re-runs only the shader — the reference program
+ * behaves the same way, which is why its palette sliders are instant no matter
+ * how deep the view is.  It is also the only route to the presets whose whole
+ * look is a fragment shader.
+ *
+ * Returns true when it took the pass; false means "fall back to CPU tiles".
+ * ----------------------------------------------------------------*/
+/* ---------------- Field memory ----------------
+ * The reference keeps its computed AREA / PREPIXELS around and only
+ * recomputes what a new view actually invalidates (00427ab0.c:152,
+ * 00498570.c:88-107).  Here the equivalent is the iteration field itself:
+ * it is a property of the *view*, never of the colours.  Remembering the last
+ * few finished fields means a palette edit, a tone change, a zoom back out or
+ * a return to a preset costs one shader draw instead of another full
+ * iteration pass — the "already rendered work is remembered" behaviour.
+ *
+ * The key deliberately excludes every colour term.  A host buffer is reused
+ * on the next pass, so the cached copy must be our own, not a view onto it. */
+const FIELD_MEM = new Map();
+let fieldMemBytes = 0;
+/* 96 MB default; `cachesize` (9/10/11 -> 1/4, 1x, 4x) and `totalmemory`
+ * (at most a quarter) from appdata\mandelbrot.json scale it. */
+let FIELD_MEM_BUDGET = 96 * 1024 * 1024;
+function fieldMemoryKey(p) {
+  const s = p.spec || {};
+  /* Everything that can change the *field* must be here; everything that
+   * only changes the colour must not be.  A custom formula, a different
+   * precision or a distance channel all produce a different field, while a
+   * palette, tone, cycle, phase or GLSL scheme produce the same one. */
+  return [p.centerRe, p.centerIm, p.spanMant, p.spanExp, p.width, p.height,
+          p.rotation || 0, p.maxIter, p.quality, p.bits,
+          p.colorMode, p.scheme, p.shade, p.dither, p.traps, !!p.inverse,
+          !!p.fieldValue,
+          p.de && p.de.on, p.de && p.de.width, p.de && p.de.strength,
+          s.mode, s.kind, s.power, s.juliaReS || '', s.juliaImS || '',
+          s.julia && s.julia.re || '', s.julia && s.julia.im || '',
+          s.newtonDegree, s.phoenixP, s.customExpr || '',
+          JSON.stringify(s.customParams || {})].join('|');
+}
+function rememberField(key, w, h, data, meta, ch) {
+  const bytes = data.byteLength;
+  if (!bytes || bytes > 64 * 1024 * 1024) return;
+  const prev = FIELD_MEM.get(key);
+  if (prev) { fieldMemBytes -= prev.data.byteLength; FIELD_MEM.delete(key); }
+  FIELD_MEM.set(key, { w, h, ch: ch === 6 ? 6 : 4, data, meta });
+  fieldMemBytes += bytes;
+  while (fieldMemBytes > FIELD_MEM_BUDGET && FIELD_MEM.size > 1) {
+    const oldest = FIELD_MEM.keys().next().value;
+    const rec = FIELD_MEM.get(oldest);
+    fieldMemBytes -= rec.data.byteLength;
+    FIELD_MEM.delete(oldest);
   }
-  tileCv.width = msg.w;
-  tileCv.height = msg.h;
-  tileCtx.putImageData(img, 0, 0);
-  const x0 = msg.x / scale, y0 = msg.y / scale;
-  const x1 = (msg.x + msg.w) / scale, y1 = (msg.y + msg.h) / scale;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(tileCv, 0, 0, msg.w, msg.h, x0, y0, x1 - x0, y1 - y0);
+}
+
+function gpuPass(vId, plan, done, planList) {
+  /* A user-typed iteration formula is not something the native field kernel can
+   * evaluate.  Taking the GPU path here would quietly paint the built-in z^2
+   * set and keep the shader's colours — the formula would look "applied" while
+   * being ignored.  Custom mode therefore stays on the worker renderer, whose
+   * deep tier owns the high-precision reference orbit and the jet series. */
+  if (state.spec.mode === 'x') return false;
+  const W = canvas.width, H = canvas.height;
+  if (!W || !H) return false;
+  const s = plan.scale;
+  const final = plan.scale >= 1;
+  const pw = Math.max(16, Math.round(W * s));
+  const ph = Math.max(16, Math.round(H * s));
+  const iter = iterForPlan(plan);
+  const idx = planList ? Math.max(0, planList.indexOf(plan)) : 0;
+
+  const payload = buildPayload({ x: 0, y: 0, w: pw, h: ph }, pw, ph, iter);
+  payload.quality = final ? 2 : 1;
+  payload.aa = 1;                       // the shader supersamples, not the kernel
+
+  const terms = nativePaletteTerms(state.palette) || {};
+  const flat = terms.palColors || [];
+  /* `paletteStopList` already returns {pos, r, g, b} handles; an edited ramp
+   * may still be raw [r,g,b] triples, so normalise both into one shape. */
+  const stopsRaw = (state.stops && state.stops.length)
+    ? state.stops
+    : paletteStopList(state.palette);
+  const stopList = (stopsRaw || []).map((c, i, a) => Array.isArray(c)
+    ? { pos: i / Math.max(1, a.length - 1), r: c[0], g: c[1], b: c[2] }
+    : { pos: c.pos, r: c.r, g: c.g, b: c.b });
+  /* An official codegl is the authority when one is installed: the reference
+   * compiles that source verbatim and feeds it the scheme's own Params.
+   * A ramp the user has edited outranks it, otherwise dragging a stop on an
+   * official scheme would silently do nothing. */
+  const hasGlsl = !!(state.glsl && state.glsl.trim());
+  const editedRamp = !!(state.stops && state.stops.length >= 2);
+  const scheme = state.schemeMeta || findSchemeAny(state.schemeId);
+  const useRamp = editedRamp || (!hasGlsl && !flat.length);
+  /* An orbit trap owns the colour stage while it is on.  Its statistic lives
+   * in the field's fourth channel, which every other shader reads as `dist2`,
+   * so running both at once would make one of them lie. */
+  const trapMode = state.traps | 0;
+  const trapOn = trapMode > 0;
+  const rampShade = useRamp && !trapOn;
+  /* Only a codegl that is actually shading keeps its own Params/colour table;
+   * a ramp run uses param[0] as iterations-per-cycle and param[1] as phase. */
+  const glslActive = !trapOn && hasGlsl && !useRamp;
+
+  /* The reference's `samples` is per-pixel supersampling inside the shader.
+   * Every official scheme ships its own count (2 or 4), so a still frame uses
+   * that rather than a global setting.  Gesture passes stay at one. */
+  const samples = final
+    ? (scheme ? clamp(scheme.samples | 0, 1, 4) : clamp(state.aa | 0, 1, 4))
+    : 1;
+
+  const schemeSrc = trapOn ? GLSL_BUILTIN.trap.src
+                           : (glslActive ? state.glsl
+                              : (useRamp ? GLSL_BUILTIN.ramp.src : activeSchemeSrc()));
+  /* Already known to fail to compile: do not even try, and do not take the
+   * whole GPU path down with it. */
+  if (badSchemeSrc && schemeSrc === badSchemeSrc) return false;
+  /* The channel mask is the scheme's own contract with the colour library:
+   * built-ins declare exactly the members they read, a loaded codegl brings the
+   * reference's `channels` number, and anything else is inferred from its body. */
+  const schemeChannels = trapOn ? GLSL_BUILTIN.trap.channels
+    : useRamp ? GLSL_BUILTIN.ramp.channels
+    : activeSchemeChannels();
+  /* Only the two Distance schemes (and a codegl declaring those channels)
+   * need the derivative recurrence.  An orbit trap writes its own value into
+   * channel a and does not read dist, so it does not need it either.  On a
+   * deep frame this removes one complex multiply per iteration per pixel. */
+  payload.fieldDist = !trapOn && !!(schemeChannels & (CHANNEL.DIST | CHANNEL.DIST2));
+  /* CHANNEL_VALUE (and CHANNEL_DERIVATIVE, which the reference aliases onto the
+   * same two textures) needs z at the escape point.  That is a second field
+   * plane — 50% more shared memory and one extra float pair per pixel — so it
+   * is requested only by a scheme that actually reads it. */
+  payload.fieldValue = !trapOn &&
+    !!(schemeChannels & (CHANNEL.VALUE | CHANNEL.DERIVATIVE));
+  /* A scheme that samples tex_aux needs the auxfile image; load it once, and
+   * the pending draw below already runs with whatever is uploaded by then. */
+  if (/\btex_aux\b/.test(schemeSrc)) ensureAuxTexture();
+  const err = gpu.setScheme(schemeSrc, samples, schemeChannels);
+  if (err) {
+    /* One shader failing to compile must not cost the session its GPU path.
+     * It used to set gpuOk = false for good, so a single bad `codegl` dropped
+     * every later frame onto the CPU renderer — which looks exactly like "the
+     * colour controls stopped working".  Remember the offending source and
+     * skip only that one. */
+    nativeLog('[glsl] ' + err.slice(0, 1200));
+    /* Keep the failure attributable: the verification run switches through the
+     * reference's schemes and needs to say which one did not compile. */
+    (window.__mbShaderErrors = window.__mbShaderErrors || [])
+      .push({ id: state.schemeId || null, err: String(err).slice(0, 400) });
+    badSchemeSrc = schemeSrc;
+    return false;
+  }
+
+  const passT0 = performance.now();
+  startPassClock(passT0);
+  const fk = fieldMemoryKey(payload);
+
+  /* One shade step, shared by a fresh field and a remembered one. */
+  const shade = (w, h, data, ch, meta, ms, cached) => {
+    const seg = segBegin();
+    const u0 = performance.now();
+    if (ch >= 6) {
+      /* Planar field: the colour plane first, then one value texel per pixel
+       * (z at the escape point).  Both are subarray views — no repacking, which
+       * would cost a 15 M float rewrite on a 2.5 Mpx window. */
+      const plane = w * h * 4;
+      gpu.uploadField(data.subarray(0, plane), w, h);
+      gpu.uploadAux(data.subarray(plane, plane + w * h * 2), w, h);
+    } else {
+      gpu.uploadField(data, w, h);
+    }
+    gpu.resize(w, h);
+    segMark(seg, 'upload', u0);
+
+    const colors = [];
+    if (trapOn) {
+      /* The trap shader still calls pal(), so it needs a table.  An additive
+       * palette supplies its own terms; a ramp palette has none, and the
+       * program's own default three-term table is what the reference falls
+       * back to in that case. */
+      if (flat.length) {
+        for (let i = 0; i + 4 < flat.length && colors.length < 20; i += 5) {
+          colors.push({ r: flat[i], g: flat[i + 1], b: flat[i + 2],
+                        frequency: flat[i + 3], initial: flat[i + 4] });
+        }
+      } else {
+        for (const c of TRAP_DEFAULT_SHADER_COLORS) colors.push({ ...c });
+      }
+    } else if (glslActive) {
+      /* The scheme's own UniformsColor table (params.color[].c/frequency/
+       * initial).  Without it every `mix(c, params.color[0].c, …)` in an
+       * official codegl would blend toward black. */
+      for (const c of (state.schemeColors || [])) {
+        if (colors.length >= 20) break;
+        colors.push({ r: +c.r || 0, g: +c.g || 0, b: +c.b || 0,
+                      frequency: +c.frequency || 0, initial: +c.initial || 0 });
+      }
+    } else if (!useRamp) {
+      for (let i = 0; i + 4 < flat.length && colors.length < 20; i += 5) {
+        colors.push({ r: flat[i], g: flat[i + 1], b: flat[i + 2],
+                      frequency: flat[i + 3], initial: flat[i + 4] });
+      }
+    }
+    const briF = glslActive ? state.schemeBri.finite
+                         : (terms.briFinite != null ? terms.briFinite : 1);
+    const briI = glslActive ? state.schemeBri.infinite
+                         : (terms.briInfinite != null ? terms.briInfinite : 1);
+    /* Brightness and the per-channel gains are the only console controls with
+     * a counterpart in the reference (brightnessfinite/infinite and the
+     * UniformsColor table).  Contrast, gamma, saturation and hue were removed
+     * rather than left inert. */
+    const T = state.tone;
+    const gR = +T.gr || 1, gG = +T.gg || 1, gB = +T.gb || 1;
+    const toneBri = T.bri == null ? 1 : +T.bri;
+    if (gR !== 1 || gG !== 1 || gB !== 1) {
+      for (const c of colors) { c.r *= gR; c.g *= gG; c.b *= gB; }
+    }
+    const drawOpts = {
+      colors,
+      stops: rampShade ? stopList.map(s => ({
+        pos: s.pos, r: s.r * gR, g: s.g * gG, b: s.b * gB
+      })) : [],
+      briFinite: briF * toneBri,
+      briInfinite: briI * toneBri,
+      briFactor: glslActive ? state.schemeBri.factor : 1,
+      /* Official schemes read params.param[i] — distance scale, detail
+       * distance or iteration limit — from their own sliders.  A ramp instead
+       * uses param[0] for iterations-per-cycle and param[1] for the phase. */
+      param: glslActive
+        ? [...state.schemeParams, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].slice(0, 10)
+        : (trapOn
+            ? [trapParam().gain, trapParam().rings, 0, 0, 0, 0, 0, 0, 0, 0]
+            : [effectiveCycle(), state.offset, 0, 0, 0, 0, 0, 0, 0, 0]),
+      julia: state.spec.mode === 'j',
+      inverse: !!state.inverse,
+      /* The reference's own clock.  A scheme that reads it animates; one that
+       * does not sees a constant, exactly as in the original program. */
+      time: schemeTime()
+    };
+    const d0 = performance.now();
+    gpu.draw(drawOpts);
+    /* Measurement only: the draw call is asynchronous, so the shader's cost is
+     * only visible after a sync.  Off by default (it costs a pipeline drain). */
+    if (seg) gpu.gl.finish();
+    segMark(seg, 'shade', d0);
+    /* The reference's second viewport is shaded by the same program instance;
+     * hand it the compiled scheme and the exact Params we just used. */
+    lastDraw = { ...drawOpts, src: schemeSrc, samples, final, fieldLive: true };
+    if (juliaView) juliaView.redraw();
+
+    /* The shader layer is the picture now: hide the 2D one and let the
+     * compositor do the rest.  No full-frame copy — on a 2.96 Mpx window that
+     * copy alone measured longer than the iteration pass it was copying. */
+    const p0 = performance.now();
+    setGlSurface(true);
+    try {
+      const d = gpu.gl.getExtension('WEBGL_debug_renderer_info');
+      const probe = new Uint8Array(4);
+      gpu.gl.readPixels((gpu.canvas.width / 2) | 0, (gpu.canvas.height / 2) | 0,
+                        1, 1, gpu.gl.RGBA, gpu.gl.UNSIGNED_BYTE, probe);
+      nativeLog(`[gl] ${w}x${h} stops=${stopList.length} ramp=${useRamp} ` +
+                `cyc=${effectiveCycle().toFixed(2)} err=${gpu.gl.getError()} ` +
+                `samples=${samples} px=${probe[0]},${probe[1]},${probe[2]} ` +
+                `cached=${cached} briF=${(+briF || 0).toFixed(2)} ` +
+                `briI=${(+briI || 0).toFixed(2)} ` +
+                `scheme=${scheme ? scheme.name : '-'} ` +
+                `param=${hasGlsl ? state.schemeParams.map(v => (+v).toFixed(2)).join(',') : '-'} ` +
+                `glsl=${state.glsl ? state.glsl.length : 0}B ` +
+                `renderer=${d ? gpu.gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : '?'}`);
+    } catch (e) {
+      nativeLog('[gl] diag failed: ' + (e && e.message));
+    }
+    tileTotal = 1;
+    tileDone = 1;
+    currentPass = idx;
+    resetPassStats();
+    addPassStats(meta);
+    lastMeta = Object.assign({}, meta || {}, { ms });
+    updateHud();
+    takeSnapshot();
+    if (!splash.finished && final) splash.finish();
+    startShadeAnimation();
+    segMark(seg, 'post', p0);
+    segReport(seg, meta, 'gpu', w, h);
+  };
+
+  /* A remembered field needs only a shader draw: the palette, tones and
+   * scheme may all have changed (setScheme above already rebuilt the shader),
+   * but the iteration field itself has not. */
+  const mem = FIELD_MEM.get(fk);
+  const wantCh = payload.fieldValue ? 6 : 4;
+  if (mem && mem.w === pw && mem.h === ph && mem.ch === wantCh &&
+      mem.data.length === pw * ph * wantCh) {
+    FIELD_MEM.delete(fk); FIELD_MEM.set(fk, mem);   // refresh LRU order
+    shade(pw, ph, mem.data, mem.ch, mem.meta, performance.now() - passT0, 1);
+    nativeLog(`[field] hit ${pw}x${ph} mem=${FIELD_MEM.size} ` +
+              `${(fieldMemBytes / 1048576).toFixed(1)}MB`);
+    done();
+    return true;
+  }
+
+  const took = nativeField(payload, (msg) => {
+    if (!msg || msg.viewId !== vId) return;
+    /* A later view has been requested while this field was computing; the
+     * result is stale and painting it would flash the old picture. */
+    if (vId !== viewId) return;
+    const ms = performance.now() - passT0;
+    /* Remember every pass, not just the final one: a palette edit otherwise
+     * still recomputes the skeleton and normal fields.  The host reuses its
+     * shared buffer on the next pass, so a field we intend to keep must own its
+     * bytes; a field the memory budget cannot hold is shaded straight out of the
+     * host buffer instead and never copied. */
+    {
+      const bytes = msg.data.byteLength;
+      /* `state.forceCopy` reproduces the old unconditional copy, so its cost can
+       * be measured on the same view instead of being estimated. */
+      const keep = state.forceCopy ||
+                   (bytes > 0 && bytes <= 64 * 1024 * 1024 &&
+                    (FIELD_MEM.has(fk) ||
+                     fieldMemBytes + bytes <= FIELD_MEM_BUDGET) &&
+                    !state.noFieldCache);
+      if (keep) {
+        const c0 = performance.now();
+        const copy = msg.data.slice ? msg.data.slice() : new Float32Array(msg.data);
+        rememberField(fk, msg.w, msg.h, copy, msg.meta, msg.ch);
+        segCopyMs = performance.now() - c0;
+      } else {
+        segCopyMs = 0;
+        nativeLog(`[field] nocopy ${msg.w}x${msg.h} ` +
+                  `${(bytes / 1048576).toFixed(1)}MB cache=${(fieldMemBytes / 1048576).toFixed(1)}MB`);
+      }
+    }
+    shade(msg.w, msg.h, msg.data, msg.ch, msg.meta, ms, 0);
+    done();
+  });
+  return took;
 }
 
 function runPass(vId, plan, done, planList) {
   const W = canvas.width, H = canvas.height;
-  const s = plan.scale;
-  const pw = Math.max(8, Math.round(W * s));
-  const ph = Math.max(8, Math.round(H * s));
+  /* The field about to be computed is not the one on the GPU any more, so the
+   * clock must stop painting over it until the new one is shaded. */
+  if (lastDraw) lastDraw.fieldLive = false;
+  let s = plan.scale;
+  /* GPU path first: one whole-frame field, shaded in one fragment pass.  It is
+   * taken whenever the depth and the scheme allow it, because everything the
+   * field carries (the smooth count, the distance estimate, the escape count)
+   * is exactly what the reference's shaders read — and a colour change then
+   * costs one draw call instead of another iteration pass. */
+  if (gpuOk && state.gpu && NATIVE &&
+      gpuPass(vId, plan, done, planList)) return;
+  /* The 2D canvas is the picture from here on: with a custom formula (or a
+   * scheme that failed to compile) the shader layer must not stay on top of
+   * it, or the frames painted below would be invisible. */
+  setGlSurface(false);
+  /* Supersampling: only the final (full-resolution) pass is rendered at
+     s x aa and box-reduced by the drawing layer.  Progressive low-res passes
+     stay 1x so the zoom preview keeps its latency. */
+  const final = plan.scale >= 1;
+  /* An hd canvas already doubles the sample count, so a 3x final pass on a
+     large window would allocate tens of megapixels.  Cap the *effective*
+     factor (not the user's setting) so one pass stays under ~16 MP. */
+  let ss = final ? Math.max(1, Math.min(4, state.aa | 0)) : 1;
+  while (ss > 1 && (W * ss) * (H * ss) > 16e6) ss--;
+  /* A device-pixel buffer is already a supersample: at dpr 1.9 the canvas holds
+   * 2x the CSS pixels, so stacking 2x2 supersampling on top rendered 12 MP for
+   * a 6 MP screen — four times the work for no visible difference.  The budget
+   * is "at most 2 samples per CSS pixel". */
+  const dprNow = Math.min(2, window.devicePixelRatio || 1);
+  while (ss > 1 && ss * dprNow > 2) ss--;
+  /* Deep passes pay double-double arithmetic per pixel, so the pass cost is
+   * quadratic in `ss` exactly where latency matters most.  The lattice output
+   * is already interpolated (the rim comes from a signed-distance zero
+   * crossing, not from point samples), so supersampling buys very little
+   * there: measured 3732 ms -> ~950 ms for the same frame at ss=1.
+   * Keep one sample and spend the budget on the live cadence instead. */
+  if (final && psLog2Now() <= -45) ss = 1;
+  /* NB: the pass buffer is declared to the shell as cw*ss x ch*ss, and the
+   * compositor maps it 1:1 onto the canvas, so a pass may not be rendered at
+   * an arbitrary fraction of the canvas.  Depth therefore buys its speed from
+   * ss (above) and from the live-pass scale, not from a hidden downscale. */
+  const pw = Math.max(8, Math.round(W * s * ss));
+  const ph = Math.max(8, Math.round(H * s * ss));
   const iter = iterForPlan(plan);
-  const tw = Math.max(40, Math.round(TILE * Math.max(s, 0.5)));
+  /* The deep-zoom kernel works on one viewport-wide lattice, so splitting the
+   * frame into 48 px tiles makes every tile rebuild that lattice from the root
+   * cell — N tiles x (a few MB of vertex table) x per-tile tree walk.  It is
+   * both slower than one full-frame pass and prone to seams.  Above the
+   * perturbation threshold the pass therefore runs as a single tile and the
+   * native pool parallelises inside it. */
+  const deepPass = psLog2Now() <= -45;
+  /* One tile must fit the shell's 1 MB shared slot (512x512 RGBA), so the
+   * upper bound is a hard 512 even when supersampling asks for more. */
+  const tw = deepPass
+    ? Math.max(pw, ph)
+    : Math.min(512, Math.max(40, Math.round(Math.min(TILE, state.tilePx || TILE) *
+                                            Math.max(s, 0.5) * ss)));
   const tiles = [];
   for (let y = 0; y < ph; y += tw) {
     for (let x = 0; x < pw; x += tw) {
@@ -402,28 +1740,92 @@ function runPass(vId, plan, done, planList) {
   const total = tiles.length;
   const idx = planList.indexOf(plan);
   let got = 0;
-  const final = plan.scale >= 1;
   currentPass = idx;
+  resetPassStats();
+
+  // Single-buffer mode: the native shell writes every tile of this pass into
+  // one shared surface and publishes it once, so the per-tile round trip
+  // (and its putImageData) disappears from the hot path.
+  const probe = buildPayload(tiles[0], pw, ph, iter);
+  const useFrame = NATIVE && nativeFrameReady() && nativeCapable(probe.spec, probe.psLog2);
+  if (useFrame) nativeFrameBegin(vId, pw, ph, ss, W, H);
+  // This pass will paint the page canvas (JS fallback) — make sure it is visible.
+  else setNativeSurface(false);
+  const passT0 = performance.now();
+  startPassClock(passT0);
 
   for (const rect of tiles) {
     const payload = buildPayload(rect, pw, ph, iter);
+    // Skeleton pass -> normal -> final.  The native kernel spends far fewer
+    // iterations on the coarse passes and only the structure bands get the
+    // full budget, so the first frame lands without waiting for the whole view.
+    payload.quality = idx === 0 ? 0 : (final ? 2 : 1);
+    /* The reference always renders SAMPLES x SAMPLES sub-pixels (its
+     * examples ship samples = 2).  `ss` is the page-side resolution
+     * multiplier, which would cost 4x memory; the core's `aa` does the
+     * same thing adaptively on the pixels that need it, so the final
+     * pass asks for that and the preview passes stay at 1. */
+    payload.aa = final ? 2 : 1;
+    payload.frame = useFrame;
     dispatch({
       payload,
       onDone: (msg) => {
         if (msg.viewId !== vId) return;
-        drawTile(msg, s);
+        /* The compositor scale is a property of the *pass buffer*, not of this
+         * tile: every tile is rendered into a pw x ph buffer (pw already
+         * includes s and ss) and must map 1:1 onto the canvas with the same
+         * ratio.  Passing `s * ss` here was wrong for the incremental passes:
+         * they run with ss = 1, so a tile rendered at full buffer resolution
+         * was blitted at 1:1 into a canvas that is half that size — twice too
+         * large, at the wrong place, over the top of an already correct frame.
+         * That is the black band that appeared every 256 pixels. */
+        if (!msg.frame) drawTile(msg, pw / ctx.canvas.width);
+        addPassStats(msg.meta);
         lastMeta = msg.meta;
         got++;
         tileTotal = total;
         tileDone = Math.round(passProgress(idx, got / total) / 100 * total);
-        updateHud();
+        // Ten DOM writes per tile force a layout each time and dominate the
+        // pass latency; one update per animation frame is enough for the HUD.
+        updateHudSoon();
         if (got === total) {
-          takeSnapshot();
-          if (!splash.finished) {
-            if (idx === 0) splash.set(0.68, 'bootFirst');
-            else if (idx === 1) splash.finish();
-          }
-          done();
+          // The HUD's "done" time must be this pass, not the last tile's:
+          // the final pass is split into many small tiles whose per-tile
+          // renderMs rounds to 0, which made the HUD look timing-less.
+          lastMeta = Object.assign({}, msg.meta, { ms: performance.now() - passT0 });
+          stopPassClock();
+          updateHud();
+          const settle = () => {
+            takeSnapshot();
+            if (nativeCanvasMode())
+              nativeLog(`[pass] view=${vId} idx=${idx} scale=${s} ss=${ss} ` +
+                        `ms=${(performance.now() - passT0).toFixed(1)}`);
+            if (!splash.finished) {
+              if (idx === 0) splash.set(0.68, 'bootFirst');
+              else if (idx === 1) splash.finish();
+            }
+            done();
+          };
+          if (useFrame) {
+            /* Hand the accumulated transform to the shell and rebase the page
+             * IMMEDIATELY: preview events arriving between the flush message
+             * and its ack must accumulate on the new frame, exactly like the
+             * shell does after CommitPassWithPreview. */
+            const xf = liveXform;
+            liveReset();
+            nativeFrameFlush(vId, (f) => {
+              /* While the D3D surface is the visible one, copying the pass into
+               * the (hidden) page canvas is pure cost — 11.8 Mpx putImageData +
+               * drawImage per commit.  Only paint when this frame is what the
+               * user actually sees, i.e. before the first successful commit or
+               * after a fallback pass. */
+              if (!nativeSurface) paintFrame(f, pw / ctx.canvas.width);
+              // A landed commit means the swapchain now holds this frame; from
+              // here on the page can be transparent without going blank.
+              if (f && f.w && f.ok !== false) setNativeSurface(true);
+              settle();
+            }, xf);
+          } else { liveReset(); settle(); }
         }
       }
     });
@@ -431,7 +1833,7 @@ function runPass(vId, plan, done, planList) {
   if (!final) updateHud();
 }
 
-function renderPlan(plan) {
+function renderPlan(plan, onDone) {
   cancelAll();
   frameStartAt = performance.now();
   const vId = viewId;
@@ -439,21 +1841,103 @@ function renderPlan(plan) {
   tileTotal = 0;
   let i = 0;
   const next = () => {
-    if (vId !== viewId) return;
+    if (vId !== viewId) { nativeLog(`[plan-abort] view=${vId} idx=${i} viewId=${viewId}`); return; }
     if (i >= plan.length) {
       frameMs = performance.now() - frameStartAt;
+      frameSeq++;
+      stopPassClock();
       updateHud(true);
       takeSnapshot();
+      if (onDone) onDone();
       return;
     }
-    runPass(vId, plan[i++], next, plan);
+    const idx = i++;
+    try {
+      runPass(vId, plan[idx], next, plan);
+    } catch (err) {
+      nativeLog(`[js-error] pass view=${vId} idx=${idx} ${err && err.message} :: ${err && err.stack}`);
+      throw err;
+    }
   };
   next();
   updateHud();
 }
 
+/* ------------------------------------------------------------------
+ * Live passes.
+ *
+ * A wheel gesture is animated by `glideFrame` (60 fps GPU transform), which
+ * means the picture keeps moving but is only re-sampled after the wheel stops.
+ * On a deep view that is a full second of a stretched, softening image — the
+ * "not following the hand" symptom.  The reference renderer instead keeps
+ * computing while you zoom: it is always showing the most recent frame it has.
+ *
+ * So during a gesture we keep issuing ONE cheap pass at a time on the current
+ * view.  The pass is never allowed to overlap another (that would just divide
+ * the same CPU time), and it is deliberately small: `LIVE_PX` pixels with the
+ * iteration count scaled down, which lands in a few tens of milliseconds on
+ * every depth we support.  The frame it commits is applied on top of the
+ * accumulated gesture transform (nativeFrameFlush(..., liveXform)), so a
+ * commit never snaps the picture back to where the pass started.
+ * ---------------------------------------------------------------- */
+const LIVE_PX_SHALLOW = 4.2e5;  // pixel budget of one live pass (direct path)
+const LIVE_PX_DEEP = 1.2e5;     // deep views pay dd per vertex: keep it small
+let liveBusy = false;
+let liveQueued = false;
+let liveAt = 0;
+
+/** Resolution/iteration plan for the next live pass, fitted to the budget. */
+function livePlan() {
+  const W = canvas.width || 1, H = canvas.height || 1;
+  const deep = psLog2Now() <= -45;
+  const budget = deep ? LIVE_PX_DEEP : LIVE_PX_SHALLOW;
+  const s = clamp(Math.sqrt(budget / (W * H)), 0.22, 0.8);
+  return [{ scale: s, iter: deep ? 0.75 : 0.6 }];
+}
+
+/** Render one live pass and re-arm itself when the gesture is still running. */
+function maybeLivePass() {
+  /* The shader is already drawing every gesture frame at full resolution; a
+   * CPU live pass on top of it would fight for the same canvas and overwrite
+   * the HUD with a tile that never reaches the screen. */
+  if (scene.ok && state.gpu && sceneView()) return;
+  if (!NATIVE && !wasmEnabled) return;
+  if (liveBusy) { liveQueued = true; return; }
+  const now = performance.now();
+  if (now - liveAt < 28) return;          // at most ~35 passes per second
+  liveAt = now;
+  liveBusy = true;
+  renderLive(livePlan());
+}
+
+/** Like renderPlan, but for the live cadence: no cancel of in-flight work. */
+function renderLive(plan) {
+  viewId++;
+  const vId = viewId;
+  const idx = 0;
+  const run = () => {
+    if (vId !== viewId) { liveBusy = false; return; }
+    try {
+      runPass(vId, plan[0], () => {
+        liveBusy = false;
+        if (liveQueued) { liveQueued = false; if (glide) maybeLivePass(); }
+      }, plan);
+    } catch (err) {
+      liveBusy = false;
+      nativeLog(`[js-error] live ${err && err.message}`);
+    }
+  };
+  run();
+}
+
 function renderNow() {
-  renderPlan(PASS_PLAN);
+  if (juliaView) juliaView.onViewChanged();
+  frameStartAt = performance.now();
+  /* The shader owns shallow views outright: one draw call, no tiles, no
+   * worker round trip.  Everything it declines falls through to the CPU
+   * pipeline unchanged. */
+  if (scenePass()) return;
+  renderPlan(passPlanForNow());
 }
 
 function scheduleRender(delay = 90) {
@@ -461,17 +1945,19 @@ function scheduleRender(delay = 90) {
   renderTimer = setTimeout(() => renderNow(), delay);
 }
 
-/** 缩放过程中的快速趟：低分辨率 + 完整迭代，保证缩略图不会塌成黑块 */
+/** Quick passes while zooming: low resolution + full iteration count, so the thumbnail never collapses into black blocks */
 function quickPreview() {
   renderPlan(QUICK_PLAN);
 }
 
-/** 滚轮缩放：即时变换上一帧 + 轻量预览，停止 300ms 后才做完整渐进渲染 */
+/** Wheel zoom: transform the previous frame instantly + a light preview; the full progressive render starts only after 300 ms of quiet */
 function scheduleZoomRender() {
   const nowT = performance.now();
-  // 连续滚轮时让快速趟每隔 ~110ms 自己触发一次，而不是每次滚轮都把它推迟
+  // While the wheel keeps spinning, re-issue a live pass every ~55 ms
+  // (two display frames).  Combined with the GPU preview this keeps the
+  // picture sharp and moving on every frame, with no full-screen blur step.
   if (!quickTimer) {
-    const wait = Math.max(0, 110 - (nowT - lastQuickAt));
+    const wait = Math.max(0, 55 - (nowT - lastQuickAt));
     quickTimer = setTimeout(() => {
       quickTimer = 0;
       lastQuickAt = performance.now();
@@ -482,12 +1968,24 @@ function scheduleZoomRender() {
   wheelTimer = setTimeout(() => {
     if (quickTimer) { clearTimeout(quickTimer); quickTimer = 0; }
     renderNow();
-  }, 360);
+  }, 260);
 }
 
-/* ---------------- 画面反馈 ---------------- */
+/* ---------------- Visual feedback ---------------- */
 function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
   const W = canvas.width, H = canvas.height;
+  // Route 1: the frame lives in the native swapchain, so the gesture feedback
+  // is a GPU transform in the shell instead of a JS canvas blit.
+  if (nativeCanvasMode()) {
+    if (!W || !H) return;
+    const ndx = dx / W, ndy = dy / H, ncx = cx / W, ncy = cy / H;
+    liveApply(ndx, ndy, scale, ncx, ncy);
+    nativeCanvasPreview(ndx, ndy, scale, ncx, ncy);
+    return;
+  }
+  /* A shader gesture is a fresh draw rather than a transform of the previous
+   * frame: the picture follows the hand at full resolution. */
+  if (sceneLive()) return;
   if (!snap.width) return;
   ctx.save();
   ctx.fillStyle = getComputedStyle(document.body).backgroundColor || '#000';
@@ -504,13 +2002,132 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
 }
 
 function takeSnapshot() {
+  if (nativeCanvasMode()) {
+    // The shell resets its preview transform when a pass is committed, so the
+    // page only needs the sentinel that keeps the glide bookkeeping happy.
+    snap.width = canvas.width;
+    snap.height = canvas.height;
+    return;
+  }
   snap.width = canvas.width;
   snap.height = canvas.height;
   snapCtx.clearRect(0, 0, snap.width, snap.height);
-  snapCtx.drawImage(canvas, 0, 0);
+  snapCtx.imageSmoothingEnabled = true;
+  snapCtx.imageSmoothingQuality = 'high';
+  if (glSurface && glCanvas.width > 0) {
+    /* The visible picture is the shader layer; its buffer may be smaller than
+     * the canvas (a low-res field upscaled by the shader), so scale it. */
+    snapCtx.drawImage(glCanvas, 0, 0, snap.width, snap.height);
+  } else {
+    snapCtx.drawImage(canvas, 0, 0);
+  }
 }
 
-/* ---------------- 交互 ---------------- */
+/* ---- drag preview (low quality while panning, full quality on release) ---- */
+let dragPreviewTimer = 0, lastDragPreviewAt = 0;
+
+/**
+ * A screen-pixel offset expressed in the plane's own axes.
+ *
+ * Two facts meet here and nowhere else:
+ *
+ *   - the plane's y axis points up while the screen's points down, so a
+ *     downward drag has to become a negative imaginary offset;
+ *   - a rotated view turns the plane *under* the screen, so the offset has to
+ *     be rotated by the same angle before it is applied.
+ *
+ * Missing the second one is what makes a rotated view feel wrong: dragging
+ * right moves the picture along the rotated axis, i.e. diagonally, and the
+ * further the view is turned the less the picture follows the hand.  Every
+ * gesture — pan, wheel zoom, pinch — goes through this function, so there is
+ * only one place that can get it wrong.
+ *
+ * The result is in mantissa units with `e` as the shared exponent, which is the
+ * form `shiftCoordScaled` wants: `value * 2^e`.
+ */
+function planeDelta(dxPx, dyPx) {
+  const p = psPair();
+  const th = state.rotation || 0;
+  const c = Math.cos(th), s = Math.sin(th);
+  const x = dxPx * p.m;
+  const y = -dyPx * p.m;
+  return { u: x * c - y * s, v: x * s + y * c, e: p.e };
+}
+
+/** Absolute plane coordinate under a client-space point.
+ *  The reference's Julia preview re-seeds from the point under the mouse
+ *  (00405590.c:126-137); this is that point, using the same rotated
+ *  screen-to-plane matrix every gesture already goes through. */
+function screenToPlane(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const sx = (clientX - r.left) * (canvas.width / Math.max(1, r.width));
+  const sy = (clientY - r.top) * (canvas.height / Math.max(1, r.height));
+  const d = planeDelta(sx - canvas.width / 2, sy - canvas.height / 2);
+  const k = Math.pow(2, d.e);
+  return {
+    re: (Number(state.center.re) || 0) + d.u * k,
+    im: (Number(state.center.im) || 0) + d.v * k
+  };
+}
+
+/** Client-space point of a plane coordinate — the inverse of screenToPlane.
+ *  Used only to park the Julia seed marker, so double precision is enough:
+ *  at 1e-15 of the view it is still within a pixel of the right place. */
+function planeToScreen(re, im) {
+  const r = canvas.getBoundingClientRect();
+  const p = psPair();
+  const th = state.rotation || 0;
+  const c = Math.cos(th), s = Math.sin(th);
+  const k = Math.pow(2, p.e);
+  const du = ((Number(re) || 0) - (Number(state.center.re) || 0)) / k;
+  const dv = ((Number(im) || 0) - (Number(state.center.im) || 0)) / k;
+  const x = du * c + dv * s;
+  const y = -du * s + dv * c;
+  const sx = canvas.width / 2 + x / p.m;
+  const sy = canvas.height / 2 - y / p.m;
+  const sc = r.width / Math.max(1, canvas.width);
+  return { x: r.left + sx * sc, y: r.top + sy * sc };
+}
+
+/** Centre after panning `base` by a device-pixel offset. */
+function panCenter(base, dx, dy) {
+  const d = planeDelta(dx, dy);
+  const bits = bitsNow() + 40;
+  /* The content follows the hand, so the *centre* moves the other way. */
+  return {
+    re: shiftCoordScaled(base.re, -d.u, d.e, bits),
+    im: shiftCoordScaled(base.im, -d.v, d.e, bits)
+  };
+}
+
+/**
+ * While a pan is in progress, draw a live medium-resolution pass of the panned
+ * view at the same ~55 ms cadence as the wheel zoom, so the exposed edges fill
+ * in with real content instead of staying stretched/blurry.  The full
+ * progressive render still runs on release.
+ */
+function scheduleDragPreview() {
+  clearTimeout(dragPreviewTimer);
+  const nowT = performance.now();
+  dragPreviewTimer = setTimeout(() => {
+    dragPreviewTimer = 0;
+    if (!drag || !drag.moved) return;
+    const vf = viewFit();
+    const dx = (drag.px - drag.sx) / vf.k;
+    const dy = (drag.py - drag.sy) / vf.k;
+    if (Math.hypot(dx, dy) < 3) return;
+    lastDragPreviewAt = performance.now();
+    state.center = panCenter(drag.baseCenter, dx, dy);
+    renderPlan(QUICK_PLAN, () => {
+      // Rebase the gesture on the frame just drawn, so later blits line up.
+      if (!drag) return;
+      drag.sx = drag.px; drag.sy = drag.py;
+      drag.baseCenter = { re: state.center.re, im: state.center.im };
+    });
+  }, Math.max(0, 55 - (nowT - lastDragPreviewAt)));
+}
+
+/* ---------------- Interaction ---------------- */
 let drag = null;
 
 /* Multi-pointer tracking powers two-finger pinch-zoom and pan on touch
@@ -521,11 +2138,29 @@ let pinch = null;
 const panelQuery = window.matchMedia('(max-width: 900px)');
 function isMobileShell() { return panelQuery.matches; }
 
-function pointerPos(e) {
+/**
+ * Map client (CSS px) coordinates onto the rendered bitmap.
+ * The canvas element fills the window but the bitmap is presented with
+ * `object-fit: contain`, so there can be letterbox bars on either axis.
+ * `k` is CSS px per bitmap px; `ox/oy` are the top-left of the displayed
+ * image inside the viewport.
+ */
+function viewFit() {
   const r = canvas.getBoundingClientRect();
+  const k = Math.min(r.width / canvas.width, r.height / canvas.height) || 1;
   return {
-    x: (e.clientX - r.left) * (canvas.width / r.width),
-    y: (e.clientY - r.top) * (canvas.height / r.height)
+    rect: r,
+    k,
+    ox: r.left + (r.width - canvas.width * k) * 0.5,
+    oy: r.top + (r.height - canvas.height * k) * 0.5
+  };
+}
+
+function pointerPos(e) {
+  const vf = viewFit();
+  return {
+    x: (e.clientX - vf.ox) / vf.k,
+    y: (e.clientY - vf.oy) / vf.k
   };
 }
 
@@ -551,6 +2186,12 @@ function startPinch() {
 
 canvas.addEventListener('pointerdown', (e) => {
   if (e.pointerType === 'mouse' && e.button !== 0) return;
+  /* The Julia seed picker owns the next click: it pins c there and must not
+   * start a pan (the two would fight over the same gesture). */
+  if (juliaView && juliaView.isPicking() && juliaView.pickAt(e.clientX, e.clientY)) {
+    e.preventDefault();
+    return;
+  }
   canvas.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
@@ -564,7 +2205,12 @@ canvas.addEventListener('pointerdown', (e) => {
 
   canvas.classList.add('dragging');
   takeSnapshot();
-  drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false };
+  drag = {
+    x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY,
+    px: e.clientX, py: e.clientY, moved: false,
+    // Anchor for the pan preview: the centre the drag started from.
+    baseCenter: { re: state.center.re, im: state.center.im }
+  };
 });
 
 canvas.addEventListener('pointermove', (e) => {
@@ -573,21 +2219,24 @@ canvas.addEventListener('pointermove', (e) => {
   if (pinch && pointers.size >= 2) {
     const m = pinchMetrics();
     if (!m) return;
-    const r = canvas.getBoundingClientRect();
-    const sx = canvas.width / r.width;
-    const sy = canvas.height / r.height;
+    const vf = viewFit();
+    const s = 1 / vf.k;
     const scale = clamp(pinch.d0 / m.d, 0.2, 5);
-    const ax = (m.cx - r.left) * sx;
-    const ay = (m.cy - r.top) * sy;
-    blitSnapshot((m.cx - pinch.cx0) * sx, (m.cy - pinch.cy0) * sy, scale, ax, ay);
+    const ax = (m.cx - vf.ox) * s;
+    const ay = (m.cy - vf.oy) * s;
+    blitSnapshot((m.cx - pinch.cx0) * s, (m.cy - pinch.cy0) * s, scale, ax, ay);
     return;
   }
 
   if (!drag) return;
-  const dx = (e.clientX - drag.sx) * (canvas.width / canvas.getBoundingClientRect().width);
-  const dy = (e.clientY - drag.sy) * (canvas.height / canvas.getBoundingClientRect().height);
+  const vf = viewFit();
+  const dx = (e.clientX - drag.sx) / vf.k;
+  const dy = (e.clientY - drag.sy) / vf.k;
+  drag.px = e.clientX;
+  drag.py = e.clientY;
   if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 1) drag.moved = true;
   blitSnapshot(dx, dy);
+  scheduleDragPreview();
 });
 
 canvas.addEventListener('pointerup', (e) => {
@@ -602,27 +2251,35 @@ canvas.addEventListener('pointerup', (e) => {
         // One finger is still down: continue as a fresh pan gesture.
         const p = [...pointers.values()][0];
         takeSnapshot();
-        drag = { x: p.x, y: p.y, sx: p.x, sy: p.y, moved: false };
+        drag = {
+          x: p.x, y: p.y, sx: p.x, sy: p.y, px: p.x, py: p.y, moved: false,
+          baseCenter: { re: state.center.re, im: state.center.im }
+        };
       }
     }
     return;
   }
 
   if (!drag) return;
+  clearTimeout(dragPreviewTimer);
+  dragPreviewTimer = 0;
   canvas.classList.remove('dragging');
-  const r = canvas.getBoundingClientRect();
+  const vf = viewFit();
   const dxCss = e.clientX - drag.sx;
   const dyCss = e.clientY - drag.sy;
-  const dx = dxCss * (canvas.width / r.width);
-  const dy = dyCss * (canvas.height / r.height);
+  const dx = dxCss / vf.k;
+  const dy = dyCss / vf.k;
   const wasDrag = drag.moved;
+  const base = drag.baseCenter;
   drag = null;
   if (!wasDrag) return;
-  commitPan(dx, dy);
+  commitPan(base, dx, dy);
 });
 
 canvas.addEventListener('pointercancel', (e) => {
   pointers.delete(e.pointerId);
+  clearTimeout(dragPreviewTimer);
+  dragPreviewTimer = 0;
   if (pinch) { pinch = null; return; }
   drag = null;
   canvas.classList.remove('dragging');
@@ -633,67 +2290,76 @@ function finishPinch(m) {
   const p0 = pinch;
   pinch = null;
   if (!p0 || !m) return;
-  const r = canvas.getBoundingClientRect();
-  const sx = canvas.width / r.width;
-  const sy = canvas.height / r.height;
+  const vf = viewFit();
+  const s = 1 / vf.k;
   const factor = clamp(p0.d0 / Math.max(1, m.d), 0.25, 4);
-  const dx = (m.cx - p0.cx0) * sx;
-  const dy = (m.cy - p0.cy0) * sy;
+  const dx = (m.cx - p0.cx0) * s;
+  const dy = (m.cy - p0.cy0) * s;
 
   if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
-    const p = psPair();
-    const bits = bitsNow() + 40;
-    state.center = {
-      re: shiftCoordScaled(state.center.re, -dx * p.m, p.e, bits),
-      im: shiftCoordScaled(state.center.im, dy * p.m, p.e, bits)
-    };
+    state.center = panCenter(state.center, dx, dy);
   }
-  const ax = (m.cx - r.left) * sx;
-  const ay = (m.cy - r.top) * sy;
+  const ax = (m.cx - vf.ox) * s;
+  const ay = (m.cy - vf.oy) * s;
   zoomAt(ax, ay, factor, false);
 }
 
-function commitPan(dx, dy) {
-  const p = psPair();
-  const bits = bitsNow() + 40;
-  state.center = {
-    re: shiftCoordScaled(state.center.re, -dx * p.m, p.e, bits),
-    im: shiftCoordScaled(state.center.im, dy * p.m, p.e, bits)
-  };
+function commitPan(base, dx, dy) {
+  state.center = panCenter(base, dx, dy);
   scheduleZoomRender();
 }
 
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  const { x, y } = pointerPos(e);
-  const W = canvas.width, H = canvas.height;
-  const factor = Math.exp(clamp(e.deltaY, -240, 240) * 0.0035);
-  zoomAt(x, y, factor, true);
+  wheelGlide(e);
 }, { passive: false });
 
+/* Regression hook driven by the shell when MB_NATIVE_SELFTEST=1: a burst of
+ * real wheel events through the same path a mouse takes, so the measured
+ * cadence is the product's, not a synthetic benchmark. */
+window.__mbSelfTest = function () {
+  const cx = Math.round(innerWidth / 2), cy = Math.round(innerHeight / 2);
+  let n = 0;
+  nativeLog('[selftest-js] wheel burst 14 notches @20ms');
+  const fire = () => {
+    if (n++ >= 14) return;
+    canvas.dispatchEvent(new WheelEvent('wheel', {
+      deltaY: -120, clientX: cx, clientY: cy, bubbles: true, cancelable: true
+    }));
+    setTimeout(fire, 20);
+  };
+  fire();
+};
+
 canvas.addEventListener('dblclick', (e) => {
+  /* A click that just pinned the Julia seed is still part of that gesture. */
+  if (juliaView && juliaView.pickedRecently && juliaView.pickedRecently()) return;
   const { x, y } = pointerPos(e);
   zoomAt(x, y, e.shiftKey ? 2.4 : 1 / 2.4, true);
 });
 
 function zoomAt(px, py, factor, instant) {
   const W = canvas.width, H = canvas.height;
-  const p = psPair();
   const log2New = psLog2Now() + Math.log2(factor);
   if (log2New < MIN_LOG2PS) return;
   if (spanNum() * factor > MAX_SPAN) return;
 
+  /* Zoom about the cursor: the point under it must stay put, so the centre
+   * moves toward it by (1 - factor) of the offset — rotated, because the offset
+   * is measured on screen and applied on the plane. */
   const cx = (px - W / 2), cy = (py - H / 2);
   const bits = Math.max(160, requiredBitsFromLog2(log2New) + 40);
+  const d = planeDelta(cx, cy);
+  const k = 1 - factor;
   state.center = {
-    re: shiftCoordScaled(state.center.re, cx * p.m * (1 - factor), p.e, bits),
-    im: shiftCoordScaled(state.center.im, -cy * p.m * (1 - factor), p.e, bits)
+    re: shiftCoordScaled(state.center.re, d.u * k, d.e, bits),
+    im: shiftCoordScaled(state.center.im, d.v * k, d.e, bits)
   };
   state.span = { m: state.span.m * factor, e: state.span.e };
   normalizeSpan();
 
   if (instant) {
-    // 以光标为锚点缩放上一帧，获得即时手感，随后渐进精修
+    // Zoom the previous frame around the cursor for immediate feedback, then refine progressively
     if (!snap.width) takeSnapshot();
     blitSnapshot(0, 0, 1 / factor, px, py);
     scheduleZoomRender();
@@ -711,32 +2377,172 @@ function normalizeSpan() {
   state.span = { m, e };
 }
 
+/* ---------------- Exponential wheel glide (P0) ----------------
+ * A wheel/trackpad burst is accumulated into one target scale and the view
+ * eases toward it with a fixed time constant (exp decay), instead of jumping
+ * per event and re-rendering per notch.  While the gesture is live only the
+ * snapshot is transformed (cheap); the quick pass and full progressive render
+ * start after the gesture settles, exactly like before.
+ */
+const GLIDE_TAU = 85;          // ms, time constant of the exponential approach
+const GLIDE_EPS = 0.0025;      // log-scale distance that counts as "arrived"
+let glide = null;
+let glideStats = null;          // frame cadence of the last wheel gesture
+
+function wheelGlide(e) {
+  const { x, y } = pointerPos(e);
+  const step = Math.exp(clamp(e.deltaY, -240, 240) * 0.0035);
+  if (!snap.width) takeSnapshot();
+  if (!glide) {
+    glide = { target: 1, cur: 1, px: x, py: y, lastT: 0, raf: 0 };
+    glideStats = { n: 0, sum: 0, max: 0 };
+  }
+  // Direction reversal: drop the leftover credit so the image follows the hand.
+  if ((glide.target < 1 && step > 1) || (glide.target > 1 && step < 1)) {
+    glide.target = glide.cur;
+  }
+  glide.target *= step;
+  glide.px = x;
+  glide.py = y;
+
+  // No heavy pass while the gesture is live.
+  if (quickTimer) { clearTimeout(quickTimer); quickTimer = 0; }
+  clearTimeout(wheelTimer);
+  if (!glide.raf) glide.raf = requestAnimationFrame(glideFrame);
+}
+
+function glideFrame(t) {
+  if (!glide) return;
+  glide.raf = 0;
+  if (!glide.lastT) glide.lastT = t;
+  const dt = clamp(t - glide.lastT, 0, 42);
+  glide.lastT = t;
+  if (glideStats && glideStats.n > 0) {
+    glideStats.sum += dt;
+    glideStats.max = Math.max(glideStats.max, dt);
+  }
+  if (glideStats) glideStats.n++;
+
+  const ratio = glide.target / glide.cur;
+  const k = 1 - Math.exp(-dt / GLIDE_TAU);
+  let step = Math.pow(ratio, k);
+  const done = Math.abs(Math.log(ratio)) < GLIDE_EPS;
+  if (done) step = ratio;
+
+  if (!glideApply(step, glide.px, glide.py)) { glide = null; return; }
+  glide.cur *= step;
+  /* Keep the picture sharp while it moves: one small pass per slot.  This is
+   * what turns the gesture from "stretched bitmap until you stop" into a
+   * continuously updating view. */
+  maybeLivePass();
+
+  if (done) {
+    if (glideStats && glideStats.n > 1 && nativeCanvasMode()) {
+      nativeLog(`[glide] frames=${glideStats.n} avg=${(glideStats.sum / (glideStats.n - 1)).toFixed(1)}ms ` +
+                `max=${glideStats.max.toFixed(1)}ms`);
+    }
+    glide = null;
+    if (state.autoIter) syncIterUi();
+    // Let the settle breathe, then refine at the usual cadence.
+    lastQuickAt = performance.now();
+    scheduleZoomRender();
+    return;
+  }
+  glide.raf = requestAnimationFrame(glideFrame);
+}
+
+/** Apply one eased zoom step in place; returns false when a zoom limit is hit. */
+function glideApply(factor, px, py) {
+  if (factor === 1) return true;
+  const W = canvas.width, H = canvas.height;
+  const log2New = psLog2Now() + Math.log2(factor);
+  if (log2New < MIN_LOG2PS) return false;
+  if (spanNum() * factor > MAX_SPAN) return false;
+
+  const cx = (px - W / 2), cy = (py - H / 2);
+  const bits = Math.max(160, requiredBitsFromLog2(log2New) + 40);
+  const d = planeDelta(cx, cy);
+  const k = 1 - factor;
+  state.center = {
+    re: shiftCoordScaled(state.center.re, d.u * k, d.e, bits),
+    im: shiftCoordScaled(state.center.im, d.v * k, d.e, bits)
+  };
+  state.span = { m: state.span.m * factor, e: state.span.e };
+  normalizeSpan();
+
+  blitSnapshot(0, 0, 1 / factor, px, py);
+  // The transformed frame becomes the base for the next eased step, so the
+  // glide stays cumulative even if the pointer moves between events.
+  takeSnapshot();
+  updateHudSoon();
+  return true;
+}
+
 /* ---------------- HUD ---------------- */
+let hudPending = false;
+function updateHudSoon() {
+  if (hudPending) return;
+  hudPending = true;
+  requestAnimationFrame(() => { hudPending = false; updateHud(); });
+}
+
 function updateHud(done = false) {
   const d = depthNow();
   const ps = psNow();
-  const bits = bitsNow();
+  /* The width on screen is the width the renderer actually used.  Before this
+   * it was the page's own guess, which stayed at 64 for every zoom shallower
+   * than 2^-45 — the "auto precision" menu looked like it did nothing. */
+  const bits = (lastMeta && lastMeta.bits > 0) ? lastMeta.bits : bitsNow();
   $('hud-depth').textContent = `${t('zoom')} ${fmtZoomFactor(d)}`;
-  const cre = trimNum(state.center.re, 16);
+  /* A phone HUD is ~46 characters wide in total, so the coordinate line has to
+   * give up digits rather than overflow: 16 sig-figs on a desktop, 10 here.
+   * The value itself is untouched — this is display only. */
+  const coordDigits = isMobileShell() ? 10 : 16;
+  const cre = trimNum(state.center.re, coordDigits);
   const cim = state.center.im;
-  $('hud-center').textContent = `${cre} ${cim.startsWith('-') ? '−' : '+'} ${trimNum(cim.replace('-', ''), 16)} i`;
+  $('hud-center').textContent = `${cre} ${cim.startsWith('-') ? '−' : '+'} ${trimNum(cim.replace('-', ''), coordDigits)} i`;
   $('chip-precision').textContent = `${bits} bit`;
 
-  const engineName = (e) => e === 'remote' ? 'CORE' : e === 'wasm' ? 'WASM' : e === 'hp' ? 'HP' : e === 'core' ? 'CORE' : 'JS';
+  const engineName = (e) => e === 'remote' ? 'CORE' : e === 'wasm' ? 'WASM'
+    : e === 'hp' ? 'HP' : e === 'core' ? 'CORE' : e === 'NATIVE' ? 'NATIVE'
+    : e === 'gpu' ? 'GPU' : 'JS';
   const modeLabel = lastMeta
     ? engineName(lastMeta.engine) + ' · ' + lastMeta.mode
-    : (remoteEnabled() ? 'CORE' : (wasmEnabled === null ? '…' : wasmEnabled ? 'WASM' : 'JS'));
+    : (remoteEnabled() ? 'CORE' : NATIVE ? 'NATIVE' : (wasmEnabled === null ? '…' : wasmEnabled ? 'WASM' : 'JS'));
   const pct = tileTotal ? Math.round((tileDone / tileTotal) * 100) : 0;
+  const liveMs = !done && passStartAt ? performance.now() - passStartAt : 0;
   const ms = done && frameMs > 0 ? frameMs.toFixed(0) + ' ms'
-    : (lastMeta ? lastMeta.ms.toFixed(0) + ' ms' : '');
+    : (liveMs > 0 ? liveMs.toFixed(0) + ' ms'
+      : (lastMeta ? lastMeta.ms.toFixed(0) + ' ms' : ''));
   let limitHint = '';
   if (state.spec.mode === 'x' && d > 13) {
     limitHint = lastMeta && lastMeta.exact === false ? ` · ${t('approxHint')}` : '';
   }
-  $('hud-engine').textContent = `${modeLabel} · ${bits} bit` + (lastMeta ? ` · ${t('refLen')} ${lastMeta.refLen}` : '') + limitHint;
+  /* What the frame actually contained.  A deep view whose whole area escapes
+   * in the same iteration has nothing to draw, and saying so is the difference
+   * between "the renderer is broken" and "there is no detail here". */
+  let colourHint = '';
+  if (lastMeta) {
+    /* Union over the pass, not the last tile: a single uniform tile must not
+     * label a frame full of filaments as "no structure".  Only claim it when
+     * the escape counts actually came from pixels — the JS renderers used to
+     * omit them, and 0/0 silently meant "structureless" for every frame. */
+    const stats = passStats;
+    const lo = stats && isFinite(stats.escMin) ? stats.escMin : lastMeta.escMin;
+    const hi = stats && isFinite(stats.escMax) ? stats.escMax : lastMeta.escMax;
+    const bounded = stats ? stats.bounded : (lastMeta.bounded | 0);
+    const known = Number.isFinite(lo) && Number.isFinite(hi);
+    if (known && hi > lo) colourHint = ` · ${t('escRange')} ${lo | 0}–${hi | 0}`;
+    if (known && hi - lo <= 1 && !(bounded > 0)) colourHint += ` · ${t('noDetail')}`;
+    if (lastMeta.cyc > 0 && lastMeta.cyc < 1000) {
+      colourHint += ` · ${t('cycShort')} ${lastMeta.cyc < 1 ? lastMeta.cyc.toFixed(2) : Math.round(lastMeta.cyc)}`;
+    }
+  }
+  $('hud-engine').textContent = `${modeLabel} · ${bits} bit` + (lastMeta ? ` · ${t('refLen')} ${lastMeta.refLen}` : '') + colourHint + limitHint;
   $('hud-progress').textContent = done || pct >= 100
     ? `${t('statusDone')} · ${ms}`
-    : `${t('statusRendering')} ${pct}%` + (ms ? ` · ${ms}` : '');
+    : `${t('statusRendering')} ${pct}%` + (ms ? ` · ${ms}` : '')
+      + (liveMs > 15000 ? ` · ${t('slowDeep')}` : '');
 
   $('kv-center').textContent = `${trimNum(state.center.re, 22)} , ${trimNum(state.center.im, 22)}`;
   $('kv-zoom').textContent = fmtZoomFactor(d);
@@ -746,53 +2552,632 @@ function updateEngineLabel() {
   updateHud();
 }
 
-/* ---------------- 控件 ---------------- */
+/* ---------------- Controls ---------------- */
 function syncIterUi() {
-  const it = state.autoIter ? autoIterNow() : state.maxIter;
+  const it = effectiveIterTotal();
   $('rng-iter').value = clamp(it, 100, 200000);
   $('in-iter').value = it;
 }
 
+/* Rotation travels in radians (the reference program's unit, and what the
+ * kernel's screenDelta() consumes); the console speaks degrees.  One place
+ * owns the conversion so a preset, an animation keyframe and the slider all
+ * leave the two controls showing the same number as the picture. */
+function syncRotationUi() {
+  const deg = clamp(Math.round((state.rotation || 0) * 180 / Math.PI), -180, 180);
+  const r = $('rng-rot'), n = $('in-rot');
+  if (r) r.value = String(deg);
+  if (n && document.activeElement !== n) n.value = String(deg);
+}
+
+function setRotationDeg(deg, render) {
+  const d = clamp(Math.round(Number.isFinite(+deg) ? +deg : 0), -180, 180);
+  state.rotation = d * Math.PI / 180;
+  syncRotationUi();
+  if (render) renderNow();
+}
+
 function fillSelects() {
-  const kinds = [
-    ['mandelbrot', 'Mandelbrot'], ['multibrot', 'Multibrot'],
-    ['burningship', 'Burning Ship'], ['celtic', 'Celtic'],
-    ['perpendicular', 'Perpendicular'], ['tricorn', 'Tricorn'],
-    ['phoenix', 'Phoenix']
-  ];
-  $('sel-kind').innerHTML = kinds.map(([v, n]) => `<option value="${v}">${n}</option>`).join('');
-  $('sel-palette').innerHTML = PALETTE_LIST
-    .map(p => `<option value="${p.id}">${getLang() === 'en' ? p.en : p.zh}</option>`).join('');
+  const user = loadUserPalettes();
+  /* Two genuinely different drawing logics, so keep them apart in the list:
+   * a cyclic ramp changes colour at one fixed rate everywhere, while an
+   * additive scheme sums several frequencies — a slow one lays down the large
+   * soft fields, fast ones resolve the filigree.  The reference program's
+   * memorable deep views all come from the second family. */
+  const opt = p => `<option value="${p.id}">${getLang() === 'en' ? p.en : p.zh}</option>`;
+  const ramp = PALETTE_LIST.filter(p => !paletteColors(p.id));
+  const art = PALETTE_LIST.filter(p => !!paletteColors(p.id));
+  const refGlsl = refSchemeRecords
+    .map(s => `<option value="${s.id}">${getLang() === 'en' ? s.name : s.nameZh}</option>`)
+    .join('');
+  const glsl = SCHEME_LIB_ALL
+    .map(s => `<option value="${s.id}">${getLang() === 'en' ? s.name : s.nameZh}</option>`)
+    .join('');
+  const builtin =
+    `<optgroup label="${t('paletteGroupRamp')}">` + ramp.map(opt).join('') + '</optgroup>' +
+    `<optgroup label="${t('paletteGroupArt')}">` + art.map(opt).join('') + '</optgroup>' +
+    `<optgroup label="${getLang() === 'en' ? 'Reference built-ins' : '原版内置'}">` + refGlsl + '</optgroup>' +
+    `<optgroup label="${t('paletteGroupGlsl')}">` + glsl + '</optgroup>';
+  const custom = user.length
+    ? `<optgroup label="${t('customPalettes')}">` +
+      user.map(p => `<option value="${p.id}">${p.name}</option>`).join('') + '</optgroup>'
+    : '';
+  $('sel-palette').innerHTML = builtin + custom;
+  // Rebuilds happen on theme / language switches — keep the selection.
+  $('sel-palette').value = state.schemeId || state.palette;
+}
+
+/* ---------------- Gradient editor ----------------
+ * A ramp widget, Photoshop's colour-stop bar reduced to what a palette needs:
+ * click the bar to add a handle, drag a handle to move it, double-click to
+ * remove it, and the selected handle's colour and position stay editable in the
+ * row below.  Every edit rewrites `state.stops`, which is what the renderer
+ * receives — there is no separate "apply" step to forget, and no palette
+ * registry to keep in sync.
+ * -------------------------------------------------*/
+let gradSel = 0;
+/* The ramp is three stacked bars, each one third of the palette drawn at full
+ * width.  Zone 1 = [0,1/3), zone 2 = [1/3,2/3), zone 3 = [2/3,1]. */
+const ZONE_SPAN = 1 / 3;
+function laneRange(z) {
+  const a = (z - 1) * ZONE_SPAN;
+  return [a, a + ZONE_SPAN];
+}
+function laneBars() {
+  /* Both the console's gradient editor and the presets panel draw the same
+   * ramp, so this deliberately matches every bar in the document: whichever
+   * surface is open repaints, and so does the other one when it comes back. */
+  return Array.from(document.querySelectorAll('.grad-bar'));
+}
+/* Pointer x -> ramp position.  `free` lets a drag continue past the lane's
+ * edges into a neighbouring third; a click always stays inside its own lane. */
+function barToT(clientX, rect, zone, free = false) {
+  let f = (clientX - rect.left) / Math.max(1, rect.width);
+  if (!free) f = clamp(f, 0, 1);
+  const [a, b] = laneRange(zone);
+  return clamp(a + f * (b - a), 0, 1);
+}
+/* Ramp position -> offset within one lane, in percent. */
+function tToPct(t, zone) {
+  const [a, b] = laneRange(zone);
+  return clamp((t - a) / Math.max(1e-9, b - a), 0, 1) * 100;
+}
+
+function editorStops() {
+  return effectiveStops().map(s => ({ ...s }));
+}
+
+/* `sort` is off while dragging: re-sorting mid-drag would swap indices under
+ * the pointer.  The drag handler clamps the handle between its neighbours
+ * instead, so the list stays ordered anyway. */
+function commitStops(list, sort = true) {
+  const s = list.map(c => ({
+    pos: Math.round(clamp(c.pos, 0, 1) * 1000) / 1000,
+    r: c.r, g: c.g, b: c.b
+  }));
+  if (sort) s.sort((a, b) => a.pos - b.pos);
+  state.stops = s;
+  syncPaletteStrip();
+  scheduleRender(140);
 }
 
 function syncPaletteStrip() {
-  $('palette-strip').style.background = paletteGradientCSS(state.palette);
+  const list = effectiveStops();
+  if (gradSel > list.length - 1) gradSel = list.length - 1;
+  const css = stopListGradientCSS(list);
+  for (const bar of laneBars()) {
+    const zone = +bar.dataset.zone;
+    const [a, b] = laneRange(zone);
+    const fill = bar.querySelector('.grad-fill');
+    /* Only the image changes; background-size (300%) and the pan position are
+     * fixed in CSS, so each lane automatically shows its own third. */
+    if (fill) fill.style.backgroundImage = css;
+    const box = bar.querySelector('.grad-handles');
+    if (!box) continue;
+    box.innerHTML = '';
+    list.forEach((s, i) => {
+      /* Half-open thirds: a stop on a boundary belongs to the lane on its
+       * right, so no handle is drawn twice.  The last lane owns t = 1. */
+      const inside = s.pos >= a - 1e-9 &&
+                     (s.pos < b - 1e-9 || (zone === 3 && s.pos <= 1 + 1e-9));
+      if (!inside) return;
+      const h = document.createElement('div');
+      h.className = 'grad-handle' + (i === gradSel ? ' sel' : '');
+      h.style.left = tToPct(s.pos, zone) + '%';
+      h.style.background = `rgb(${Math.round(s.r * 255)},${Math.round(s.g * 255)},${Math.round(s.b * 255)})`;
+      h.dataset.i = String(i);
+      box.appendChild(h);
+    });
+  }
+  const sel = list[clamp(gradSel, 0, list.length - 1)];
+  if (sel) {
+    const col = $('grad-color');
+    if (col) col.value = rgb01ToHex([sel.r, sel.g, sel.b]);
+    const pos = $('grad-pos');
+    if (pos && document.activeElement !== pos) pos.value = sel.pos.toFixed(3);
+  }
+  syncRgbSliders();
+}
+
+function bindGradientEditor() {
+  /* Delegated from the document, not from the console's own stack: the presets
+   * panel carries a second set of the same lanes, and one handler for every
+   * `.grad-bar` is what makes the two surfaces behave identically. */
+  const stack = document;
+
+  stack.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const bar = e.target.closest('.grad-bar');
+    if (!bar) return;
+    const zone = +bar.dataset.zone;
+    const rect = bar.getBoundingClientRect();
+    const t = barToT(e.clientX, rect, zone);
+    const handle = e.target.closest('.grad-handle');
+
+    if (!handle) {                       // empty stretch of bar: insert there
+      const list = editorStops();
+      const c = sampleStopList(list, t);
+      list.push({ pos: t, r: c[0], g: c[1], b: c[2] });
+      list.sort((a, b) => a.pos - b.pos);
+      gradSel = list.findIndex(s => Math.abs(s.pos - t) < 1e-6);
+      commitStops(list, false);
+      return;
+    }
+
+    const idx = +handle.dataset.i;
+    gradSel = idx;
+    syncPaletteStrip();
+    /* Capture on the bar, not the handle: syncPaletteStrip() has just replaced
+     * the handle DOM, so the pointer must belong to something that survives. */
+    bar.setPointerCapture(e.pointerId);
+
+    const move = (ev) => {
+      const list = editorStops();
+      const lo = idx > 0 ? list[idx - 1].pos + 0.002 : 0;
+      const hi = idx < list.length - 1 ? list[idx + 1].pos - 0.002 : 1;
+      const tt = clamp(barToT(ev.clientX, rect, zone, true), lo, hi);
+      list[idx].pos = tt;
+      commitStops(list, false);
+    };
+    const up = () => {
+      bar.removeEventListener('pointermove', move);
+      bar.removeEventListener('pointerup', up);
+      bar.removeEventListener('pointercancel', up);
+    };
+    bar.addEventListener('pointermove', move);
+    bar.addEventListener('pointerup', up);
+    bar.addEventListener('pointercancel', up);
+  });
+
+  stack.addEventListener('dblclick', (e) => {
+    const handle = e.target.closest('.grad-handle');
+    if (!handle) return;
+    const list = editorStops();
+    if (list.length <= 2) return;
+    list.splice(+handle.dataset.i, 1);
+    gradSel = Math.max(0, Math.min(gradSel, list.length - 1));
+    commitStops(list, false);
+  });
+
+  $('grad-color').oninput = (e) => {
+    const list = editorStops();
+    if (!list[gradSel]) return;
+    const [r, g, b] = hexToRgb01(e.target.value);
+    list[gradSel].r = r; list[gradSel].g = g; list[gradSel].b = b;
+    commitStops(list, false);
+  };
+
+  $('grad-pos').onchange = (e) => {
+    const list = editorStops();
+    if (!list[gradSel]) return;
+    list[gradSel].pos = clamp(+e.target.value || 0, 0, 1);
+    commitStops(list, true);
+  };
+
+  $('grad-add').onclick = () => {
+    const list = editorStops();
+    const sel = list[gradSel] || list[0];
+    const pos = sel ? Math.min(1, sel.pos + 0.1) : 0.5;
+    const c = sampleStopList(list, pos);
+    list.push({ pos, r: c[0], g: c[1], b: c[2] });
+    list.sort((a, b) => a.pos - b.pos);
+    gradSel = list.findIndex(s => Math.abs(s.pos - pos) < 1e-6);
+    commitStops(list, false);
+  };
+
+  $('grad-del').onclick = () => {
+    const list = editorStops();
+    if (list.length <= 2) return;
+    list.splice(gradSel, 1);
+    gradSel = Math.max(0, Math.min(gradSel, list.length - 1));
+    commitStops(list, false);
+  };
+
+  $('grad-reset').onclick = () => {
+    state.stops = null;                   // back to the selected palette's ramp
+    gradSel = 0;
+    syncPaletteStrip();
+    scheduleRender(60);
+  };
+}
+
+/* ---------------- User palettes ----------------
+ * Stored apart from the theme so switching light/dark or zh/en never wipes
+ * them.  Registered into palettes.js at boot, which makes them first-class
+ * ids for every render path (worker WASM and the native kernel alike).
+ * -------------------------------------------------*/
+function loadUserPalettes() {
+  try {
+    const l = JSON.parse(localStorage.getItem('mb.palettes') || '[]');
+    return Array.isArray(l) ? l : [];
+  } catch { return []; }
+}
+
+function saveUserPalettes(list) {
+  try { localStorage.setItem('mb.palettes', JSON.stringify(list)); } catch { /* quota */ }
+}
+
+function hydrateUserPalettes() {
+  for (const p of loadUserPalettes()) {
+    if (p && p.id && Array.isArray(p.stops)) registerCustomPalette(p.id, p.stops);
+  }
+}
+
+function hexToRgb01(h) {
+  const s = String(h).replace('#', '');
+  const v = s.length === 3 ? s.split('').map(c => c + c).join('') : s;
+  const n = parseInt(v, 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+
+function rgb01ToHex(c) {
+  const f = (x) => clamp(Math.round(x * 255), 0, 255).toString(16).padStart(2, '0');
+  return '#' + f(c[0]) + f(c[1]) + f(c[2]);
+}
+
+/** Colour-set editor: even-spaced stops, closed loop, live gradient preview. */
+function openPaletteEditor() {
+  const curId = state.palette;
+  const editing = isCustomPalette(curId);
+  const base = paletteStops(curId) || paletteStops('ice');
+  const stored = loadUserPalettes().find(p => p.id === curId);
+  const draft = {
+    id: curId,
+    editing,
+    name: stored ? stored.name : t('myPalette'),
+    stops: base.map(c => rgb01ToHex(c)),
+    /* Where each stop sits on the ramp.  The flat stop list the registry keeps
+     * is evenly spaced, so an edited ramp is resampled on apply; the handles
+     * only have to keep these numbers ordered. */
+    pos: base.map((c, i) => (base.length > 1 ? i / (base.length - 1) : 0))
+  };
+
+  const body = `
+    <div class="pal-edit">
+      <div class="pal-preview" id="pal-preview">
+        <div class="grad-handles" id="pal-handles"></div>
+      </div>
+      <div class="row"><label>${t('paletteName')}</label><input class="ctl" id="pal-name"/></div>
+      <div class="pal-stops" id="pal-stops"></div>
+      <div class="btnrow">
+        <button class="btn" id="pal-add">${t('addStop')}</button>
+        <button class="btn" id="pal-base">${t('fromBuiltin')}</button>
+        ${editing ? `<button class="btn danger" id="pal-del">${t('delete')}</button>` : ''}
+      </div>
+      <div class="fx-hint">${t('paletteHint')}</div>
+    </div>`;
+  const foot = `
+    <button class="btn ghost" data-close>${t('close')}</button>
+    <button class="btn primary" id="pal-apply">${t('apply')}</button>`;
+  openModal('palette', t('paletteTitle'), t('paletteSub'), body, foot, 'mid');
+  $('pal-name').value = draft.name;
+
+  function gradientOf(stops, pos) {
+    return 'linear-gradient(90deg,' +
+      stops.map((h, i) => `${h} ${((pos ? pos[i] : i / (stops.length - 1)) * 100).toFixed(2)}%`)
+        .join(',') + ')';
+  }
+
+  /* Ramp value at t, reading the draft's own positions. */
+  function sampleDraft(t) {
+    const hs = draft.stops.map(hexToRgb01);
+    const ps = draft.pos;
+    let i = 0;
+    while (i < ps.length - 1 && ps[i + 1] < t) ++i;
+    const j = Math.min(i + 1, ps.length - 1);
+    const span = Math.max(1e-9, ps[j] - ps[i]);
+    const f = clamp((t - ps[i]) / span, 0, 1);
+    return [0, 1, 2].map(c => hs[i][c] + (hs[j][c] - hs[i][c]) * f);
+  }
+
+  function paintHandles() {
+    const box = $('pal-handles');
+    if (!box) return;
+    box.innerHTML = draft.stops.map((h, i) =>
+      `<div class="grad-handle" data-i="${i}" style="left:${(draft.pos[i] * 100).toFixed(2)}%;background:${h}"></div>`)
+      .join('');
+    for (const el of box.querySelectorAll('.grad-handle')) {
+      el.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const bar = $('pal-preview');
+        const rect = bar.getBoundingClientRect();
+        const idx = +el.dataset.i;
+        el.setPointerCapture(e.pointerId);
+        el.classList.add('sel');
+        const move = (ev) => {
+          const lo = idx > 0 ? draft.pos[idx - 1] + 0.005 : 0;
+          const hi = idx < draft.pos.length - 1 ? draft.pos[idx + 1] - 0.005 : 1;
+          const t = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), lo, hi);
+          draft.pos[idx] = t;
+          el.style.left = (t * 100).toFixed(2) + '%';
+          $('pal-preview').style.background = gradientOf(draft.stops, draft.pos);
+        };
+        const up = () => {
+          el.removeEventListener('pointermove', move);
+          el.removeEventListener('pointerup', up);
+          el.removeEventListener('pointercancel', up);
+          el.classList.remove('sel');
+        };
+        el.addEventListener('pointermove', move);
+        el.addEventListener('pointerup', up);
+        el.addEventListener('pointercancel', up);
+      });
+    }
+  }
+
+  function repaint() {
+    $('pal-preview').style.background = gradientOf(draft.stops, draft.pos);
+    paintHandles();
+  }
+
+  function renderStops() {
+    const box = $('pal-stops');
+    box.innerHTML = draft.stops.map((h, i) => `
+      <div class="pal-stop">
+        <span class="pal-idx mono">${i + 1}</span>
+        <input type="color" value="${h}" data-i="${i}"/>
+        <span class="pal-hex mono">${h.toUpperCase()}</span>
+        <button class="iconbtn tiny" data-del="${i}" title="${t('delete')}" ${draft.stops.length <= 2 ? 'hidden' : ''}>
+          <svg viewBox="0 0 14 14" width="11" height="11"><path d="M2 2l10 10M12 2L2 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>`).join('');
+    box.querySelectorAll('input[type="color"]').forEach(inp => {
+      inp.addEventListener('input', () => {
+        draft.stops[+inp.dataset.i] = inp.value;
+        inp.closest('.pal-stop').querySelector('.pal-hex').textContent = inp.value.toUpperCase();
+        repaint();
+      });
+    });
+    box.querySelectorAll('[data-del]').forEach(btn => {
+      btn.onclick = () => {
+        if (draft.stops.length <= 2) return;
+        draft.stops.splice(+btn.dataset.del, 1);
+        draft.pos.splice(+btn.dataset.del, 1);
+        renderStops();
+        repaint();
+      };
+    });
+    repaint();
+  }
+
+  $('pal-add').onclick = () => {
+    /* Insert in the middle of the widest gap: adding a stop where there is
+     * already a dense run of them changes nothing visible. */
+    let best = 1, gap = -1;
+    for (let i = 1; i < draft.pos.length; ++i) {
+      const d = draft.pos[i] - draft.pos[i - 1];
+      if (d > gap) { gap = d; best = i; }
+    }
+    const at = draft.pos[best - 1] + gap / 2;
+    draft.stops.splice(best, 0, draft.stops[best - 1] || '#ffffff');
+    draft.pos.splice(best, 0, at);
+    renderStops();
+  };
+  $('pal-base').onclick = () => {
+    const base2 = paletteStops('ice') || [];
+    draft.stops = base2.map(c => rgb01ToHex(c));
+    draft.pos = base2.map((c, i) => (base2.length > 1 ? i / (base2.length - 1) : 0));
+    renderStops();
+  };
+  const delBtn = $('pal-del');
+  if (delBtn) {
+    delBtn.onclick = () => {
+      const list = loadUserPalettes().filter(p => p.id !== draft.id);
+      saveUserPalettes(list);
+      state.palette = 'ice';
+      fillSelects(); syncPaletteStrip(); renderNow();
+      closeModal();
+      toast(t('delete') + ' ✓');
+    };
+  }
+
+  $('pal-apply').onclick = () => {
+    draft.name = ($('pal-name').value || '').trim().slice(0, 24) || t('myPalette');
+    /* The registry stores evenly spaced stops, so an edited ramp is resampled
+     * from its own handle positions.  32 samples is well below what the eye can
+     * tell apart in a 256-entry LUT. */
+    const N = 32;
+    const stops = [];
+    for (let i = 0; i < N; ++i) stops.push(sampleDraft(i / (N - 1)));
+    let id = draft.id;
+    if (!draft.editing) {
+      id = 'u' + Date.now().toString(36);
+      draft.editing = true;
+      draft.id = id;
+    }
+    const list = loadUserPalettes();
+    const rec = { id, name: draft.name, stops };
+    const i = list.findIndex(p => p.id === id);
+    if (i >= 0) list[i] = rec; else list.push(rec);
+    saveUserPalettes(list);
+    registerCustomPalette(id, stops);
+    state.palette = id;
+    fillSelects();
+    $('sel-palette').value = id;
+    syncPaletteStrip();
+    renderNow();
+    closeModal();
+  };
+
+  renderStops();
+}
+
+/** Set the supersampling factor used by the final pass (1 = off) and re-render. */
+function setAA(n) {
+  state.aa = clamp(n | 0, 1, 3);
+  const sel = $('sel-aa');
+  if (sel) sel.value = String(state.aa);
+  renderNow();
 }
 
 function syncModeUi() {
   const m = state.spec.mode;
   document.querySelectorAll('#seg-mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   $('grp-julia').hidden = m !== 'j';
-  $('row-kind').hidden = m === 'n' || m === 'x';
-  $('row-power').hidden = !(state.spec.kind === 'multibrot');
-  $('row-degree').hidden = m !== 'n';
-  $('row-phoenix').hidden = state.spec.kind !== 'phoenix';
-  $('sel-kind').value = state.spec.kind;
-  $('rng-power').value = state.spec.power;
-  $('val-power').textContent = state.spec.power;
-  $('rng-degree').value = state.spec.newtonDegree;
-  $('val-degree').textContent = state.spec.newtonDegree;
+  syncFormulaUi();
+}
+
+/* Family of the iteration.  Kept as (kind, power) because the number of
+ * branches is what the set is named after: z^2 for the classic Mandelbrot,
+ * z^p for a multibrot, and the four signed-absolute folds that only exist at
+ * power 2.  Both reach the native core unchanged through spec.kind/power. */
+function syncFamilyUi() {
+  const sel = $('sel-family'), num = $('num-power'), row = $('row-power');
+  if (sel) sel.value = state.spec.mode === 'x' ? 'custom' : state.spec.kind;
+  if (num) num.value = String(state.spec.power);
+  if (row) row.hidden = state.spec.kind !== 'multibrot' || state.spec.mode === 'x';
+  syncFormulaUi();
+}
+
+/* The panel always shows which iteration it is actually running.  A custom
+ * formula lives in `spec.customExpr` and is only active in mode 'x'; showing
+ * it next to the entry button is what keeps "which formula is on screen"
+ * answerable without opening the editor. */
+function syncFormulaUi() {
+  const code = $('formula-current');
+  if (!code) return;
+  const custom = state.spec.mode === 'x';
+  const src = (state.spec.customExpr || 'z^2 + c').trim().split('\n')
+    .filter(s => s.trim()).pop() || '';
+  code.textContent = custom
+    ? (src.length > 30 ? src.slice(0, 30) + '…' : src)
+    : 'z² + c';
+  code.title = custom ? state.spec.customExpr : 'z² + c';
+}
+
+function setFamily(kind, power) {
+  /* Choosing a built-in family leaves custom mode; the formula stays stored so
+   * picking 自定义公式… again brings it back. */
+  if (kind === 'custom') { openFormula(); return; }
+  state.spec.mode = 'm';
+  state.spec.kind = kind || 'mandelbrot';
+  state.spec.power = state.spec.kind === 'multibrot'
+    ? clamp(Math.round(+power || 2), 2, 8) : 2;
+  syncModeUi();
+  syncFamilyUi();
+  renderNow();
+}
+
+/* ---------------- Parameter sliders (Desmos style) ----------------
+ * Every free single letter in the custom expression becomes a live slider.
+ * The range (min/max/step) is remembered per parameter while the app is open
+ * and is user-editable, like a Desmos slider's min/max/step fields.
+ * ------------------------------------------------------------------ */
+const PARAM_RANGE = {};
+
+function defaultRange(v) {
+  const a = Math.abs(v);
+  if (a <= 1) return { min: -3, max: 3, step: 0.01 };
+  return { min: v - 3 * a, max: v + 3 * a, step: +((a / 100).toPrecision(2)) };
+}
+
+/* Compile the expression once per edit to find its parameters. */
+let _pnKey = null, _pnVal = [];
+function paramNames(spec) {
+  if (!spec || spec.mode !== 'x' || !spec.customExpr) return [];
+  if (_pnKey === spec.customExpr) return _pnVal;
+  let names = [];
+  try { names = compileMath(spec.customExpr).params || []; } catch { names = []; }
+  _pnKey = spec.customExpr; _pnVal = names;
+  return names;
+}
+
+let paramTimer = 0;
+function scheduleParamRender() {
+  clearTimeout(paramTimer);
+  paramTimer = setTimeout(() => renderNow(), 120);
+}
+
+function syncParamPanel() {
+  const box = $('grp-params'), list = $('param-list');
+  if (!box || !list) return;
+  const names = paramNames(state.spec);
+  box.hidden = names.length === 0;
+  if (!names.length) { list.innerHTML = ''; return; }
+  const tag = $('param-tag');
+  if (tag) tag.textContent = names.length + ' · ' + t('live');
+
+  state.spec.customParams = state.spec.customParams || {};
+  const cp = state.spec.customParams;
+  names.forEach(n => { if (!Number.isFinite(+cp[n])) cp[n] = 0; });
+
+  list.innerHTML = names.map(n => {
+    const v = +cp[n];
+    const rg = PARAM_RANGE[n] || (PARAM_RANGE[n] = defaultRange(v));
+    return `<div class="prm" data-p="${n}">
+      <div class="prm-top">
+        <span class="prm-name"><i>${n}</i></span>
+        <input class="ctl prm-val mono" type="number" step="any" value="${v}"/>
+        <button class="iconbtn prm-gear" title="min / max / step" aria-label="range">⋯</button>
+      </div>
+      <input class="prm-slider" type="range" min="${rg.min}" max="${rg.max}" step="${rg.step}" value="${v}"/>
+      <div class="prm-range" hidden>
+        <label>min<input class="ctl" type="number" step="any" data-k="min" value="${rg.min}"/></label>
+        <label>max<input class="ctl" type="number" step="any" data-k="max" value="${rg.max}"/></label>
+        <label>step<input class="ctl" type="number" step="any" min="1e-12" data-k="step" value="${rg.step}"/></label>
+      </div>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.prm').forEach(row => {
+    const name = row.dataset.p;
+    const sl = row.querySelector('.prm-slider');
+    const num = row.querySelector('.prm-val');
+    const rgRow = row.querySelector('.prm-range');
+    const set = (v, syncSlider) => {
+      cp[name] = v;
+      num.value = (+v).toFixed(6).replace(/\.?0+$/, '') || '0';
+      if (syncSlider) sl.value = String(v);
+      scheduleParamRender();
+    };
+    sl.oninput = () => set(+sl.value, false);
+    num.oninput = () => { const v = +num.value; if (Number.isFinite(v)) set(v, true); };
+    row.querySelector('.prm-gear').onclick = () => { rgRow.hidden = !rgRow.hidden; };
+    rgRow.querySelectorAll('input').forEach(inp => {
+      inp.oninput = () => {
+        const k = inp.dataset.k;
+        const v = +inp.value;
+        if (!Number.isFinite(v)) return;
+        const rg = PARAM_RANGE[name] || (PARAM_RANGE[name] = defaultRange(+cp[name]));
+        rg[k] = v;
+        if (rg.min > rg.max) rg.max = rg.min;
+        if (!(rg.step > 0)) rg.step = 0.01;
+        sl.min = rg.min; sl.max = rg.max; sl.step = rg.step;
+      };
+    });
+  });
 }
 
 function applyMode(mode) {
   state.spec.mode = mode;
+  state.presetId = null;
   if (mode === 'n') {
     state.spec.newtonDegree = state.spec.newtonDegree || 3;
     state.center = { re: '0', im: '0' };
-    state.span = { m: 1.75, e: 1 };   // 3.5 单位宽，正好容纳三个根
+    state.span = { m: 1.75, e: 1 };   // 3.5 units wide, exactly fitting the three roots
     state.maxIter = 90; state.autoIter = false; $('chk-autoiter').checked = false;
-    state.cycle = 9; state.cycleAuto = false;
-    $('rng-cycle').value = 9; $('val-cycle').textContent = 9;
+    state.bands = 9; state.cycleAuto = true;
   } else if (mode === 'j') {
     state.center = { re: '0', im: '0' };
     state.span = { m: 1.6, e: 1 };
@@ -808,9 +3193,61 @@ function applyMode(mode) {
   syncModeUi(); syncIterUi(); renderNow();
 }
 
-/* ---------------- 预设窗口 ---------------- */
-let modalKind = null;
+/* ---- the second viewport as a door into the first ----------------------
+ * Clicking the Julia preview opens that exact set in the main view.  The view
+ * before the jump is kept here so the caption's back button can put it back —
+ * the reference's own `julia_x/y` + `zoom`, i.e. what the user was looking at.
+ * ---------------------------------------------------------------------- */
+let juliaReturn = null;
 
+function openJuliaSet(c) {
+  if (!juliaReturn) {
+    juliaReturn = {
+      mode: state.spec.mode,
+      julia: { ...state.spec.julia },
+      center: { ...state.center },
+      span: { ...state.span },
+      maxIter: state.maxIter,
+      autoIter: state.autoIter
+    };
+  }
+  state.spec.mode = 'j';
+  state.spec.julia = { re: String(c.re), im: String(c.im) };
+  state.presetId = null;
+  /* A Julia set lives inside |z| < 2, so the frame is the same 3.2 units the
+   * mode switch uses, centred on the origin. */
+  state.center = { re: '0', im: '0' };
+  state.span = { m: 1.6, e: 1 };
+  state.autoIter = false;
+  state.maxIter = Math.max(800, state.maxIter | 0);
+  $('chk-autoiter').checked = false;
+  $('in-jr').value = state.spec.julia.re;
+  $('in-ji').value = state.spec.julia.im;
+  syncModeUi(); syncIterUi();
+  if (juliaView) juliaView.setFocus(true);
+  renderNow();
+}
+
+function backFromJulia() {
+  const r = juliaReturn;
+  juliaReturn = null;
+  if (!r) return;
+  state.spec.mode = r.mode;
+  state.spec.julia = r.julia;
+  state.center = r.center;
+  state.span = r.span;
+  state.maxIter = r.maxIter;
+  state.autoIter = r.autoIter;
+  $('chk-autoiter').checked = state.autoIter;
+  $('in-jr').value = state.spec.julia.re;
+  $('in-ji').value = state.spec.julia.im;
+  syncModeUi(); syncIterUi();
+  if (juliaView) juliaView.setFocus(false);
+  renderNow();
+}
+
+/* ---------------- Presets window ---------------- */
+let modalKind = null;
 function openModal(kind, title, sub, bodyHtml, footHtml, cls = '') {
   modalKind = kind;
   const root = $('modal-root');
@@ -821,59 +3258,232 @@ function openModal(kind, title, sub, bodyHtml, footHtml, cls = '') {
   $('modal-sub').textContent = sub || '';
   $('modal-sub').hidden = !sub;
   $('modal-body').innerHTML = bodyHtml;
+  /* The formula panel manages its own scrolling (see .fx-fit in app.css). */
+  $('modal-body').classList.toggle('fx-fit', kind === 'formula');
   $('modal-foot').innerHTML = footHtml || '';
   root.querySelectorAll('[data-close]').forEach(el => el.onclick = closeModal);
 }
 
 function closeModal() {
   $('modal-root').hidden = true;
+  $('modal-root').classList.remove('previewing');
+  stopAnimation();
   modalKind = null;
   thumbQueue.length = 0;
 }
 
 document.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', closeModal));
 
+/* ------------------------------------------------------------------
+ * Colour controls shared by the presets panel and the console.
+ *
+ * One ramp, one selection index (`gradSel`), one writer (`commitStops`).  The
+ * presets panel and the console's gradient editor are two views of the same
+ * `state.stops`, so an edit made in either shows up in both — there is no
+ * second copy of the colour state to keep in sync.
+ * ------------------------------------------------------------------ */
+function rgbRowHtml() {
+  const rows = ['r', 'g', 'b'].map(k => `
+        <label class="pce-slide">
+          <span class="pce-ch">${k.toUpperCase()}</span>
+          <input type="range" min="0" max="255" step="1" data-rgb="${k}" value="0">
+          <b data-rgbval="${k}">0</b>
+        </label>`).join('');
+  return `<div class="pce-rgb">${rows}</div>`;
+}
+
+function gradLanesHtml(prefix) {
+  return [1, 2, 3].map(z => `
+      <div class="grad-lane" data-zone="${z}">
+        <div class="grad-bar" data-zone="${z}" title="${t('gradHint')}">
+          <div class="grad-fill"></div>
+          <span class="grad-lane-tag">${z === 1 ? t('zoneLeft') : z === 2 ? t('zoneMid') : t('zoneRight')}</span>
+          <div class="grad-handles"></div>
+        </div>
+      </div>`).join('');
+}
+
+function bindRgbSliders(root) {
+  if (!root) return;
+  root.querySelectorAll('[data-rgb]').forEach(inp => {
+    inp.addEventListener('input', () => {
+      const list = editorStops();
+      const i = clamp(gradSel, 0, list.length - 1);
+      for (const k of ['r', 'g', 'b']) {
+        const el = root.querySelector(`[data-rgb="${k}"]`);
+        if (el) list[i][k] = (+el.value) / 255;
+      }
+      commitStops(list, false);
+      for (const k of ['r', 'g', 'b']) {
+        const v = root.querySelector(`[data-rgbval="${k}"]`);
+        if (v) v.textContent = String(inp.value);
+      }
+    });
+  });
+}
+
+/** Push the selected stop into every RGB slider on screen. */
+function syncRgbSliders() {
+  const list = effectiveStops();
+  const sel = list[clamp(gradSel, 0, list.length - 1)];
+  if (!sel) return;
+  document.querySelectorAll('[data-rgb]').forEach(inp => {
+    const k = inp.dataset.rgb;
+    const v = Math.round(clamp(sel[k], 0, 1) * 255);
+    if (document.activeElement !== inp) inp.value = String(v);
+    const lab = inp.parentElement && inp.parentElement.querySelector('[data-rgbval]');
+    if (lab) lab.textContent = String(v);
+  });
+}
+
+/* Three tabs: the reference's own two pictures, the other families, and the
+ * user's saved work.  `other` is a family tab, not a folder — the cards are
+ * ordinary presets that happen to iterate another formula. */
+const PRESET_CATS = ['m', 'j', 'other', 'mine'];
+
+function presetCatLabel(k) {
+  return ({
+    m: t('presetSetM'), j: t('presetSetJ'), mine: t('presetSetMine'),
+    other: getLang() === 'en' ? 'Other sets' : '其他集'
+  })[k] || k;
+}
+
+/**
+ * The preset panel.
+ *
+ * The library is built in (see presetlib.js), so there is no folder to scan and
+ * no message to wait for: the grid, the counts and the thumbnails are all local
+ * work.  Three things live here and nowhere else — the search/category filter,
+ * the save row, and the colour footer that edits the live ramp while the
+ * picture stays visible behind it.
+ */
 function openPresets() {
-  const cats = [
-    ['all', t('catAll')], ['mandelbrot', t('catM')], ['julia', t('catJ')],
-    ['newton', t('catN')], ['exotic', t('catX')], ['custom', t('catC')]
-  ];
   const body = `
     <div class="preset-toolbar">
-      <input class="ctl" id="preset-search" placeholder="${t('search')}" />
       <div class="cats" id="preset-cats">
-        ${cats.map(([k, n]) => `<button data-cat="${k}" class="${k === 'all' ? 'on' : ''}">${n}</button>`).join('')}
+        ${PRESET_CATS.map(k => `<button data-cat="${k}" class="${k === 'm' ? 'on' : ''}">${presetCatLabel(k)}</button>`).join('')}
       </div>
-      <span style="margin-left:auto;color:var(--text-3);font-size:11px" id="preset-count"></span>
+      <span class="preset-count" id="preset-count"></span>
+      <span class="preset-grow"></span>
+      <button class="btn tiny" id="preset-import" title="Ctrl+O">${t('presetImport')}</button>
+      <button class="btn tiny" id="preset-export" title="Ctrl+S">${t('presetExport')}</button>
+      <button class="btn primary" id="preset-save">＋ ${t('saveView')}</button>
+    </div>
+    <div class="save-row" id="preset-save-row" hidden>
+      <input class="ctl" id="preset-name" placeholder="${t('namePlaceholder')}" spellcheck="false" />
+      <button class="btn primary" id="preset-name-ok">${t('saveCurrent')}</button>
+      <button class="btn ghost" id="preset-name-cancel">${t('cancel')}</button>
     </div>
     <div class="preset-grid" id="preset-grid"></div>`;
-  openModal('presets', t('presetTitle'), t('presetSub'), body);
+  openModal('presets', t('presetTitle'), '', body);
 
-  let cat = 'all', q = '';
+  let cat = 'm';
   const grid = $('preset-grid');
+  let current = state.presetId || null;   // the preset the view came from
+
+  /* Three filters, one dimension: the set.  The library only contains pictures,
+   * so there is nothing to search and no colour to edit in here. */
+  const matches = (it) => it.c === cat;
+
+  /* A display name has to identify a card.  Two entries that end up with the
+   * same label would be indistinguishable, so the id is appended on collision. */
+  const labelFor = (it, list) => {
+    const base = getLang() === 'en' ? it.n : (it.nz || it.n);
+    const dup = list.filter(o => (getLang() === 'en' ? o.n : (o.nz || o.n)) === base).length > 1;
+    return dup ? `${base} · ${it.f}` : base;
+  };
+
   const renderList = () => {
-    const list = PRESETS.filter(p =>
-      (cat === 'all' || p.cat === cat) &&
-      (!q || (p.nameZh + p.nameEn + p.cx + p.cy).toLowerCase().includes(q)));
-    $('preset-count').textContent = list.length + ' / ' + PRESETS.length;
-    grid.innerHTML = list.map(p => `
-      <button class="pcard" data-id="${p.id}">
-        <canvas class="thumb" data-id="${p.id}" width="158" height="99"></canvas>
-        <span class="meta">
-          <span class="nm">${getLang() === 'en' ? p.nameEn : p.nameZh}</span>
-          <span class="tag">${p.mode.toUpperCase()} · ${p.palette}</span>
-        </span>
-      </button>`).join('');
+    const list = LIB.items.filter(matches);
+    $('preset-count').textContent = `${list.length} / ${LIB.count}`;
+    if (!list.length) {
+      grid.innerHTML = `<div class="preset-empty">${cat === 'mine' ? t('presetEmptyMine') : t('empty')}</div>`;
+      return;
+    }
+    grid.innerHTML = list.map(it => `
+      <div class="pcard-wrap">
+        <button class="pcard${current === it.f ? ' on' : ''}" data-id="${it.f}">
+          <canvas class="thumb" data-id="${it.f}" width="158" height="99"></canvas>
+          <span class="meta">
+            <span class="nm">${labelFor(it, list)}</span>
+            <span class="tag">${it.m.toUpperCase()}${it.an ? ' · ↻' : ''}${it.cg ? ' · GLSL' : ''}</span>
+          </span>
+        </button>
+        ${it.c === 'mine'
+          ? `<button class="pcard-del" data-del="${it.f}" title="${t('delete')}">×</button>`
+          : ''}
+      </div>`).join('');
+
     grid.querySelectorAll('.pcard').forEach(el => {
-      el.onclick = () => {
-        const p = PRESETS.find(x => x.id === el.dataset.id);
-        applyPreset(p); closeModal();
+      el.onclick = async () => {
+        const id = el.dataset.id;
+        try {
+          const patch = await loadPatch(id);
+          applyRefPresetPatch(patch, id);
+          markCurrent(el, id);
+        } catch (e) {
+          nativeLog('[preset] open failed: ' + (e && e.message));
+          toast('preset ✗');
+        }
+      };
+    });
+    grid.querySelectorAll('[data-del]').forEach(b => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        deletePreset(b.dataset.del, (m) => {
+          toast(m && m.ok ? t('deleted') : 'preset ✗');
+          renderList();
+        });
       };
     });
     observeThumbs();
   };
 
-  $('preset-search').oninput = (e) => { q = e.target.value.trim().toLowerCase(); renderList(); };
+  const markCurrent = (el, id) => {
+    current = id != null ? id : (el && el.dataset.id);
+    state.presetId = current;
+    grid.querySelectorAll('.pcard').forEach(c => c.classList.toggle('on', c === el));
+    syncAnimationButton();
+  };
+
+  /* ---- toolbar -------------------------------------------------------- */
+  const saveMine = () => {
+    const name = $('preset-name').value.trim() ||
+                 `${t('custom')} ${new Date().toLocaleString()}`;
+    const obj = makeRefPreset(name);
+    /* Overwrite only when the open view *is* one of the user's own presets and
+     * the name was not changed; a built-in one always gets a copy. */
+    const overwrite = current && LIB.items.some(i => i.f === current && i.c === 'mine')
+      ? current : '';
+    savePreset(obj, overwrite, name, (m) => {
+      toast(m && m.ok ? t('saved') : 'preset ✗');
+      if (m && m.ok) {
+        current = m.name;
+        state.presetId = m.name;
+        state.presetFile = m.name;
+        cat = 'mine';
+        $('preset-cats').querySelectorAll('button').forEach(x =>
+          x.classList.toggle('on', x.dataset.cat === 'mine'));
+        renderList();
+      }
+    });
+    $('preset-name').value = '';
+    $('preset-save-row').hidden = true;
+  };
+
+  $('preset-save').onclick = () => {
+    const row = $('preset-save-row');
+    row.hidden = !row.hidden;
+    if (!row.hidden) {
+      $('preset-name').value = state.presetName || '';
+      $('preset-name').focus();
+    }
+  };
+  $('preset-name-cancel').onclick = () => { $('preset-save-row').hidden = true; };
+  $('preset-name-ok').onclick = saveMine;
+  $('preset-name').onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveMine(); }
+  };
   $('preset-cats').querySelectorAll('button').forEach(b => {
     b.onclick = () => {
       cat = b.dataset.cat;
@@ -881,79 +3491,764 @@ function openPresets() {
       renderList();
     };
   });
+  $('preset-import').onclick = importPresetFile;
+  $('preset-export').onclick = exportPresetFile;
+  syncAnimationButton();
   renderList();
+  nativeLog(`[ui] presets lib=${LIB.count} mine=${LIB.items.filter(i => i.c === 'mine').length} ` +
+            `cards=${grid.children.length} cat=${cat}`);
 }
 
+/** Refresh the animation button: only presets that carry keyframes can play. */
+function syncAnimationButton() {
+  const b = $('pce-play');
+  if (!b) return;
+  const has = !!(state.animation && state.animation.keys);
+  b.hidden = !has;
+  b.textContent = (animPlaying ? '⏸ ' : '▶ ') + t('presetPlay');
+}
+
+/* The view a preset produced, for the "save" path when no shell is present. */
 let thumbObserver = null;
+let thumbBackfill = 0;
 function observeThumbs() {
-  if (thumbObserver) thumbObserver.disconnect();
+  if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
   thumbObserver = new IntersectionObserver((entries) => {
     for (const en of entries) {
-      if (!en.isIntersecting) continue;
-      const c = en.target;
-      thumbObserver.unobserve(c);
-      enqueueThumb(c);
+      if (en.isIntersecting) enqueueThumb(en.target);
     }
   }, { root: $('modal-body'), rootMargin: '120px' });
   document.querySelectorAll('.thumb').forEach(c => thumbObserver.observe(c));
+  // Backfill the cards a fast scroll skipped.  The grid is ~512 cards and the
+  // desktop shell runs a single worker, so the observer alone used to leave
+  // every card that never intersected the viewport black until the category
+  // was reopened.
+  clearTimeout(thumbBackfill);
+  thumbBackfill = setTimeout(() => {
+    if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
+    document.querySelectorAll('.thumb').forEach(c => enqueueThumb(c));
+  }, 350);
 }
 
+/** 2/zoom as a mantissa/exponent pair, which is what the view stores. */
 function enqueueThumb(cv) {
-  const p = PRESETS.find(x => x.id === cv.dataset.id);
-  if (!p) return;
-  const W = 158, H = 99;
-  const span = spanFromDecimal(p.spanExp);
-  const ps = (span.m * Math.pow(2, span.e)) / W;
+  /* The field and the card are the same size on purpose: the shader samples
+   * the field at gl_FragCoord, so a smaller field would be read as "everything
+   * outside the top-left corner" and every card would go flat. */
+  /* The field and the card are the same size on purpose: the shader samples
+   * the field at gl_FragCoord, so a smaller field would read as "everything
+   * outside the top-left corner" and every card would go flat.  A card is
+   * displayed at 158x99, but shading a 100x62 field and letting CSS scale it
+   * costs 2.5x less and buys the iterations a 1e74 preset needs. */
+  /* Render at twice the displayed size and let the blit minify.
+   *
+   * `dist` is in *rendered pixels* (the reference divides by the pixel size and
+   * its shader multiplies back by `pixelsize`), so a Distance-style scheme puts
+   * its rim at a fixed 0.4 px.  A 100 px wide field turned that rim into 0.02 px
+   * at the card's scale, which aliases into one-different-colour-per-pixel
+   * speckle — measured: 13010 distinct colours in a 158x99 card while the main
+   * canvas of the same view was a clean line drawing.  Two samples per axis is
+   * the cheapest cure and costs 4x on a 316x198 grid, not on the real frame. */
+  const W = 316, H = 198;
+  const FW = W, FH = H;
+  if (cv.dataset.q) return;
+  cv.dataset.q = '1';
+  const id = cv.dataset.id;
+  const it = id ? LIB.items.find(x => x.f === id) : null;
+  if (!it) return;
+
+  /* A card is a hint, not a picture: the preset's own additive colour table is
+   * what the CPU path can draw, and a shader-based preset is approximated by
+   * those same terms here.  Opening the card always uses the shader. */
+  const patch = patchOf(it.obj);
+  const spec = specOfPatch(patch, it.m);
+  const center = patch.center || { re: '0', im: '0' };
+  let span = patch.span || { m: 1.6, e: 1 };
+  /* The card must use the *same* budget as the view it opens, otherwise it
+   * advertises a picture the program will not draw.  900 + 800 per decade
+   * capped at 30k was exactly that: a 1e56 preset needs ~124k, so at 30k the
+   * kernels stop mid-orbit, every pixel is "bounded", the cycle finder hands
+   * out whatever period it happened to catch and the card comes out as
+   * salt-and-pepper noise while the main canvas is a clean scroll fan (both
+   * measured on Mandelbrot 15).  Same formula, same cap as the main view. */
+  const zoomLog = Math.log10(Math.max(1, Number(it.zo) || 1));
+  const maxIter = Math.min(120000, autoIterFor(zoomLog));
+  const palette = thumbPalette(it);
+  const cycle = 12;
+  const offset = 0;
+
+  /* Thumbnails are framed a little wider than the view they name, so the shape
+   * has air around it inside the card instead of bleeding into the edges. */
+  span = scaleSpan(span, 1.22);
+  const ps = (span.m * Math.pow(2, span.e)) / FW;
+  /* Numeric id: the native host parses viewId as an int and discards jobs with
+   * viewId < cancelView, so a string id turned into 0 and every thumbnail was
+   * dropped as stale.  A high id is never older than a main-pass cancel. */
+  const THUMB_VIEW_ID = 900000;
   const payload = {
-    id: 'th-' + p.id, viewId: 'thumb',
-    x: 0, y: 0, w: W, h: H, width: W, height: H,
-    spec: {
-      mode: p.mode, kind: p.kind, power: p.power, julia: p.julia,
-      newtonDegree: p.newtonDegree, customExpr: p.customExpr,
-      customParams: p.customParams
-    },
-    center: { re: p.cx, im: p.cy }, span,
-    pixelSize: ps, maxIter: Math.min(p.maxIter, 1200), bits: 'auto',
-    palette: p.palette, cycle: p.cycle || 8, offset: p.offset || 0, samples: 1
+    id: 'th-' + id, viewId: THUMB_VIEW_ID,
+    x: 0, y: 0, w: FW, h: FH, width: W, height: H,
+    spec,
+    center, span,
+    pixelSize: ps,
+    maxIter,
+    /* `aa` must match the main view's request (1).  The shader is what
+     * supersamples, and asking the *kernel* for 2x as well made the card's
+     * field and its canvas disagree about their size, which the shader then
+     * read as an out-of-range texture: a 158x99 card came back as one
+     * distinct colour per pixel while the main canvas was clean. */
+    bits: 'auto', palette, cycle, offset, samples: 2, quality: 2, aa: 1,
+    rotation: patch.rotation || 0
   };
   if (modalKind !== 'presets') return;
+
+  /* The card shows what *this* program draws, not the reference's JPEG.
+   *
+   * It used to prefer the shipped JPEG and never render: a card that promises
+   * the original's picture while the app produces something else is the one
+   * thing a preset browser must not do.  The JPEG is still useful as an
+   * instant placeholder while the real thumbnail is being computed, so it is
+   * painted first and replaced the moment the render lands — unless the render
+   * already got there. */
+  const art = PRESET_THUMBS[id];
+  if (art) {
+    const im = new Image();
+    im.onload = () => {
+      if (cv.dataset.q === 'own') return;   // a real render already replaced it
+      const g = cv.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(im, 0, 0, cv.width, cv.height);
+      cv.dataset.q = 'art';
+    };
+    im.src = art;
+  }
+
+  /* The card must show the colour recipe the card *opens*, which for most of
+   * the shipped presets is a shader rather than a palette table.  So the same
+   * split the main view uses applies here: the host integrates a small field,
+   * one shared WebGL surface shades it, and the result is blitted into the
+   * card's 2D canvas.  A per-card context would hit the browser's context
+   * limit (~16), which is why there is exactly one. */
+  if (gpuOk && NATIVE && !gpu.gl.isContextLost()) {
+    thumbJobs.push({ cv, patch, payload, fieldW: FW, fieldH: FH });
+    pumpThumbs();
+    return;
+  }
+
   dispatch({
     payload, thumb: true,
     onDone: (msg) => {
-      if (msg.viewId !== 'thumb') return;
+      if (!msg || msg.viewId !== THUMB_VIEW_ID || !msg.data) return;
       const g = cv.getContext('2d');
-      g.putImageData(new ImageData(new Uint8ClampedArray(msg.data), msg.w, msg.h), 0, 0);
+      const img = new ImageData(new Uint8ClampedArray(msg.data), msg.w, msg.h);
+      g.putImageData(img, 0, 0);
+      cv.dataset.q = 'own';
     }
   });
 }
 
-function applyPreset(p) {
-  state.spec.mode = p.mode;
-  state.spec.kind = p.kind || 'mandelbrot';
-  state.spec.power = p.power || 2;
-  state.spec.newtonDegree = p.newtonDegree || 3;
-  if (p.julia) state.spec.julia = { ...p.julia };
-  if (p.customExpr) {
-    state.spec.customExpr = p.customExpr;
-    state.spec.customParams = { ...(p.customParams || { a: 0, b: 0, k: 0 }) };
-  }
-  state.center = { re: p.cx, im: p.cy };
-  state.span = spanFromDecimal(p.spanExp);
-  state.maxIter = p.maxIter;
-  state.autoIter = false;
-  state.palette = p.palette;
-  state.cycle = p.cycle || 8; state.cycleAuto = false;
-  state.offset = p.offset || 0;
-  state.presetId = p.id;
-  $('chk-autoiter').checked = false;
-  if (p.mode === 'x') { state.autoIter = false; state.maxIter = Math.max(400, p.maxIter); }
-  $('sel-palette').value = state.palette;
-  $('rng-cycle').value = state.cycle; $('val-cycle').textContent = state.cycle;
-  $('rng-offset').value = state.offset; $('val-offset').textContent = state.offset.toFixed(2);
-  syncModeUi(); syncPaletteStrip(); syncIterUi(); renderNow();
+/* ---- thumbnail shading ------------------------------------------------- */
+
+let thumbGpu = null;
+let thumbGpuCv = null;
+let thumbBusy = false;
+const thumbJobs = [];
+
+/** One WebGL surface for every card, created on first use. */
+function thumbRenderer() {
+  if (thumbGpu) return thumbGpu;
+  thumbGpuCv = document.createElement('canvas');
+  thumbGpuCv.width = 158;
+  thumbGpuCv.height = 99;
+  thumbGpu = new FieldRenderer(thumbGpuCv);
+  return thumbGpu;
 }
 
-/* ---------------- 公式窗口 ---------------- */
+function pumpThumbs() {
+  if (thumbBusy) return;
+  const job = thumbJobs.shift();
+  if (!job) return;
+  const { cv, patch, payload, fieldW, fieldH } = job;
+  const r = thumbRenderer();
+  if (!r.ok) { cv.dataset.q = ''; return; }
+  thumbBusy = true;
+  const ok = nativeField(payload, (msg) => {
+    try {
+      if (!msg || !msg.data) return;
+      const W = msg.w, H = msg.h;
+      const rec = resolveScheme(patch);
+      const err = r.setScheme(rec.src || GLSL_BUILTIN.smooth.src, 1);
+      if (err) { nativeLog('[thumb] sch: ' + String(err).slice(0, 160)); return; }
+      r.uploadField(msg.data, W, H);
+      r.resize(W, H);
+      r.draw({
+        colors: rec.colors,
+        stops: [],
+        briFinite: rec.bri.finite,
+        briInfinite: rec.bri.infinite,
+        briFactor: rec.bri.factor,
+        param: rec.params,
+        julia: patch.mode === 'j',
+        juliaRe: patch.julia ? Number(patch.julia.re) : 0,
+        juliaIm: patch.julia ? Number(patch.julia.im) : 0,
+        inverse: !!patch.inverse,
+        tone: { bri: 1, gr: 1, gg: 1, gb: 1 }
+      });
+      cv.getContext('2d').imageSmoothingQuality = 'high';
+      cv.getContext('2d').drawImage(thumbGpuCv, 0, 0, cv.width, cv.height);
+      cv.dataset.q = 'own';
+    } finally {
+      thumbBusy = false;
+      setTimeout(pumpThumbs, 0);
+    }
+  });
+  if (!ok) { thumbBusy = false; cv.dataset.q = ''; }
+  void fieldW; void fieldH;
+}
+
+/* ------------------------------------------------------------------
+ * Reference presets (the original program's own JSON).
+ *
+ * A file describes position, zoom, rotation, the Julia seed, the additive
+ * `colors` table, the brightness pair — and, for the presets whose whole look
+ * is a shader, the `colorscheme.codegl` source.  Importing therefore does two
+ * things at once: it moves the view, and it installs a colour scheme.  The
+ * second half is the one that matters: four of the shipped presets cannot be
+ * expressed as pal() parameters at all, so without the shader they come back
+ * as "some other fractal".
+ *
+ * Export writes the same shape back, including the HLSL twin the original
+ * program actually reads, so a round trip stays loadable there.
+ * ------------------------------------------------------------------ */
+const IMPORTED_PALETTE = 'imported';
+
+/* ---- colour recipe of a preset ---------------------------------------- */
+
+/* The reference's built-in schemes are named in its presets and compiled into
+ * its binary: Example 5 says only "Distance and iteration levels" and still
+ * gets that shader.  We carry the same set, so a file that names one resolves
+ * to our copy instead of silently falling back to a ramp. */
+const BUILTIN_SCHEME_BY_NAME = [
+  [/^iteration\s+with\s+limit/i, 'glsl:6'],
+  [/^iteration/i, 'builtin:iteration'],
+  [/^smooth/i, 'builtin:smooth'],
+  [/^distance\s+and\s+iteration\s+levels/i, 'glsl:8'],
+  [/^distance/i, 'glsl:7'],
+  [/^texture/i, 'glsl:9'],
+  [/^amethyst/i, 'glsl:1'],
+  [/^nebula/i, 'glsl:2'],
+  [/^rainbow\s+veins/i, 'glsl:3'],
+  [/^high\s+precision\s+rainbow/i, 'glsl:4'],
+  [/^chinese\s+remainder/i, 'glsl:5']
+];
+
+function builtinSchemeId(name) {
+  const s = String(name || '').trim();
+  if (!s) return null;
+  for (const [re, id] of BUILTIN_SCHEME_BY_NAME) if (re.test(s)) return id;
+  return null;
+}
+
+/**
+ * Everything needed to *shade* a preset: the fragment source, its params, its
+ * colour table, its brightness pair and its supersampling count.
+ *
+ * Pure by construction — the preset grid calls it for every card, so it must
+ * not touch `state`.  A file either carries its own `codegl` or names one of
+ * the built-ins; in both cases the result is one shader body.
+ */
+/* Imported `codegl` bodies are GLSL ES 1.00: they carry precision qualifiers
+ * inside expressions (`highp float(x)`), which ES 3.00 rejects, and sometimes a
+ * `#version`/`precision` line that would land in the middle of our program.
+ * Strip both at the boundary rather than teaching every scheme about it. */
+function sanitizeGlsl(src) {
+  if (!src) return '';
+  return String(src)
+    .replace(/^\s*#version[^\n]*$/gm, '')
+    .replace(/^\s*precision\s+(?:lowp|mediump|highp)\s+\w+\s*;\s*$/gm, '')
+    .replace(/\b(?:highp|mediump|lowp)\s+(?=(?:float|int|vec[234]|mat[234]|sampler2D)\b)/g, '');
+}
+
+/* The program's own default three-term palette, used by the trap shader when
+ * the current palette is a ramp (a ramp has no pal() terms to sum). */
+const TRAP_DEFAULT_COLORS = [
+  { r: 1, g: 0, b: 0, frequency: -2.1202635765075684, initial: -1.0 },
+  { r: 0, g: 1, b: 0, frequency: -1.1363141536712646, initial: -1.5 },
+  { r: 0, g: 0, b: 1, frequency: -0.023268627002835274, initial: -0.5 }
+];
+/* The program's own three-term default, in the domain `pal()` reads. */
+const TRAP_DEFAULT_SHADER_COLORS = shaderTerms(TRAP_DEFAULT_COLORS);
+
+/** Trap gain / ring count: the console's own two sliders. */
+function trapParam() {
+  const clamp01 = (v, d) => (Number.isFinite(+v) ? Math.min(1, Math.max(0, +v)) : d);
+  return { gain: clamp01(state.trapGain, 0.45), rings: clamp01(state.trapRings, 0.40) };
+}
+
+/* Re-shade without re-rendering.
+ *
+ * A trap's gain and ring count are read only by the fragment shader, so the
+ * field on the GPU stays valid and the whole update is one draw call — the
+ * same path the shader clock uses.  When there is no live field yet (a render
+ * in flight, a gesture) the caller falls back to a normal render. */
+function reshadeOnly() {
+  const d = lastDraw;
+  if (!d || !d.fieldLive || !d.param || !(state.traps > 0)) return false;
+  d.param[0] = trapParam().gain;
+  d.param[1] = trapParam().rings;
+  gpu.draw(d);
+  if (juliaView) juliaView.redraw();
+  return true;
+}
+
+function resolveScheme(patch) {
+  const out = {
+    src: sanitizeGlsl(patch.glsl || ''),
+    schemeId: null,
+    nparam: patch.nparam | 0,
+    params: (patch.param || []).slice(0, 4).map(v => +v || 0),
+    colors: shaderTerms((patch.colors || []).map(c => ({
+      r: c.r, g: c.g, b: c.b,
+      frequency: c.frequency != null ? c.frequency : 0,
+      initial: c.initial != null ? c.initial : 0
+    })), patch.colorFreq, patch.colorInit),
+    bri: {
+      finite: patch.briFinite != null ? patch.briFinite : 1,
+      infinite: patch.briInfinite != null ? patch.briInfinite : 1,
+      factor: patch.briFactor != null ? patch.briFactor : 1
+    },
+    samples: clamp(patch.samples | 0 || 2, 1, 4)
+  };
+  if (!out.src) {
+    const sid = builtinSchemeId(patch.schemeBuiltin || patch.schemeName);
+    if (sid === 'builtin:iteration' || sid === 'builtin:smooth') {
+      out.src = GLSL_BUILTIN[sid.slice(8)].src;
+      out.nparam = 0;
+      out.params = [];
+    } else if (sid) {
+      const s = findSchemeAny(sid);
+      if (s) {
+        out.src = sanitizeGlsl(s.glsl);
+        out.schemeId = s.id;
+        out.nparam = s.nparam;
+        /* The file's `custom` is the authored setting; the library value is
+         * only the fallback when a file names the scheme but not its params. */
+        if (!(patch.param && patch.param.length)) out.params = (s.params || []).slice(0, 4);
+        /* Three of the built-in schemes (Distance, Distance and iteration
+         * levels, Texture) are compiled into the reference together with the
+         * program's *default* colour table, so their JSON carries no `colors`
+         * at all — the file's own table (or the default the preset generator
+         * injected) is what `pal()` must read.  Overwriting it with an empty
+         * list left `pal()` returning white and turned these presets into a
+         * solid white frame. */
+        if (s.colors && s.colors.length) {
+          out.colors = shaderTerms(s.colors.map(c => ({
+            r: c[0], g: c[1], b: c[2], frequency: c[3], initial: c[4]
+          })), s.gf, s.gi);
+        }
+        out.bri = {
+          finite: patch.briFinite != null ? patch.briFinite : s.briFinite,
+          infinite: patch.briInfinite != null ? patch.briInfinite : s.briInfinite,
+          factor: patch.briFactor != null ? patch.briFactor : s.briFactor
+        };
+        out.samples = clamp(patch.samples | 0 || s.samples || 2, 1, 4);
+        out.channels = s.channels == null ? null : s.channels;
+      }
+    }
+  }
+  /* A shipped file may name a custom `codegl` scheme and carry no `colors` at
+   * all (Example 12 does).  The reference only overwrites the palette entries
+   * the file actually contains, so such a file inherits the palette that was
+   * loaded before it — the program's own three-term default on a fresh start.
+   * Leaving the list empty makes `pal()` sum nothing and paint a solid black
+   * frame, which is exactly what an all-black import looked like. */
+  if (!out.colors.length) {
+    out.colors = (state.schemeColors && state.schemeColors.length
+      ? state.schemeColors
+      : TRAP_DEFAULT_SHADER_COLORS).map(c => ({
+        r: c.r, g: c.g, b: c.b,
+        frequency: +c.frequency || 0, initial: +c.initial || 0
+      }));
+  }
+  while (out.params.length < out.nparam) out.params.push(0.33);
+  out.params = out.params.slice(0, Math.max(0, out.nparam));
+  return out;
+}
+
+/**
+ * Install a preset patch.
+ *
+ * `patch` comes from presetlib.patchOf(), which is the one place that knows how
+ * the file's four coordinate pairs map onto the app's view.  Everything else
+ * here is bookkeeping: which formula, which colour source, which samples, and
+ * whether the file also carries keyframes.
+ */
+/* The engine's families, by the number the kernels use.  A card carries that
+ * number in `spec`; the UI wants the name, and native.js maps the name back to
+ * the number for the request — one vocabulary, two spellings. */
+const KIND_NAMES = ['mandelbrot', 'tricorn', 'burningship', 'celtic',
+                    'perpendicular', 'phoenix'];
+function kindNameOf(kind, power) {
+  const n = Number(kind) || 0;
+  if (n === 0 && power > 2) return 'multibrot';
+  return KIND_NAMES[n] || 'mandelbrot';
+}
+/** The formula a patch names: its own `spec`, else the reference's z^2 + c. */
+function specOfPatch(patch, modeOverride) {
+  const sp = patch && patch.spec;
+  const mode = modeOverride || (sp && sp.mode) || (patch && patch.mode) || 'm';
+  const kind = sp ? Number(sp.kind) || 0 : 0;
+  const power = sp ? Number(sp.power) || 2 : 2;
+  return {
+    mode: mode === 'j' ? 'j' : 'm',
+    kind: kindNameOf(kind, power),
+    power,
+    julia: (patch && patch.julia) || null
+  };
+}
+
+function applyRefPresetPatch(patch, file) {
+  const sp = specOfPatch(patch);
+  state.spec.mode = sp.mode;
+  /* A reference file is the quadratic map; the cards this program authored
+   * carry their own family in `spec`, so reading it costs nothing and leaving
+   * it out would silently paint another set with the file's picture. */
+  state.spec.kind = sp.kind;
+  state.spec.power = sp.power;
+  syncFamilyUi();
+  if (patch.julia) state.spec.julia = { re: patch.julia.re, im: patch.julia.im };
+
+  if (patch.center) state.center = { re: patch.center.re, im: patch.center.im };
+  if (patch.span) state.span = patch.span;
+  if (patch.rotation != null) state.rotation = patch.rotation;
+
+  /* A preset owns its whole colour recipe.  The seven tone sliders and the
+   * phase knob are session state, not file state, so leaving them where the
+   * last view put them tinted every preset opened afterwards — the file's
+   * measured palette then looked "wrong" while the preset's own numbers were
+   * fine.  Neutral here, and syncColorUi() pushes it into the controls. */
+  state.tone = { bri: 1, gr: 1, gg: 1, gb: 1 };
+  state.offset = 0;
+  state.shade = 0;
+  state.bands = 0;              // the file's own frequencies, never a fitted band count
+  state.detail = 3;
+
+  /* The shader is the preset's real colour recipe (see resolveScheme). */
+  const rec = resolveScheme(patch);
+  state.glsl = rec.src || null;
+  state.schemeChannels = rec.channels == null ? null : rec.channels;
+  state.schemeName = patch.schemeName || '';
+  state.schemeId = rec.schemeId;
+  if (state.glsl) {
+    state.schemeMeta = {
+      nparam: rec.nparam,
+      paramLabels: Array.from({ length: rec.nparam }, (_, i) => ({
+        zh: i === 0 ? '方案参数' : '细节距离',
+        en: i === 0 ? 'Scheme parameter' : 'Detail distance'
+      })),
+      samples: rec.samples
+    };
+    state.schemeParams = rec.params.slice(0, 4);
+    state.schemeColors = rec.colors;
+    state.schemeBri = rec.bri;
+    /* The file's own scheme joins the library under its own name, which is
+     * what the reference does for every Colorscheme it creates.  A name that
+     * is already there is replaced, as addjdict does. */
+    schemeStoreAdd(state.schemeName || patch.name || 'imported', state.glsl, {
+      nparam: rec.nparam, samples: rec.samples, channels: state.schemeChannels
+    });
+  } else {
+    state.schemeMeta = null;
+  }
+  if (patch.samples) state.aa = patch.samples;
+
+  if (patch.colors && patch.colors.length) {
+    registerAdditivePalette(IMPORTED_PALETTE, patch.colors,
+                            patch.briFinite, patch.briInfinite,
+                            patch.schemeName || (patch.name || '').trim(),
+                            { gf: patch.colorFreq, gi: patch.colorInit });
+    state.palette = IMPORTED_PALETTE;
+    state.stops = null;
+  }
+  /* An edited ramp comes back as a ramp; without one the preset's own colour
+   * table is the source, so any earlier edit is dropped. */
+  state.stops = Array.isArray(patch.ramp) && patch.ramp.length ? patch.ramp : null;
+  state.inverse = !!patch.inverse;
+  state.animation = patch.animation || null;
+  state.juliaView = patch.juliaView || state.juliaView;
+  /* A reference JSON carries the second viewport's own zoom/rotation and the
+   * Mandelbrot seed (julia_mx/my).  Feed them to the preview so opening an
+   * official example reproduces its authored Julia set too. */
+  if (juliaView) juliaView.setParams({
+    zoom: state.juliaView && state.juliaView.zoom,
+    rotation: state.juliaView && state.juliaView.rotation,
+    center: state.juliaView && state.juliaView.re != null
+      ? { re: state.juliaView.re, im: state.juliaView.im } : null,
+    seed: patch.juliaSeed || null
+  });
+  state.presetFile = file || '';
+  state.presetName = patch.name || '';
+  state.presetId = file || patch.id || null;
+
+  nativeLog(`[preset] open ${file || '-'} mode=${mode} ` +
+            `center=${state.center.re},${state.center.im} ` +
+            `span=${state.span.m}*2^${state.span.e} rot=${(state.rotation || 0).toFixed(3)} ` +
+            `glsl=${state.glsl ? 'yes' : 'no'} colors=${patch.colors ? patch.colors.length : 0} ` +
+            `anim=${patch.animation ? 'yes' : 'no'}`);
+
+  try {
+    const sel = $('sel-palette');
+    if (patch.colors && patch.colors.length) {
+      let opt = [...sel.options].find(o => o.value === IMPORTED_PALETTE);
+      if (!opt) {
+        opt = document.createElement('option');
+        opt.value = IMPORTED_PALETTE;
+        sel.appendChild(opt);
+      }
+      opt.textContent = patch.schemeName || patch.name || 'Imported';
+    }
+    sel.value = state.palette;
+    $('sel-scheme').value = state.scheme;
+  } catch (_) { /* the palette may not be in the dropdown yet */ }
+
+  syncColorUi();
+  syncModeUi(); syncIterUi(); syncRotationUi();
+  /* A preset that carries keyframes starts paused: playing is a deliberate act,
+   * and a view that starts moving on its own is not what "open a file" means. */
+  stopAnimation();
+  syncAnimationButton();
+  viewId++;
+  renderNow();
+  toast(patch.name || patch.schemeName || t('saved'));
+  return true;
+}
+
+/** Text entry point, used by the file dialog and by a file named on the CLI. */
+function applyRefPresetText(text, name) {
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch (e) {
+    nativeLog('[preset] parse failed: ' + (e && e.message));
+    toast('JSON ✗');
+    return false;
+  }
+  let patch;
+  try {
+    patch = patchOf(obj);
+  } catch (e) {
+    nativeLog('[preset] not a preset: ' + (e && e.message));
+    toast('preset ✗');
+    return false;
+  }
+  if (!patch.name && name) patch.name = String(name).split(/[\\/]/).pop();
+  /* Import = add to "mine" *and* open it.  Storing first means the id the
+   * library assigns is the one the view records, so saving again overwrites
+   * instead of piling up copies. */
+  let stored = '';
+  savePreset(obj, '', patch.name || 'imported', (m) => { if (m && m.ok) stored = m.name; });
+  return applyRefPresetPatch(patch, stored);
+}
+
+/* The shell can open a preset or a panel by name: a file on the command line,
+ * or a scripted screenshot. */
+window.addEventListener('mbShell', async (e) => {
+  const m = e.detail;
+  if (!m) return;
+  if (m.type === 'openPreset' && m.name) {
+    try {
+      const patch = await loadPatch(m.name);
+      applyRefPresetPatch(patch, m.name);
+    } catch (err) {
+      nativeLog('[preset] shell open failed: ' + (err && err.message));
+    }
+  } else if (m.type === 'openPanel' && m.panel === 'presets') {
+    openPresets();
+  }
+});
+
+/* The shell can push a preset without being asked (a file named on the
+ * command line, or one dropped on the window). */
+window.addEventListener('mbPreset', (e) => {
+  const m = e.detail;
+  if (m && m.type === 'presetImport' && m.ok) applyRefPresetText(m.text, m.name);
+  else if (m && m.type === 'presetExport') toast(m.ok ? t('saved') : 'preset ✗');
+});
+
+/* ---- appdata\mandelbrot.json -------------------------------------------
+ * The reference program's parameter file (winparameters.html).  The shell
+ * parses it, clamps every key to the documented range/defaults, applies
+ * `nthread` before the engine starts, and sends the effective values here.
+ * Only the keys with a real counterpart in this port change anything; the rest
+ * are surfaced so the reference's own file is drop-in.
+ */
+function applyConfig(cfg) {
+  if (!cfg) return;
+  state.cfg = cfg;
+  const MB = 1024 * 1024;
+  let budget = 96 * MB;
+  if (cfg.cachesize === 9) budget /= 4;
+  else if (cfg.cachesize === 11) budget *= 4;
+  if (cfg.totalmemory > 0) budget = Math.min(budget, cfg.totalmemory * MB / 4);
+  FIELD_MEM_BUDGET = Math.max(16 * MB, Math.min(512 * MB, budget));
+  if (cfg.guiscale && Math.abs(cfg.guiscale - 1) > 1e-3)
+    document.documentElement.style.zoom = String(cfg.guiscale);
+  const mb = Math.round(FIELD_MEM_BUDGET / MB);
+  const note = $('cfg-note');
+  if (note) {
+    note.hidden = false;
+    note.textContent = getLang() === 'en'
+      ? (cfg.loaded ? `mandelbrot.json loaded · threads ${cfg.nthread || nativeThreads()} · cache ${cfg.cachesize} · field ${mb} MB`
+                    : 'mandelbrot.json not found · documented defaults')
+      : (cfg.loaded ? `mandelbrot.json 已读取 · 线程 ${cfg.nthread || nativeThreads()} · 缓存 ${cfg.cachesize} · 场缓存 ${mb} MB`
+                    : 'mandelbrot.json 未找到 · 使用文档默认值');
+  }
+  nativeLog('[cfg] applied ' + JSON.stringify(cfg) + ' fieldMB=' + mb);
+}
+window.addEventListener('mbConfig', (e) => applyConfig(e.detail));
+
+function importPresetFile() {
+  if (!nativeImportPreset((m) => {
+        if (!m || !m.ok) { toast('preset ✗'); return; }
+        applyRefPresetText(m.text, m.name);
+      })) {
+    /* Browser build: fall back to a file input, which is the only way a page
+     * can read a local file on its own. */
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.json,application/json';
+    inp.addEventListener('change', async () => {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      applyRefPresetText(await f.text(), f.name);
+    });
+    inp.click();
+  }
+}
+
+/**
+ * The current view as a reference-shaped preset object.
+ *
+ * Every field is filled: the position and zoom as decimal text (so a 40-digit
+ * centre survives), the rotation, the Julia view *and* seed, the additive colour
+ * table, the brightness pair, the scheme's shader when one is installed, and the
+ * animation when the view has one.
+ */
+function makeRefPreset(name) {
+  /* Export writes the file's LITERAL log-domain table, not the exp()-converted
+   * values the shader uses: the reference applies exp(f_i + F) itself in
+   * loadParams.  Writing shader values here would double-apply it. */
+  const raw = paletteRaw(state.palette);
+  const terms = nativePaletteTerms(state.palette) || {};
+  const colors = raw ? raw.colors.map(c => ({ ...c })) : [];
+  return buildObject({
+    colorFreq: raw ? raw.gf : undefined,
+    colorInit: raw ? raw.gi : undefined,
+    name,
+    nameZh: name,
+    id: (state.presetFile || '').replace(/\.json$/, '') || null,
+    category: 'user',
+    mode: state.spec.mode,
+    center: state.center,
+    span: state.span,
+    rotation: state.rotation || 0,
+    julia: state.spec.julia,
+    juliaView: state.juliaView,
+    colors,
+    /* A hand-edited ramp travels as itself (see presetlib.buildObject): it is
+     * not expressible as the additive table, and rounding it into one would
+     * lose the edit that produced it. */
+    ramp: Array.isArray(state.stops) ? state.stops : null,
+    briFinite: terms.briFinite,
+    briInfinite: terms.briInfinite,
+    glsl: state.glsl || '',
+    hlsl: state.glsl ? glslToHlsl(state.glsl) : '',
+    schemeName: state.schemeName || (state.glsl ? 'Imported scheme' : undefined),
+    samples: state.aa,
+    param: null,
+    animation: state.animation || null
+  });
+}
+
+function exportPresetFile() {
+  const json = JSON.stringify(makeRefPreset(state.presetName || 'preset'), null, 2) + '\n';
+  if (!nativeExportPreset(json, (m) => {
+        toast(m && m.ok ? t('saved') : 'preset ✗');
+      })) {
+    const blob = new Blob([json], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'preset.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Animation playback.
+ *
+ * Some presets carry a keyframe list (the reference program's own files can
+ * describe a move as well as a view).  Playing one walks the view along those
+ * keys and asks for a frame at a fixed cadence; the renderer's progressive
+ * path already drops stale frames, so a slow frame simply means a lower frame
+ * rate, never a queue.
+ *
+ * It is deliberately not a video renderer: no frame is written to disk, and the
+ * cadence is chosen to stay interactive.
+ * ---------------------------------------------------------------- */
+let animPlaying = false;
+let animRAF = 0;
+let animStart = 0;
+let animLast = 0;
+const ANIM_FRAME_MS = 130;
+
+function stopAnimation() {
+  animPlaying = false;
+  if (animRAF) { cancelAnimationFrame(animRAF); animRAF = 0; }
+  syncAnimationButton();
+}
+
+function toggleAnimation() {
+  if (animPlaying) { stopAnimation(); return; }
+  const anim = state.animation;
+  if (!anim || !anim.keys) return;
+  animPlaying = true;
+  animStart = performance.now();
+  animLast = 0;
+  syncAnimationButton();
+  const step = (now) => {
+    if (!animPlaying) return;
+    const dur = Math.max(0.5, Number(anim.duration) || 12) * 1000;
+    const t = ((now - animStart) % dur) / dur;
+    if (now - animLast >= ANIM_FRAME_MS) {
+      animLast = now;
+      const v = sampleAnimation(anim, t);
+      if (v) {
+        /* The keys carry plain numbers; the view wants decimal text.  Going
+         * through String() keeps one code path for the renderer, which reads
+         * the centre as text so a deep view is not truncated. */
+        if (isFinite(v.x) && isFinite(v.y)) {
+          state.center = { re: String(v.x), im: String(v.y) };
+        }
+        if (v.zoom && isFinite(v.zoom)) {
+          const span = 2 / v.zoom;
+          let m = span, e = 0;
+          while (m >= 2) { m /= 2; e++; }
+          while (m < 1) { m *= 2; e--; }
+          state.span = { m, e };
+        }
+        if (v.rotation != null && isFinite(v.rotation)) { state.rotation = v.rotation; syncRotationUi(); }
+        if (v.offset != null && isFinite(v.offset)) state.offset = v.offset;
+        viewId++;
+        renderNow();
+      }
+    }
+    animRAF = requestAnimationFrame(step);
+  };
+  animRAF = requestAnimationFrame(step);
+}
+
+/* ---------------- Formula window ---------------- */
 let formulaWorkerJob = null;
 
 function openFormula() {
@@ -961,13 +4256,22 @@ function openFormula() {
     <div class="fx-wrap">
       <div class="fx-list" id="fx-list"></div>
       <div class="fx-preview">
-        <canvas id="formula-preview" width="720" height="450"></canvas>
-        <div class="fx-meta" id="fx-meta"></div>
+        <div class="fx-stage" id="fx-stage">
+          <canvas id="formula-preview" width="720" height="450"></canvas>
+          <div class="fx-insetbox" id="fx-inset-box" hidden>
+            <canvas id="formula-inset" width="320" height="200"></canvas>
+            <div class="fx-inset-cap" id="fx-inset-cap">10^9</div>
+          </div>
+          <div class="fx-marker" id="fx-marker" hidden></div>
+          <button class="btn tiny fx-branch-btn" id="fx-branch-next">${t('pickAnother')}</button>
+          <div class="fx-branch-info" id="fx-branch-info">${t('pickCriteria')}</div>
+        </div>
       </div>
     </div>`;
   const foot = `
     <button class="btn ghost" id="f-copy">LaTeX</button>
     <button class="btn" id="f-save">${t('saveFormula')}</button>
+    <button class="btn" id="f-parse">${t('parseExpr')}</button>
     <button class="btn primary" id="f-apply">${t('apply')}</button>`;
   openModal('formula', t('formulaTitle'), t('formulaSub'), body, foot, 'wide');
 
@@ -980,27 +4284,65 @@ function openFormula() {
   };
 
   const list = $('fx-list');
-  const input = document.createElement('textarea');
-  input.className = 'fx-expr';
-  input.spellcheck = false;
-  input.value = state2.expr;
+  // One-time shell: the textarea is created once and never rebuilt, so typing
+  // never loses focus / caret. Only the parameter block and the LaTeX line
+  // get refreshed, and only when the user explicitly asks for a parse.
+  list.innerHTML = `
+    <div class="fx-row fx-main">
+      <span class="fx-idx">1</span>
+      <div class="fx-cell"><div class="fx-tex big" id="fx-tex"></div></div>
+    </div>
+    <div class="fx-row fx-input">
+      <span class="fx-idx">ƒ</span>
+      <div class="fx-cell"><textarea class="fx-expr" id="fx-expr" spellcheck="false"></textarea></div>
+    </div>
+    <div class="fx-examples" id="fx-examples">
+      ${EXAMPLES.map(e => `<button data-expr="${e.expr.replace(/"/g, '&quot;')}">${getLang() === 'en' ? e.en : e.zh}</button>`).join('')}
+    </div>
+    <div class="fx-hint">${t('fxHint')}</div>
+    <div class="fx-meta" id="fx-meta"></div>
+    <div class="fx-deep" id="fx-deep">${t('formulaDeep')}</div>
+    <div id="fx-params"></div>`;
 
-  function buildRows() {
-    const texMain = state2.ok ? latexToHtml(state2.latex) : '<span class="fx-err">表达式有误</span>';
-    let html = `
-      <div class="fx-row fx-main">
-        <span class="fx-idx">1</span>
-        <div class="fx-cell">
-          <div class="fx-tex big">z \u2192 ${texMain}</div>
-        </div>
-      </div>`;
+  const ta = $('fx-expr');
+  ta.value = state2.expr;
+  ta.addEventListener('input', () => {
+    state2.expr = ta.value;
+    state2.dirty = true;
+    setMetaPending();
+  });
+  ta.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+      ev.preventDefault();
+      validate();
+    }
+  });
+
+  function setMetaPending() {
+    const m = $('fx-meta');
+    if (!m) return;
+    m.className = 'fx-meta';
+    m.textContent = t('parsePending');
+  }
+
+  function renderTex() {
+    const el = $('fx-tex');
+    if (!el) return;
+    if (!state2.ok) { el.innerHTML = 'z \u2192 <span class="fx-err">?</span>'; return; }
+    el.innerHTML = `z \u2192 ${latexToHtml(state2.latex)}`;
+  }
+
+  function renderParams() {
+    const box = $('fx-params');
+    if (!box) return;
+    let html = '';
     state2.params.forEach((name, i) => {
       const v = state2.vals[name] ?? 0;
       html += `
       <div class="fx-row fx-param">
         <span class="fx-idx">${i + 2}</span>
         <div class="fx-cell">
-          <div class="fx-tex"><i>${name}</i> = <span class="fx-val">${(v).toFixed(2)}</span></div>
+          <div class="fx-tex"><i>${name}</i> = <span class="fx-val">${v.toFixed(2)}</span></div>
           <div class="fx-slider">
             <span>-3</span>
             <input type="range" data-p="${name}" min="-3" max="3" step="0.01" value="${v}"/>
@@ -1009,74 +4351,113 @@ function openFormula() {
         </div>
       </div>`;
     });
-    list.innerHTML = `
-      <div class="fx-row fx-input">
-        <span class="fx-idx">ƒ</span>
-        <div class="fx-cell"><textarea class="fx-expr" id="fx-expr" spellcheck="false">${state2.expr.replace(/</g, '&lt;')}</textarea></div>
-      </div>
-      <div class="fx-hint">${t('fxHint')}</div>
-      ${html}
-      <div class="fx-examples" id="fx-examples">
-        ${EXAMPLES.map(e => `<button data-expr="${e.expr.replace(/"/g, '&quot;')}">${getLang() === 'en' ? e.en : e.zh}</button>`).join('')}
-      </div>`;
-    const ta = $('fx-expr');
-    ta.addEventListener('input', () => {
-      state2.expr = ta.value;
-      clearTimeout(ta._tm);
-      ta._tm = setTimeout(validate, 220);
-    });
-    list.querySelectorAll('.fx-slider input').forEach(sl => {
+    box.innerHTML = html;
+    box.querySelectorAll('.fx-slider input').forEach(sl => {
       sl.addEventListener('input', () => {
         const name = sl.dataset.p;
         state2.vals[name] = parseFloat(sl.value);
         const lab = sl.closest('.fx-cell').querySelector('.fx-val');
         if (lab) lab.textContent = state2.vals[name].toFixed(2);
         clearTimeout(sl._tm);
-        sl._tm = setTimeout(() => { renderFormulaPreview(state2.expr, state2.vals); }, 150);
+        sl._tm = setTimeout(() => {
+          renderFormulaPreview(state2.expr, state2.vals);
+          /* A parameter moves the branches themselves, so the previous pick is
+           * no longer describing this family: score again. */
+          state2.branch = null;
+          renderInset(state2.expr, state2.vals);
+        }, 150);
       });
-    });
-    $('fx-examples').querySelectorAll('button').forEach(b => {
-      b.onclick = () => { state2.expr = b.dataset.expr; buildRows(); validate(); };
     });
   }
 
   function validate() {
+    const meta = $('fx-meta');
     try {
       const r = compileMath(state2.expr);
       state2.ok = true;
       state2.latex = r.latex;
-      const ps = (r.params || []).filter(n => !['a', 'b', 'k', 'm'].includes(n) || true);
-      // 合并：保持已有值，新增默认为 0
-      const uniq = [...new Set(ps)];
+      const uniq = [...new Set(r.params || [])];
       state2.params = uniq;
       uniq.forEach(n => { if (!(n in state2.vals)) state2.vals[n] = 0; });
       state2.fn = r.fn;
-      buildRows();
-      $('fx-meta').className = 'fx-meta ok';
-      $('fx-meta').textContent = t('compileOk') + ' · ' + uniq.length + ' ' + t('params');
+      state2.step = r.step;
+      /* A new expression means every previous pick described a different
+       * family: drop it so the branch scorer runs again from scratch. */
+      state2.branch = null;
+      state2.recent = [];
+      state2.parsedExpr = state2.expr;
+      state2.dirty = false;
+      renderTex();
+      renderParams();
+      if (ta) ta.classList.remove('bad');
+      const deep = $('fx-deep');
+      if (deep) {
+        /* Which deep path this expression can take.  A holomorphic formula gets
+         * the exact power-series (jet) perturbation; a non-analytic one (abs,
+         * conj, arg, re, im) only admits a linear perturbation, and saying so
+         * is better than letting it quietly blur at depth. */
+        const holy = !/(^|[^A-Za-z])(abs|conj|arg|re|im|abs2|norm)\s*\(/.test(state2.expr);
+        deep.className = 'fx-deep ' + (holy ? 'ok' : 'warn');
+        deep.textContent = holy ? t('formulaDeep') : t('formulaDeepOff');
+      }
+      if (meta) {
+        meta.className = 'fx-meta ok';
+        meta.textContent = t('compileOk') + ' · ' + uniq.length + ' ' + t('params');
+      }
       renderFormulaPreview(state2.expr, state2.vals);
+      /* The whole point of the inset is to answer "is *this* parameter set worth
+       * zooming into", so every successful parse re-asks it. */
+      renderInset(state2.expr, state2.vals);
     } catch (err) {
       state2.ok = false;
-      buildRows();
-      $('fx-meta').className = 'fx-meta err';
-      $('fx-meta').textContent = t('compileErr') + '：' + err.message;
+      state2.dirty = false;
+      state2.parsedExpr = state2.expr;
+      renderTex();
+      if (ta) ta.classList.add('bad');
+      if (meta) {
+        const pos = Number.isFinite(err.pos) ? err.pos : null;
+        const line = Number.isFinite(err.line) ? err.line : null;
+        let where = '';
+        if (line != null) {
+          where = t('errorAt')
+            .replace('{line}', String(line))
+            .replace('{col}', String((pos != null ? pos : 0) + 1)) + ' · ';
+        } else if (pos != null) {
+          where = 'col ' + (pos + 1) + ' · ';
+        }
+        meta.className = 'fx-meta err';
+        meta.textContent = t('compileErr') + '：' + where + err.message;
+      }
     }
   }
 
-  $('f-apply').onclick = () => {
-    if (!state2.ok) return;
+  $('fx-examples').querySelectorAll('button').forEach(b => {
+    b.onclick = () => {
+      state2.expr = b.dataset.expr;
+      ta.value = state2.expr;
+      ta.focus();
+      validate();
+    };
+  });
+  $('f-parse').onclick = () => { state2.expr = ta.value; validate(); };
+
+  function applyCurrent() {
+    if (state2.dirty || !state2.parsedExpr) validate();
+    if (!state2.ok) return false;
     state.spec.customExpr = state2.expr;
     state.spec.customParams = { ...state2.vals };
     state.spec.mode = 'x';
-    state.center = { re: '-0.5', im: '0' };
-    state.span = { m: 1.6, e: 1 };
-    state.maxIter = 600;
-    state.autoIter = false;
-    $('chk-autoiter').checked = false;
-    syncModeUi(); syncIterUi(); renderNow();
+    /* Keep the view the user is looking at.  Jumping back to the home view on
+     * apply made "write a formula, then zoom in" impossible: every edit threw
+     * the zoom away.  The formula is applied to whatever frame is on screen. */
+    state.presetId = null;
+    syncModeUi(); syncFormulaUi(); renderNow();
     closeModal();
-  };
+    return true;
+  }
+  $('f-apply').onclick = applyCurrent;
   $('f-save').onclick = () => {
+    if (state2.dirty || !state2.parsedExpr) validate();
     if (!state2.ok) return;
     const l = loadFormulas();
     l.push({ name: state2.expr.split('\n')[0].slice(0, 40), expr: state2.expr, params: { ...state2.vals }, at: Date.now() });
@@ -1086,6 +4467,289 @@ function openFormula() {
   $('f-copy').onclick = () => {
     navigator.clipboard?.writeText(state2.latex).then(() => toast('LaTeX ✓')).catch(() => toast('LaTeX'));
   };
+
+  /* ---- second viewport: automatic branch view ------------------------
+   * The inset no longer asks the user where to look.  It scores the preview
+   * domain and picks a *branch* on its own: a place that is outside the set,
+   * carries a real iteration gradient, and is not a flat wash.  The same rule
+   * the colour stage uses to decide "there is structure here" is what decides
+   * the pick, so this is a measurement, not a scatter of random points.
+   *
+   * The score of a candidate point uses the real iteration counts from the
+   * same `step` kernel the renderer runs (never the colours, which are a
+   * palette away from the truth):
+   *
+   *   edge  — boundary density: fraction of a one-level-set difference across
+   *           the four neighbours.  A point inside a lobe or inside a flat
+   *           exterior band has edge = 0.
+   *   grad  — iteration gradient, mean |Δn| over the four neighbours: level
+   *           sets per preview pixel.  Flat colour means grad ≈ 0.
+   *   open  — non-flatness, the spread of the neighbour counts divided by the
+   *           centre's count.  A single-colour region scores 0 here.
+   *
+   * score = (log(1+grad)·0.6 + edge·0.4) · (0.35 + min(1, open))
+   *
+   * Interior points (`m2 < 0`, i.e. the kernel's "never escaped") are dropped
+   * before scoring.  The pick is drawn from the top 15 % of the survivors, and
+   * the last few picks are excluded so "another one" really rotates.  The
+   * magnification is derived from the local structure scale, not chosen by the
+   * user; if the render comes back flat the point is rejected and another is
+   * tried, so a blank inset is never shown.
+   * ------------------------------------------------------------------ */
+  const MAIN_W = 4.26666;              // preview width in the complex plane
+  const MAIN_H = MAIN_W * (450 / 720); // and its height, same pixel size
+  const MAIN_C = { re: -0.5, im: 0 };
+  const PREVIEW_MAXITER = 500;
+  state2.branch = null;
+  state2.recent = [];
+  let insetSeq = 0;
+
+  const clampN = (v, a, b) => Math.min(b, Math.max(a, v));
+
+  /** Luminance gradient and spread of a rendered RGBA buffer. */
+  function imageStructure(d, w, h) {
+    let sum = 0, sum2 = 0, gsum = 0, n = 0;
+    const lum = (i) => 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    for (let y = 1; y + 2 < h; y += 2) {
+      for (let x = 1; x + 2 < w; x += 2) {
+        const i = (y * w + x) * 4;
+        const l = lum(i);
+        sum += l; sum2 += l * l; n++;
+        gsum += Math.abs(lum((y * w + x + 2) * 4) - l);
+        gsum += Math.abs(lum(((y + 2) * w + x) * 4) - l);
+      }
+    }
+    const mean = n ? sum / n : 0;
+    const sd = Math.sqrt(Math.max(0, (n ? sum2 / n : 0) - mean * mean));
+    return { sd, edge: n ? gsum / (2 * n) : 0 };
+  }
+
+  /** Score every candidate cell of the preview; return the survivors. */
+  function branchCandidates(k) {
+    const px = MAIN_W / 720;
+    const d = px * 2;
+    const cols = 56, rows = 34;
+    const out = [];
+    for (let gy = 2; gy < rows - 2; gy++) {
+      for (let gx = 2; gx < cols - 2; gx++) {
+        const re = MAIN_C.re + (((gx + 0.5) / cols) - 0.5) * MAIN_W;
+        const im = MAIN_C.im + (0.5 - ((gy + 0.5) / rows)) * MAIN_H;
+        const n0 = k.at(re, im, PREVIEW_MAXITER);
+        if (n0 < 0) continue;                     // interior: not a branch
+        let gsum = 0, minN = n0, maxN = n0, live = 0;
+        for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
+          const n1 = k.at(re + dx, im + dy, PREVIEW_MAXITER);
+          if (n1 < 0) continue;                   // neighbour inside the set
+          live++;
+          gsum += Math.abs(n1 - n0);
+          if (n1 < minN) minN = n1;
+          if (n1 > maxN) maxN = n1;
+        }
+        if (live < 2) continue;                   // hugging the set: no room
+        const grad = gsum / live;
+        const spread = maxN - minN;
+        const edge = spread > 0 ? Math.min(1, spread / (maxN + 1)) : 0;
+        const open = spread / (n0 + 1);
+        /* A point that escapes early is an exterior plateau: at n = 19 the
+         * nearest boundary is ~2^-19 away, so any card small enough to be
+         * interesting lands inside a smooth wash.  Requiring a high escape
+         * count is what puts the pick on the boundary rather than near it. */
+        if (n0 < 40 || grad < 1.0) continue;
+        const score = Math.log1p(n0) * Math.log1p(grad) *
+                      (0.35 + Math.min(1, open));
+        if (score < 0.3) continue;                // flat band / dead region
+        out.push({ re, im, score, grad, edge, open, n: n0 });
+      }
+    }
+    out.sort((a, b) => b.score - a.score);
+    return out;
+  }
+
+  /** Kernels for the scorer; rebuilt per call because params can change. */
+  function branchKernel() {
+    const stp = state2.step;
+    if (!stp) return null;
+    const P = state2.params.map(n2 => state2.vals[n2] ?? 0);
+    const S = {}, OUT = new Float64Array(2);
+    return {
+      P,
+      /* n < 0 marks "inside" (a period was found); n >= limit means no escape
+       * within the budget, which is the same answer for our purposes. */
+      at(re, im, limit) {
+        stp(0, 0, re, im, P, limit, S, OUT);
+        const n = OUT[0];
+        return (OUT[1] < 0 || n >= limit) ? -1 : n;
+      }
+    };
+  }
+
+  /**
+   * Walk down to the boundary at the target scale.
+   *
+   * The overview cannot show a 10^-9 feature: a coarse sample of it can only
+   * tell us "the boundary is somewhere near".  So the pick is not a point but
+   * a descent — at each decade we sample a 9x9 grid one card wide, move to the
+   * cell with the highest escape count, and zoom another decade.  The escape
+   * count is a monotone proxy for "closer to the set", so this converges onto
+   * the boundary instead of guessing at it.  81 kernel calls per decade is
+   * cheap enough to run on every open.
+   */
+  function descendToBoundary(re, im, targetMag, k) {
+    const limit = Math.min(6000, 400 + Math.round(targetMag * 90));
+    let x = re, y = im;
+    for (let mag = 1.5; mag <= targetMag + 0.001; mag += 1) {
+      const span = MAIN_W / Math.pow(10, mag);
+      const d = span / 8;                       // 9x9 grid, one card wide
+      let bx = x, by = y, bn = -1;
+      for (let j = -4; j <= 4; j++) {
+        for (let i = -4; i <= 4; i++) {
+          const n = k.at(x + i * d, y + j * d, limit);
+          /* A cell that never escapes is *inside*; the boundary we want hugs
+           * it from the outside, so interior cells are skipped, not chosen. */
+          if (n > bn) { bn = n; bx = x + i * d; by = y + j * d; }
+        }
+      }
+      if (bn < 0) break;
+      x = bx; y = by;
+    }
+    return { re: x, im: y };
+  }
+
+  /** Pick one branch from the best-scoring candidates, avoiding recent ones. */
+  function pickBranch() {
+    const k = branchKernel();
+    if (!k) return null;
+    const cands = branchCandidates(k);
+    if (!cands.length) return null;
+    const top = cands.slice(0, Math.max(1, Math.round(cands.length * 0.3)));
+    const fresh = top.filter(c =>
+      !state2.recent.some(r => Math.hypot(r.re - c.re, r.im - c.im) < 0.25));
+    const pool = fresh.length ? fresh : top;
+    const c = pool[(Math.random() * pool.length) | 0];
+    /* Magnification follows the escape count.  A point that escapes at n has
+     * its nearest boundary about 2^-n away, so the card must be much smaller
+     * than that to stand inside the structure: log10(2^n) = 0.301·n, plus a
+     * margin.  The margin is the whole trick — at exactly 2^-n the card is a
+     * quarter of the boundary, at one decade less it is a portrait of it. */
+    const magLog = clampN(0.301 * c.n + 1.5, 4, 10);
+    const p = descendToBoundary(c.re, c.im, magLog, k);
+    state2.branch = { re: p.re, im: p.im, magLog, seed: { re: c.re, im: c.im },
+                      n: c.n, grad: c.grad, edge: c.edge, open: c.open, score: c.score };
+    state2.recent.push({ re: p.re, im: p.im });
+    if (state2.recent.length > 4) state2.recent.shift();
+    return state2.branch;
+  }
+
+  function insetSpan() {
+    let w = MAIN_W / Math.pow(10, state2.branch.magLog);
+    let e = Math.floor(Math.log2(w));
+    let m = w / Math.pow(2, e);
+    while (m >= 2) { m /= 2; e++; }
+    while (m < 1) { m *= 2; e--; }
+    return { m, e, w };
+  }
+
+  /** Extend a double coordinate with zeros to the digits the depth needs. */
+  function padCoord(v, digits) {
+    let s = String(v);
+    const dot = s.indexOf('.');
+    if (dot < 0 && digits > 0) s += '.';
+    const have = dot < 0 ? 0 : s.length - dot - 1;
+    if (digits > have) s += '0'.repeat(digits - have);
+    return s;
+  }
+
+  function drawMarker() {
+    const mk = $('fx-marker'), cv = $('formula-preview');
+    if (!mk || !cv || !state2.branch) { if (mk) mk.hidden = true; return; }
+    const stage = $('fx-stage').getBoundingClientRect();
+    const r = cv.getBoundingClientRect();
+    const px = (state2.branch.re - MAIN_C.re) / MAIN_W + 0.5;
+    const py = 0.5 - (state2.branch.im - MAIN_C.im) / MAIN_H;
+    mk.hidden = false;
+    mk.style.left = (r.left - stage.left + px * r.width) + 'px';
+    mk.style.top = (r.top - stage.top + py * r.height) + 'px';
+  }
+
+  function branchInfo(b, ms, st) {
+    const el = $('fx-branch-info');
+    if (!el) return;
+    if (!b) { el.textContent = t('pickCriteria'); return; }
+    const y = b.im < 0 ? '-' : '+';
+    el.textContent = `10^${b.magLog.toFixed(1)} · n=${b.n} ∇=${b.grad.toFixed(0)}` +
+                     ` · ${b.re.toFixed(4)}${y}${Math.abs(b.im).toFixed(4)}i` +
+                     (st ? ` · σ${st.sd.toFixed(0)} Δ${st.edge.toFixed(0)}` : '') +
+                     (ms != null ? ` · ${ms}ms` : '');
+  }
+
+  /** Render the picked branch; a flat answer is rejected and re-picked. */
+  function renderInset(src, vals, tries = 3) {
+    const cv = $('formula-inset');
+    const box = $('fx-inset-box');
+    const cap = $('fx-inset-cap');
+    if (!cv || !box) return;
+    if (!state2.branch && !pickBranch()) { box.hidden = true; return; }
+    const b = state2.branch;
+    drawMarker();
+    const W = cv.width, H = cv.height;
+    const sp = insetSpan();
+    const ps = sp.w / W;
+    const digits = Math.ceil(b.magLog) + 22;
+    const id = 'fi' + (++insetSeq);
+    const t0 = performance.now();
+    box.hidden = false;
+    if (cap) cap.textContent = '10^' + b.magLog.toFixed(1);
+    dispatch({
+      payload: {
+        id, viewId: 'formula-inset',
+        x: 0, y: 0, w: W, h: H, width: W, height: H,
+        spec: {
+          mode: 'x', kind: 'mandelbrot', power: 2,
+          customExpr: src, customParams: { ...(vals || state2.vals) },
+          julia: { ...state.spec.julia }
+        },
+        center: { re: padCoord(b.re, digits), im: padCoord(b.im, digits) },
+        span: { m: sp.m, e: sp.e },
+        pixelSize: ps,
+        maxIter: Math.min(6000, 400 + Math.round(b.magLog * 90)),
+        bits: 'auto',
+        palette: state.palette, cycle: state.cycle, offset: state.offset, samples: 1
+      },
+      thumb: true,
+      onDone: (msg) => {
+        if (msg.viewId !== 'formula-inset' || msg.id !== id) return;
+        const c2 = $('formula-inset');
+        if (!c2) return;
+        const pxIn = (msg.data instanceof ArrayBuffer)
+          ? new Uint8ClampedArray(msg.data) : msg.data;
+        const st = imageStructure(pxIn, msg.w, msg.h);
+        /* A blank card is not an answer.  Retry with another branch while the
+         * pick still looks structureless — a deep environment that failed to
+         * build shows up here as sd = 0 and is never shown as a result.  Every
+         * other retry also steps one decade shallower: a card that is flat at
+         * 10^8 is usually an exterior plateau, and the boundary it belongs to
+         * is visible a decade out. */
+        if (st.sd < 8 && st.edge < 2.0 && tries > 0) {
+          const prev = state2.branch.magLog;
+          if (pickBranch()) {
+            if (tries % 2 === 0) state2.branch.magLog = Math.max(4, prev - 1.2);
+            renderInset(src, vals, tries - 1);
+            return;
+          }
+        }
+        c2.getContext('2d').putImageData(
+          new ImageData(new Uint8ClampedArray(pxIn), msg.w, msg.h), 0, 0);
+        if (cap) {
+          cap.textContent = '10^' + b.magLog.toFixed(1) + ' · ' +
+                            Math.round(performance.now() - t0) + ' ms';
+        }
+        branchInfo(b, Math.round(performance.now() - t0), st);
+      }
+    });
+  }
+
+  const nextBtn = $('fx-branch-next');
+  if (nextBtn) nextBtn.onclick = () => { pickBranch(); renderInset(state2.expr, state2.vals); };
 
   validate();
 }
@@ -1099,7 +4763,9 @@ function renderFormulaPreview(src, vals) {
   const cv = $('formula-preview');
   if (!cv) return;
   const W = cv.width, H = cv.height;
-  const span = { m: 1.6, e: 1 };
+  /* 4/3 of the old span draws the set at three quarters of its previous size,
+   * which leaves room around it for the outline to actually be legible. */
+  const span = { m: 2.1333, e: 1 };
   const ps = (span.m * Math.pow(2, span.e)) / W;
   const payload = {
     id: 'fp', viewId: 'formula',
@@ -1124,113 +4790,29 @@ function renderFormulaPreview(src, vals) {
   });
 }
 
-/* ---------------- 自定义预设 ---------------- */
-function loadCustom() {
-  try { return JSON.parse(localStorage.getItem('mb.custom') || '[]'); } catch { return []; }
-}
-function saveCustom(list) { localStorage.setItem('mb.custom', JSON.stringify(list)); }
 function loadFormulas() {
   try { return JSON.parse(localStorage.getItem('mb.formulas') || '[]'); } catch { return []; }
 }
 function saveFormulas(list) { localStorage.setItem('mb.formulas', JSON.stringify(list)); }
 
-function openCustom() {
-  const list = loadCustom();
-  const body = `
-    <div class="save-row">
-      <input class="ctl" id="cp-name" placeholder="${t('namePlaceholder')}" />
-      <button class="btn primary" id="cp-save">${t('saveCurrent')}</button>
-      <button class="btn" id="cp-export">${t('exportJson')}</button>
-      <button class="btn" id="cp-import">${t('importJson')}</button>
-      <input type="file" id="cp-file" accept="application/json" hidden />
-    </div>
-    <div class="saved-list" id="cp-list"></div>`;
-  openModal('custom', t('customTitle'), t('customSub'), body, '', 'mid');
-
-  const renderList = () => {
-    const l = loadCustom();
-    const box = $('cp-list');
-    if (!l.length) { box.innerHTML = `<div style="color:var(--text-3);font-size:12px">${t('empty')}</div>`; return; }
-    box.innerHTML = l.map((it, i) => `
-      <div class="saved-item">
-        <div class="info">
-          <div class="nm">${it.name}</div>
-          <div class="sub">${it.state.spec.mode.toUpperCase()} · ${it.state.palette} · ${it.state.center.re}, ${it.state.center.im}</div>
-        </div>
-        <button class="btn" data-apply="${i}">${t('applyPreset')}</button>
-        <button class="btn ghost" data-del="${i}">${t('delete')}</button>
-      </div>`).join('');
-    box.querySelectorAll('[data-apply]').forEach(b => {
-      b.onclick = () => {
-        const it = loadCustom()[+b.dataset.apply];
-        if (!it) return;
-        Object.assign(state, JSON.parse(JSON.stringify(it.state)));
-        $('chk-autoiter').checked = state.autoIter;
-        $('sel-palette').value = state.palette;
-        syncModeUi(); syncPaletteStrip(); syncIterUi(); renderNow(); closeModal();
-      };
-    });
-    box.querySelectorAll('[data-del]').forEach(b => {
-      b.onclick = () => {
-        const l2 = loadCustom();
-        l2.splice(+b.dataset.del, 1);
-        saveCustom(l2); renderList();
-      };
-    });
-  };
-
-  $('cp-save').onclick = () => {
-    const name = $('cp-name').value.trim() || `${t('custom')} ${new Date().toLocaleTimeString()}`;
-    const l = loadCustom();
-    l.unshift({ name, at: Date.now(), state: JSON.parse(JSON.stringify({
-      spec: state.spec, center: state.center, span: state.span,
-      maxIter: state.maxIter, autoIter: state.autoIter, bits: state.bits,
-      palette: state.palette, cycle: state.cycle, offset: state.offset
-    })) });
-    saveCustom(l); $('cp-name').value = ''; renderList(); toast(t('saved'));
-  };
-  $('cp-export').onclick = () => {
-    const blob = new Blob([JSON.stringify(loadCustom(), null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'mandelbrot-presets.json';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  };
-  $('cp-import').onclick = () => $('cp-file').click();
-  $('cp-file').onchange = (e) => {
-    const f = e.target.files[0];
-    if (!f) return;
-    const r = new FileReader();
-    r.onload = () => {
-      try {
-        const arr = JSON.parse(r.result);
-        if (!Array.isArray(arr)) throw new Error('bad');
-        saveCustom([...arr, ...loadCustom()]);
-        renderList(); toast(t('saved'));
-      } catch { toast(t('loadFail')); }
-    };
-    r.readAsText(f);
-  };
-
-  renderList();
-}
-
-/* ---------------- 关于 ---------------- */
+/* ---------------- About ---------------- */
 function openAbout() {
   const body = `
     <div class="about-body">${t('aboutBody')}</div>
     <div class="about-stats">
-      <div><b>512</b><span>${t('statPresets')}</span></div>
+      <div><b>${LIB.count}</b><span>${t('statPresets')}</span></div>
       <div><b>7</b><span>${t('statSets')}</span></div>
       <div><b>10⁻³⁰⁰</b><span>${t('statDepth')}</span></div>
       <div><b>${wasmEnabled ? 'WASM' : 'JS'}</b><span>${t('engine')}</span></div>
     </div>
     <div style="margin-top:18px;font-size:11px;letter-spacing:.14em;color:var(--text-3);text-transform:uppercase">${t('shortcuts')}</div>
     <div class="shortcut-grid">
-      <kbd>${t('scPan')}</kbd><span>${t('scPan')}</span>
+      <kbd>Drag</kbd><span>${t('scPan')}</span>
       <kbd>Wheel</kbd><span>${t('scZoom')}</span>
       <kbd>2×</kbd><span>${t('scDbl')}</span>
+      <kbd>↑ ↓ ← →</kbd><span>${t('scKeysPan')}</span>
+      <kbd>Z / X</kbd><span>${t('scKeysZoom')}</span>
+      <kbd>A · C</kbd><span>${t('scKeysAa')}</span>
       <kbd>R</kbd><span>${t('scReset')}</span>
       <kbd>P</kbd><span>${t('scPanel')}</span>
       <kbd>F</kbd><span>${t('scFull')}</span>
@@ -1243,7 +4825,7 @@ function openAbout() {
 }
 
 
-/* ---------------- LaTeX 简易排版 ---------------- */
+/* ---------------- Minimal LaTeX typesetting ---------------- */
 const LATEX_SYMBOL = {
   pi: 'π', tau: 'τ', phi: 'φ', infty: '∞', cdot: '·', times: '×',
   ln: 'ln', sin: 'sin', cos: 'cos', tan: 'tan', sinh: 'sinh', cosh: 'cosh',
@@ -1362,7 +4944,7 @@ function latexToHtml(tex) {
   try { return seq() || '&nbsp;'; } catch { return '&nbsp;'; }
 }
 
-/* ---------------- 提示 ---------------- */
+/* ---------------- Toasts ---------------- */
 let toastTimer = 0;
 function toast(msg) {
   const el = $('toast');
@@ -1372,9 +4954,9 @@ function toast(msg) {
   toastTimer = setTimeout(() => { el.hidden = true; }, 1800);
 }
 
-/* ---------------- 顶栏/面板事件 ---------------- */
+/* ---------------- Top bar / panel events ---------------- */
 function bindUi() {
-  // 集菜单
+  // Set menu
   const setsBtn = $('btn-sets'), setsMenu = $('menu-sets');
   setsBtn.onclick = (e) => {
     e.stopPropagation();
@@ -1394,23 +4976,41 @@ function bindUi() {
     setBtn.classList.toggle('open', !setMenu.hidden);
   };
 
-  // 面板内部的点击不关闭下拉
+  // Clicks inside a menu must not close the dropdown
   ['menu-sets', 'menu-settings'].forEach(id => {
     $(id).addEventListener('click', (e) => e.stopPropagation());
   });
   document.addEventListener('click', () => { closeMenus(); });
 
   $('btn-presets').onclick = openPresets;
-  $('btn-formula').onclick = openFormula;
-  $('btn-custom').onclick = openCustom;
-  $('btn-about').onclick = () => { closeMenus(); openAbout(); };
-  $('btn-fullscreen').onclick = () => {
-    closeMenus();
-    if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
-    else document.exitFullscreen?.();
-  };
+  /* Same editor as the side-panel entry — one code path, one state. */
+  const topFormula = $('btn-formula-top');
+  if (topFormula) topFormula.onclick = () => openFormula();
+  /* Import and export live in the presets panel now: a preset file is a
+   * preset, and the keyboard shortcuts still reach the same two functions. */
 
-  // 语言 / 主题
+  /* The badge is the embedded library's live count (built-ins plus "mine"),
+   * never a number baked into the page. */
+  onLibrary((lib) => {
+    /* One line of proof that the names survived the trip: they are UTF-8 in the
+     * file, UTF-16 across the WebView boundary, and JSON on arrival. */
+    const f0 = lib.items && lib.items[0];
+    nativeLog(`[ui] preset lib ${lib.count} dir=${lib.dir || '-'} ` +
+              `first=${f0 ? (f0.nz || f0.n) + ' / ' + f0.n : '-'}`);
+    const badge = document.querySelector('#btn-presets .badge');
+    if (badge) {
+      const n = lib.count || 0;
+      badge.textContent = n ? String(n) : '';
+      badge.hidden = !n;
+    }
+    /* A panel that is already open gets rebuilt so a save or a delete shows up
+     * without being asked for. */
+    if (modalKind === 'presets') openPresets();
+  });
+  $('btn-about').onclick = () => { closeMenus(); openAbout(); };
+  $('btn-fullscreen').onclick = toggleFullscreen;
+
+  // Language / theme
   $('seg-lang').querySelectorAll('button').forEach(b => {
     b.onclick = () => {
       state.lang = b.dataset.lang;
@@ -1427,33 +5027,43 @@ function bindUi() {
     };
   });
 
-  $('chk-hd').onchange = (e) => { state.hd = e.target.checked; resizeCanvas(); };
+  $('sel-scale').onchange = (e) => {
+    state.renderScale = Math.max(1, Math.min(2, +e.target.value || 2));
+    try { localStorage.setItem('mb.scale', String(state.renderScale)); } catch { /* private mode */ }
+    resizeCanvas();
+  };
 
-  // 分段控件
+  /* View angle.  The kernel rotates the plane under the screen, so this is a
+   * rigid turn of the picture, not a change of the centre.  Dragging still
+   * follows the mouse because planeDelta() applies the same angle to the pan. */
+  const rotRange = $('rng-rot'), rotNum = $('in-rot');
+  if (rotRange) {
+    rotRange.oninput = (e) => { setRotationDeg(+e.target.value, false); scheduleRender(120); };
+    rotRange.onchange = () => renderNow();
+  }
+  if (rotNum) rotNum.onchange = (e) => setRotationDeg(+e.target.value, true);
+  const rotZero = $('btn-rot-zero'), rotQuarter = $('btn-rot-quarter');
+  if (rotZero) rotZero.onclick = () => setRotationDeg(0, true);
+  if (rotQuarter) rotQuarter.onclick = () => {
+    let d = Math.round((state.rotation || 0) * 180 / Math.PI) + 90;
+    if (d > 180) d -= 360;
+    setRotationDeg(d, true);
+  };
+  syncRotationUi();
+
+  // Segmented control
   $('seg-mode').querySelectorAll('button').forEach(b => {
     b.onclick = () => applyMode(b.dataset.mode);
   });
 
-  $('sel-kind').onchange = (e) => {
-    state.spec.kind = e.target.value;
-    syncModeUi();
-    renderNow();
+  const selFamily = $('sel-family'), numPower = $('num-power');
+  if (selFamily) selFamily.onchange = () => {
+    setFamily(selFamily.value, selFamily.value === 'multibrot'
+      ? (+($('num-power').value) || 3) : 2);
   };
-  $('rng-power').oninput = (e) => {
-    state.spec.power = +e.target.value;
-    $('val-power').textContent = state.spec.power;
-  };
-  $('rng-power').onchange = () => renderNow();
-  $('rng-degree').oninput = (e) => {
-    state.spec.newtonDegree = +e.target.value;
-    $('val-degree').textContent = state.spec.newtonDegree;
-  };
-  $('rng-degree').onchange = () => renderNow();
-  $('rng-phoenix').oninput = (e) => {
-    state.spec.phoenixP = +e.target.value;
-    $('val-phoenix').textContent = state.spec.phoenixP.toFixed(2);
-  };
-  $('rng-phoenix').onchange = () => renderNow();
+  if (numPower) numPower.onchange = () => setFamily('multibrot', +numPower.value);
+  const btnFormula = $('btn-formula-editor');
+  if (btnFormula) btnFormula.onclick = () => openFormula();
 
   $('in-jr').oninput = (e) => { state.spec.julia.re = e.target.value.trim() || '0'; };
   $('in-ji').oninput = (e) => { state.spec.julia.im = e.target.value.trim() || '0'; };
@@ -1474,6 +5084,7 @@ function bindUi() {
   $('rng-iter').onchange = () => renderNow();
   $('in-iter').onchange = (e) => {
     state.autoIter = false;
+    state.presetId = null;          // manual budget wins over the preset floor
     $('chk-autoiter').checked = false;
     state.maxIter = clamp(+e.target.value || 600, 100, 200000);
     $('rng-iter').value = state.maxIter;
@@ -1482,23 +5093,121 @@ function bindUi() {
 
   $('sel-bits').onchange = (e) => { state.bits = e.target.value; renderNow(); };
   $('sel-palette').onchange = (e) => {
-    state.palette = e.target.value;
-    syncPaletteStrip();
+    const id = e.target.value;
+    state.stops = null;            // a different recipe means its own colours
+    if (String(id).startsWith('glsl:')) {
+      installScheme(id);           // official codegl + its own param sliders
+    } else {
+      state.palette = id;
+      installScheme(null);
+      gradSel = 0;
+      syncPaletteStrip();
+    }
+    syncSchemeParams();
+    syncColorUi();               // dim the band-only rows when a scheme is on
     renderNow();
   };
-  $('rng-cycle').oninput = (e) => {
-    state.cycleAuto = false;
-    state.cycle = +e.target.value;
-    $('val-cycle').textContent = state.cycle;
+  $('sel-scheme').onchange = (e) => { state.scheme = e.target.value; renderNow(); };
+  const selShade = $('sel-shade');
+  if (selShade) selShade.onchange = (e) => { state.shade = parseInt(e.target.value, 10) || 0; renderNow(); };
+  /* A trap changes the *field* (the kernel has to accumulate it), so this is a
+   * full re-render, not a re-shade. */
+  const selTrap = $('sel-trap');
+  if (selTrap) {
+    selTrap.value = String(state.traps | 0);
+    selTrap.onchange = (e) => {
+      state.traps = Math.max(0, Math.min(4, parseInt(e.target.value, 10) || 0));
+      syncTrapUi();
+      renderNow();          // a trap changes the field, so this one is a render
+    };
+  }
+  for (const [id, vid, key] of [['rng-trapgain', 'val-trapgain', 'trapGain'],
+                                ['rng-traprings', 'val-traprings', 'trapRings']]) {
+    const el = $(id);
+    if (!el) continue;
+    el.oninput = (e) => {
+      state[key] = +e.target.value;
+      $(vid).textContent = (+e.target.value).toFixed(2);
+      /* Shader-only change: repaint, never re-iterate. */
+      if (!reshadeOnly()) scheduleRender(140);
+    };
+  }
+  const paletteEdit = $('btn-palette-edit');
+  if (paletteEdit) {
+    paletteEdit.title = t('paletteTitle');
+    paletteEdit.onclick = () => openPaletteEditor();
+  }
+  const rank = $('rng-iterrank');
+  const rankNum = $('in-iterrank');
+  const applyRank = (v) => {
+    state.autoRank = clamp(Math.round(v) || 100, 1, 100);
+    if (rank) rank.value = String(state.autoRank);
+    if (rankNum && document.activeElement !== rankNum) rankNum.value = String(state.autoRank);
+    scheduleRender(120);
   };
-  $('rng-cycle').onchange = () => renderNow();
-  $('rng-offset').oninput = (e) => {
+  if (rank) {
+    rank.oninput = (e) => applyRank(+e.target.value);
+    rank.onchange = () => renderNow();
+  }
+  if (rankNum) {
+    rankNum.onchange = (e) => applyRank(+e.target.value);
+  }
+  if (rank) rank.value = String(state.autoRank);
+  if (rankNum) rankNum.value = String(state.autoRank);
+  bindGradientEditor();
+
+  /* The band-density / detail / cycle-span sliders are gone.  The reference
+   * has none of them: spacing comes from each scheme's own frequency, detail
+   * from SAMPLES in the shader, and a frame-fitted cycle re-phases the whole
+   * picture on every zoom.  Official params.param[] sliders (generated by
+   * syncSchemeParams) are the only colour controls beyond the tone stage. */
+  const offsetEl = $('rng-offset');
+  offsetEl.oninput = (e) => {
     state.offset = +e.target.value;
     $('val-offset').textContent = state.offset.toFixed(2);
   };
-  $('rng-offset').onchange = () => renderNow();
+  offsetEl.onchange = () => renderNow();
+
+  /* Tone stage: every slider writes state.tone and repaints after a short
+   * quiet period, so dragging shows the effect continuously. */
+  const toneMap = [
+    ['rng-bri', 'val-bri', 'bri'],
+    ['rng-gr', 'val-gr', 'gr'], ['rng-gg', 'val-gg', 'gg'], ['rng-gb', 'val-gb', 'gb']
+  ];
+  for (const [id, vid, key] of toneMap) {
+    const el = $(id);
+    if (!el) continue;
+    el.oninput = (e) => {
+      state.tone[key] = +e.target.value;
+      $(vid).textContent = (+e.target.value).toFixed(2);
+    };
+    el.onchange = () => renderNow();
+  }
+  const toneReset = $('btn-tone-reset');
+  if (toneReset) {
+    toneReset.onclick = () => {
+      state.tone = { bri: 1, gr: 1, gg: 1, gb: 1 };
+      for (const [id, vid, key] of toneMap) {
+        if ($(id)) $(id).value = state.tone[key];
+        if ($(vid)) $(vid).textContent = state.tone[key].toFixed(2);
+      }
+      renderNow();
+    };
+  }
 
   $('btn-reset').onclick = () => applyMode(state.spec.mode);
+
+  /* Supersampling selector, applied to the final pass only:
+   *   1 = off (the reference's default)
+   *   2 = "High res": 2x2 = 4 values per pixel, then downsampled — exactly the
+   *       option winapp.html documents
+   *   3 = 3x3 = 9 values (our sharper default; kept so the port never regresses) */
+  const selAA = $('sel-aa');
+  if (selAA) {
+    selAA.value = String(state.aa);
+    selAA.onchange = () => setAA(+selAA.value);
+  }
+
   $('btn-fit').onclick = () => {
     state.span = state.spec.mode === 'j' ? { m: 1.6, e: 1 } : { m: 1.6, e: 1 };
     state.center = state.spec.mode === 'm' ? { re: '-0.6', im: '0' } : { re: '0', im: '0' };
@@ -1512,7 +5221,7 @@ function bindUi() {
   };
   $('btn-png').onclick = () => exportPng();
 
-  // 面板拖动（仅桌面；移动端由底部抽屉接管）
+  // Panel dragging (desktop only; on mobile the bottom drawer takes over)
   const panel = $('panel');
   const head = $('panel-drag');
   let pd = null;
@@ -1531,15 +5240,15 @@ function bindUi() {
   });
   head.addEventListener('pointerup', () => { pd = null; });
 
-  // 最小化 → 收进顶栏的控制台按钮
+  // Minimise -> fold into the top-bar console button
   $('btn-panel-collapse').onclick = () => setPanelOpen(false);
   $('btn-console').onclick = () => togglePanel();
-  $('btn-panel-reset').onclick = () => {
-    panel.style.left = '';
-    panel.style.right = '';
-    panel.style.top = '';
-  };
-  $('btn-core').onclick = () => {
+  // The desktop build ships a self-contained native core (see its src folder);
+  // the "download core" entry only makes sense for the web page.
+  if (NATIVE) {
+    const coreBtn = $('btn-core');
+    if (coreBtn) coreBtn.remove();
+  } else $('btn-core').onclick = () => {
     closeMenus();
     openCorePanel({
       t,
@@ -1554,14 +5263,97 @@ function bindUi() {
     });
   };
 
-  // 键盘
+  // Keyboard
   window.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-    if (e.key === 'Escape') { closeModal(); closeMenus(); return; }
-    if (e.key === 'r' || e.key === 'R') applyMode(state.spec.mode);
-    if (e.key === 'p' || e.key === 'P') togglePanel();
-    if (e.key === 'f' || e.key === 'F') document.documentElement.requestFullscreen?.();
-    if (e.key === 's' || e.key === 'S') exportPng();
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+    if (e.key === 'Escape') {
+      const modalOpen = !$('modal-root').hidden;
+      const menuOpen = !$('menu-sets').hidden || !$('menu-settings').hidden;
+      closeModal(); closeMenus();
+      /* Esc is also the way out of a deep pass that will take minutes; the
+       * HUD advertises it while `slowDeep` is shown. */
+      if (!modalOpen && !menuOpen && passTick) {
+        cancelAll();
+        stopPassClock();
+        updateHud(true);
+      }
+      return;
+    }
+    const k = e.key;
+    /* --- keyboard navigation: arrows pan by 1/8 view, z/x (or PgUp/PgDn) zoom --- */
+    const step = Math.max(8, Math.round(Math.min(canvas.width, canvas.height) / 8));
+    /* Preset files: the reference program's own JSON.  Ctrl+O / Ctrl+S are the
+     * pair every editor uses, and they have to be handled before the plain-key
+     * block below swallows the modifier. */
+    if ((e.ctrlKey || e.metaKey) && (k === 'o' || k === 'O')) {
+      e.preventDefault(); importPresetFile(); return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (k === 's' || k === 'S')) {
+      e.preventDefault(); exportPresetFile(); return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (k === 'ArrowLeft') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, -step, 0); return; }
+    if (k === 'ArrowRight') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, step, 0); return; }
+    if (k === 'ArrowUp') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, 0, -step); return; }
+    if (k === 'ArrowDown') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, 0, step); return; }
+    if (k === 'z' || k === 'Z' || k === 'PageUp') { e.preventDefault(); zoomAt(canvas.width / 2, canvas.height / 2, 0.5, true); return; }
+    if (k === 'x' || k === 'X' || k === 'PageDown') { e.preventDefault(); zoomAt(canvas.width / 2, canvas.height / 2, 2, true); return; }
+    if (k === 'Home' || k === '0') { e.preventDefault(); applyMode(state.spec.mode); return; }
+    /* --- the reference program's numeric keypad (winapp.html) --------------
+     * 2/4/6/8 pan, 1/3 zoom out/in, 7/9 rotate, 5 stop.  Numpad keys report the
+     * same `e.key` as the top row, so both work.  Only "0" was already taken
+     * (home view), so nothing above is overridden. */
+    if (k === '2') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, 0, step); return; }
+    if (k === '8') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, 0, -step); return; }
+    if (k === '4') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, -step, 0); return; }
+    if (k === '6') { e.preventDefault(); commitPan({ re: state.center.re, im: state.center.im }, step, 0); return; }
+    if (k === '3') { e.preventDefault(); zoomAt(canvas.width / 2, canvas.height / 2, 0.5, true); return; }
+    if (k === '1') { e.preventDefault(); zoomAt(canvas.width / 2, canvas.height / 2, 2, true); return; }
+    if (k === '7') { e.preventDefault(); setRotationDeg((state.rotation || 0) * 180 / Math.PI - 15, true); return; }
+    if (k === '9') { e.preventDefault(); setRotationDeg((state.rotation || 0) * 180 / Math.PI + 15, true); return; }
+    if (k === '5') {
+      e.preventDefault();
+      cancelAll(); stopPassClock(); updateHud(true);
+      return;
+    }
+    /* F1 opens the Julia set of the current centre; pressed again it goes back.
+     * The reference's F1 shows/hides a second *window*; we have that preview
+     * dock permanently, so the key is mapped to the full view instead. */
+    if (k === 'F1') {
+      e.preventDefault();
+      if (state.spec.mode === 'j') backFromJulia();
+      else openJuliaSet({ re: state.center.re, im: state.center.im });
+      return;
+    }
+    /* F3–F7: the reference's shading-mode keys.  Our kernel has four band
+     * density policies (0..3), so F7 repeats the densest one. */
+    if (k === 'F3' || k === 'F4' || k === 'F5' || k === 'F6' || k === 'F7') {
+      e.preventDefault();
+      state.shade = clamp(+k.slice(1) - 3, 0, 3);
+      const sel = $('sel-shade');
+      if (sel) sel.value = String(state.shade);
+      renderNow();
+      return;
+    }
+    /* T: trajectory trace is not ported yet (linewidth/pointsize/ntrace are read
+     * from mandelbrot.json but unused).  Say so instead of binding a key to
+     * something that looks similar but is not. */
+    if (k === 't' || k === 'T') {
+      toast(getLang() === 'en' ? 'Trace mode is not ported yet' : '轨迹模式尚未移植');
+      return;
+    }
+    if (k === 'c' || k === 'C') {
+      const ids = PALETTE_LIST.map(p => p.id);
+      const i = (ids.indexOf(state.palette) + 1) % ids.length;
+      state.palette = ids[i];
+      $('sel-palette').value = state.schemeId || state.palette;
+      syncPaletteStrip(); renderNow(); return;
+    }
+    if (k === 'a' || k === 'A') { setAA(state.aa === 1 ? 2 : state.aa === 2 ? 3 : 1); return; }
+    if (k === 'r' || k === 'R') applyMode(state.spec.mode);
+    if (k === 'p' || k === 'P') togglePanel();
+    if (k === 'f' || k === 'F' || k === 'F11') toggleFullscreen();
+    if (k === 's' || k === 'S') exportPng();
     if (e.key === '+' || e.key === '=') {
       state.autoIter = false; $('chk-autoiter').checked = false;
       state.maxIter = clamp(state.maxIter * 1.5 | 0, 100, 200000);
@@ -1586,7 +5378,7 @@ function closeMenus(except) {
   if (except === $('menu-sets')) $('btn-sets').classList.add('open');
 }
 
-/* ---------------- 控制台开合 ---------------- */
+/* ---------------- Console open / close ---------------- */
 /**
  * Single source of truth for console visibility.  The panel, the top-bar
  * toggle (which also serves as the "minimized" target) and the keyboard
@@ -1610,7 +5402,27 @@ function togglePanel() {
   setPanelOpen(document.body.classList.contains('panel-closed'));
 }
 
+/* Fullscreen.  WebView2 does not implement the DOM Fullscreen API, so inside
+ * the desktop shell the request goes to the host, which drops the window frame
+ * and covers the monitor.  In a browser the standard API is used instead. */
+const shellBridge = (typeof window !== 'undefined' && window.chrome && window.chrome.webview) || null;
+function toggleFullscreen() {
+  closeMenus();
+  if (shellBridge && shellBridge.postMessage) {
+    try { shellBridge.postMessage(JSON.stringify({ type: 'cmd', cmd: 'fullscreen' })); } catch { /* shell gone */ }
+    return;
+  }
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
+  else document.exitFullscreen?.();
+}
+
 function exportPng() {
+  if (nativeCanvasMode()) {
+    // Pixels never come back to JS in route 1; the shell keeps the last final
+    // pass and writes a PNG through the system Save As dialog.
+    nativeCanvasExport();
+    return;
+  }
   canvas.toBlob((blob) => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1620,11 +5432,28 @@ function exportPng() {
   }, 'image/png');
 }
 
-/* ---------------- 状态序列化 ---------------- */
+/* ---------------- State serialisation ---------------- */
 function encodeState() {
   const payload = {
     s: state.spec, c: state.center, sp: state.span, i: state.maxIter,
-    a: state.autoIter, b: state.bits, p: state.palette, cy: state.cycle, o: state.offset
+    a: state.autoIter, b: state.bits, p: state.palette, cy: state.cycle, o: state.offset,
+    /* r = view angle in radians, so a shared link keeps the rotation too. */
+    r: state.rotation,
+    sh: state.scheme,
+    /* Colour set: band density, period, tone stage and the edited ramp.  A
+     * link that dropped these would open with somebody else's colours. */
+    bd: state.bands, ca: state.cycleAuto,
+    /* Only the four live tone keys travel.  An older link that still carries
+     * con/gam/sat/hue is read as if those keys were absent (see decodeState). */
+    tn: { bri: state.tone.bri, gr: state.tone.gr,
+          gg: state.tone.gg, gb: state.tone.gb },
+    st: state.stops,
+    /* An official GLSL recipe: the library id is enough for embedded schemes
+     * (the source can be looked up), while an imported one has to carry its
+     * own codegl.  Either way the slider values travel with it. */
+    si: state.schemeId, sm: state.schemeMeta, spm: state.schemeParams,
+    sc: state.schemeColors, sb: state.schemeBri,
+    gl: state.schemeId ? null : state.glsl
   };
   return 'st=' + btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
 }
@@ -1636,13 +5465,50 @@ function decodeState() {
     const o = JSON.parse(decodeURIComponent(escape(atob(h.slice(3)))));
     Object.assign(state, {
       spec: o.s, center: o.c, span: o.sp, maxIter: o.i,
-      autoIter: o.a, bits: o.b, palette: o.p, cycle: o.cy, offset: o.o
+      autoIter: o.a, bits: o.b, palette: o.p, cycle: o.cy, offset: o.o,
+      rotation: Number.isFinite(+o.r) ? +o.r : 0,
+      scheme: o.sh === 'bands' ? 'bands' : 'distance',
+      bands: o.bd != null ? o.bd : state.bands,
+      cycleAuto: o.ca !== false,
+      /* Only the four live keys are read.  A link saved before the console lost
+       * contrast/gamma/saturation/hue still carries those keys; they are
+       * dropped here, so the state never grows fields no control owns. */
+      tone: {
+        bri: Number.isFinite(+(o.tn && o.tn.bri)) ? +o.tn.bri : 1,
+        gr: Number.isFinite(+(o.tn && o.tn.gr)) ? +o.tn.gr : 1,
+        gg: Number.isFinite(+(o.tn && o.tn.gg)) ? +o.tn.gg : 1,
+        gb: Number.isFinite(+(o.tn && o.tn.gb)) ? +o.tn.gb : 1
+      },
+      stops: Array.isArray(o.st) && o.st.length >= 2 ? o.st : null,
+      schemeMeta: o.sm || null,
+      schemeParams: Array.isArray(o.spm) ? o.spm : [],
+      schemeColors: Array.isArray(o.sc) ? o.sc : [],
+      schemeBri: o.sb || { finite: 1, infinite: 1, factor: 1 },
+      glsl: o.gl || null
     });
+    if (o.si) {
+      const s = findSchemeAny(o.si);
+      if (s) {
+        state.schemeId = s.id;
+        state.glsl = s.glsl;
+        state.schemeMeta = { nparam: s.nparam, paramLabels: s.paramLabels,
+                             samples: s.samples };
+        state.schemeColors = s.colors.map(c => ({
+          r: c[0], g: c[1], b: c[2], frequency: c[3], initial: c[4]
+        }));
+        state.schemeBri = { finite: s.briFinite, infinite: s.briInfinite,
+                            factor: s.briFactor };
+      }
+    } else {
+      state.schemeId = null;
+    }
+    if (!state.schemeParams.length && state.schemeMeta)
+      state.schemeParams = [0.33, 0.3];
     return true;
   } catch { return false; }
 }
 
-/* ---------------- i18n 应用 ---------------- */
+/* ---------------- i18n application ---------------- */
 function applyI18n() {
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const k = el.dataset.i18n;
@@ -1650,22 +5516,65 @@ function applyI18n() {
   });
   document.title = 'MANDELBROT · ' + t('appSub');
   fillSelects();
+  syncSchemeParams();          // slider labels follow the language switch
+  if (juliaView) juliaView.syncUi();
   updateHud();
   setPanelOpen(!document.body.classList.contains('panel-closed'), false);
   if (modalKind === 'presets') openPresets();
 }
 
-/* ---------------- 画布尺寸 ---------------- */
-function resizeCanvas() {
-  const dpr = state.hd ? Math.min(2, window.devicePixelRatio || 1) : 1;
+/* ---------------- Canvas sizing ---------------- */
+function resizeCanvas(render = true) {
+  /* state.renderScale is a multiple of CSS pixels, not of device pixels: on a
+   * 175% display "2" is 2 CSS px per CSS px, which is what the user sees as
+   * "device pixels".  Clamp to the range the option offers. */
+  const dpr = Math.max(1, Math.min(2, +state.renderScale || 2));
   canvas.width = Math.max(320, Math.round(innerWidth * dpr));
   canvas.height = Math.max(240, Math.round(innerHeight * dpr));
   ctx.fillStyle = '#05060a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  renderNow();
+  // One line in shell.log per resize: the only way to see the real viewport,
+  // DPI and buffer size without a debugger attached to WebView2.
+  try {
+    window.chrome?.webview?.postMessage(JSON.stringify({
+      type: 'log',
+      msg: `viewport css=${innerWidth}x${innerHeight} dpr=${(window.devicePixelRatio || 1).toFixed(2)} ` +
+           `buffer=${canvas.width}x${canvas.height} scale=${state.renderScale}`
+    }));
+  } catch { /* browser build */ }
+  if (render) renderNow();
 }
 
-/* ---------------- 启动加载层 ---------------- */
+/* Window resizing is part of the view, not a decoration: the span is a width,
+ * so a wider/taller window simply reveals more of the plane and the frame is
+ * rendered again at that shape.  The old bitmap is stretched into the new
+ * rectangle immediately (one blit) so the window never shows empty bands while
+ * the first pass is still running. */
+let resizeTimer = 0;
+function onWindowResize() {
+  const native = nativeCanvasMode();
+  const had = snap.width > 0;
+  resizeCanvas(false);
+  if (native) {
+    // Route 1 contract: a resize only changes the picture frame.  The shell
+    // resizes its swapchain and stretches the displayed pass; the plane is
+    // not recomputed until the next interaction asks for a new view.
+    return;
+  }
+  if (had) {
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'medium';
+    ctx.drawImage(snap, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+  }
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => renderNow(), 150);
+}
+window.addEventListener('resize', onWindowResize);
+window.addEventListener('orientationchange', onWindowResize);
+
+/* ---------------- Boot splash ---------------- */
 const splash = {
   p: 0,
   startAt: 0,
@@ -1706,13 +5615,16 @@ const splash = {
   }
 };
 
-/* ---------------- 启动 ---------------- */
+/* ---------------- Boot ---------------- */
 function boot() {
   // Tell the inline bootstrap guard that the module graph loaded fine.
   window.__mbModuleLoaded = true;
   if (window.__mbBootWatch) clearTimeout(window.__mbBootWatch);
 
   splash.init();
+  hydrateUserPalettes();
+  /* The colour-scheme library is read before anything can install a scheme. */
+  schemeStoreLoad();
   decodeState();
   setLang(state.lang);
   document.documentElement.dataset.theme = state.theme;
@@ -1722,10 +5634,19 @@ function boot() {
   syncIterUi();
   applyI18n();
   bindUi();
+  initGlassSelects();
+  /* The shell may have answered `hello` before the listener above existed. */
+  applyConfig(nativeConfig());
 
   // Panel starts open on desktop, folded into the top-bar button on phones.
   let panelPref = null;
   try { panelPref = localStorage.getItem('mb.panel'); } catch { /* ignore */ }
+  /* A launch flag (?panel=1) wins over the stored preference: the shell uses it
+   * to open the console for screenshots and regression runs. */
+  try {
+    const q = new URLSearchParams(location.search);
+    if (q.has('panel')) panelPref = q.get('panel');
+  } catch { /* ignore */ }
   setPanelOpen(panelPref === null ? !isMobileShell() : panelPref === '1', false);
   panelQuery.addEventListener('change', () => {
     document.body.classList.toggle('panel-open',
@@ -1734,14 +5655,14 @@ function boot() {
 
   $('in-jr').value = state.spec.julia.re;
   $('in-ji').value = state.spec.julia.im;
-  $('sel-palette').value = state.palette;
-  $('rng-cycle').value = state.cycle; $('val-cycle').textContent = state.cycle;
-  $('rng-offset').value = state.offset; $('val-offset').textContent = state.offset.toFixed(2);
+  $('sel-palette').value = state.schemeId || state.palette;
+  $('sel-scheme').value = state.scheme;
+  syncColorUi();
   $('chk-autoiter').checked = state.autoIter;
   $('sel-bits').value = state.bits;
   splash.set(0.16, 'bootKernel');
 
-  // 兜底：无论发生什么，8 秒后一定进入主界面
+  // Safety net: whatever happens, enter the main UI after 8 seconds
   setTimeout(() => { if (!splash.finished) splash.finish(); }, 8000);
 
   probeRemote().then((ok) => {
@@ -1750,13 +5671,88 @@ function boot() {
     if (ok) updateHud();
   });
   initWorkers();
+  /* Resolution must be restored before the first canvas sizing, otherwise the
+   * saved choice would only take effect on the next view change. */
+  try {
+    const sc = parseFloat(localStorage.getItem('mb.scale') || '');
+    if (sc >= 1 && sc <= 2) state.renderScale = sc;
+  } catch { /* private mode */ }
+  if ($('sel-scale')) $('sel-scale').value = String(state.renderScale);
   resizeCanvas();
 
-  let rt = 0;
-  window.addEventListener('resize', () => {
-    clearTimeout(rt);
-    rt = setTimeout(resizeCanvas, 180);
+  /* The reference's second viewport (00406070.c) is brought up last so it can
+   * borrow the first pass's compiled scheme and Params. */
+  juliaView = initJuliaView({
+    mainCanvas: canvas,
+    getScheme: () => lastDraw,
+    screenToPlane,
+    planeToScreen,
+    getCenter: () => ({ re: state.center.re, im: state.center.im }),
+    t, getLang, onLog: nativeLog,
+    onOpen: openJuliaSet,
+    onBack: backFromJulia
   });
+  /* Dev probe: tools/cdp.mjs verifies the second viewport (seed round-trip,
+   * picking, marker placement) through this instead of a debugger.  The render
+   * and preset entry points are exported too, so an automated A/B against the
+   * reference examples does not have to click through the modal. */
+  window.__mb = { state, screenToPlane, planeToScreen, julia: juliaView,
+                  render: renderNow, apply: applyRefPresetPatch,
+                  load: loadPatch, resolveScheme,
+                  /* Install a scheme by id from the library, exactly as the
+                   * colour panel does, so a verification run can switch to a
+                   * codegl (e.g. the Texture scheme) without clicking. */
+                  scheme: installScheme,
+                  /* Measurement hook for the frame-time breakdown: one `[seg]`
+                   * log line per shaded pass (see segReport). */
+                  seg: (on) => { segOn = !!on; return segOn; },
+                  /* Same view, cache off: isolates the field copy's cost. */
+                  nocache: (on) => { state.noFieldCache = !!on; return state.noFieldCache; },
+                  forcecopy: (on) => { state.forceCopy = !!on; return state.forceCopy; },
+                  /* Force a pass plan (measurement only), e.g. the old 0.16/0.5/1.0. */
+                  plan: (arr) => {
+                    planOverride = Array.isArray(arr) && arr.length
+                      ? arr.map(o => ({ scale: +o.scale || 1,
+                                        iter: o.iter == null ? 1 : +o.iter }))
+                      : null;
+                    return passPlanForNow();
+                  },
+                  /* Last completed frame's wall time (trigger -> last pass done)
+                   * and the exact pixel grid we render, for the speed comparison. */
+                  /* Why the shader declined the last frame, if it did. */
+                  scene: () => ({ ok: scene.ok, fail: sceneFail,
+                                  view: !!sceneView(), last: sceneLast,
+                                  result: sceneResult }),
+                  frame: () => frameMs,
+                  frames: () => frameSeq,
+                  /* Metadata of the last finished pass: orbit time, whether the
+                   * environment came from the cache, bits, glitches. */
+                  meta: () => lastMeta,
+                  viewport: () => ({ css: [innerWidth, innerHeight],
+                                     dpr: window.devicePixelRatio || 1,
+                                     buffer: [canvas.width, canvas.height] }),
+                  /* The scheme library, so the colour port can be inspected
+                   * without a debugger: names, the JSON that is on disk, and
+                   * whether a seeded write-back happened. */
+                  schemes: {
+                    names: () => (schemeDict ? [...schemeDict.keys()] : []),
+                    get: (n) => (schemeDict ? schemeDict.get(n) : null),
+                    json: () => (schemeDict ? writeColorschemes(schemeDict) : ''),
+                    save: schemeStoreSave
+                  } };
+
+  // The shell also pauses on WM_SIZE/SIZE_MINIMIZED; this covers the page-side
+  // signal (tab hidden) so the C++ pool never spins while nobody is looking.
+  if (NATIVE) {
+    document.addEventListener('visibilitychange', () => {
+      nativeSetPaused(document.visibilityState === 'hidden');
+    });
+  }
+
+  // Framing model: resizing / maximising / restoring only changes the frame.
+  // The rendered bitmap keeps its size and content; CSS `object-fit: contain`
+  // presents it proportionally inside the new frame, and no render pass is
+  // triggered.  (HD toggle and "适应窗口" still re-render on purpose.)
   updateHud();
 }
 

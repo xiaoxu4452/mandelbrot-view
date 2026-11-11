@@ -116,14 +116,14 @@ const NAMES = [
 ];
 
 const PALETTES = [
-  { id: 'ice', zh: '冰蓝', en: 'Ice', cycle: 8 },
-  { id: 'mono', zh: '单色', en: 'Mono', cycle: 6 },
-  { id: 'copper', zh: '铜', en: 'Copper', cycle: 10 },
-  { id: 'ember', zh: '余烬', en: 'Ember', cycle: 9 },
-  { id: 'viridis', zh: '翠绿', en: 'Viridis', cycle: 9 },
-  { id: 'twilight', zh: '暮色', en: 'Twilight', cycle: 7 },
-  { id: 'ocean', zh: '深海', en: 'Ocean', cycle: 7 },
-  { id: 'slate', zh: '石板', en: 'Slate', cycle: 9 }
+  { id: 'prism', zh: '三棱镜', en: 'Prism', cycle: 8 },
+  { id: 'amethyst', zh: '紫晶', en: 'Amethyst', cycle: 8 },
+  { id: 'nebula', zh: '星云', en: 'Nebula', cycle: 8 },
+  { id: 'veins', zh: '虹脉', en: 'Veins', cycle: 8 },
+  { id: 'clock', zh: '时序', en: 'Clockwork', cycle: 8 },
+  { id: 'sine13', zh: '深空光谱', en: 'Spectrum', cycle: 8 },
+  { id: 'engrave', zh: '镌刻', en: 'Engraved', cycle: 8 },
+  { id: 'ice', zh: '冰蓝', en: 'Ice', cycle: 8 }
 ];
 
 const anchors = [];
@@ -264,6 +264,60 @@ CUSTOM.forEach(([zh, en, expr, params, cx, cy, spanExp, mi]) => {
 const bad = anchors.filter(a => a.score != null && a.score < 6);
 console.log('锚点总数', anchors.length, '低分锚点', bad.length, bad.map(a=>a.nameZh+':'+a.score.toFixed(1)).join(', '));
 
+/* 7) 参考项目自带的视点 ------------------------------------------------
+ * examples/*.json 是解密项目自己的存档：中心坐标是全精度十进制字符串，
+ * zoom 是放大倍数（1 级视野宽 3.2）。它们代表"原程序看起来是什么样"，
+ * 所以单独成一组，用原文件里的配色（前面的 PALETTES 与之同源）。
+ * 只收 zoom <= 1e14 的：更深的视点缩略图代价太高，留到手动打开。
+ * -------------------------------------------------------------------- */
+const REF_DIR = 'C:/Users/harve/Desktop/mande/00_原始项目副本/examples';
+function spanFromZoom(z) {
+  // span = 3.2 / zoom，转成 mant * 10^exp（与 spanExp 字段同一进制）
+  if (!(z > 0)) return [3.2, 0];
+  const span = 3.2 / z;
+  const exp = Math.floor(Math.log10(span));
+  const mant = span / Math.pow(10, exp);
+  return [mant, exp];
+}
+try {
+  const files = fs.readdirSync(REF_DIR).filter(f => f.endsWith('.json'));
+  for (const f of files) {
+    let j;
+    try { j = JSON.parse(fs.readFileSync(REF_DIR + '/' + f, 'utf8')); } catch { continue; }
+    if (!j.x || !j.y || !j.zoom) continue;
+    const z = parseFloat(j.zoom);
+    if (!(z > 0) || z > 1e14) continue;
+    const [mant, exp] = spanFromZoom(z);
+    const title = f.replace(/\.json$/, '');
+    const iter = Math.min(60000, Math.max(1200, Math.round(800 + 380 * Math.log10(z + 1))));
+    anchors.push({
+      cat: 'reference', mode: 'm', kind: 'mandelbrot', power: 2,
+      cx: String(j.x), cy: String(j.y),
+      spanMant: mant, spanExp: exp,
+      maxIter: iter,
+      nameZh: '原项目 · ' + title, nameEn: 'Reference · ' + title
+    });
+    // 同一存档的朱丽叶视角
+    if (j.julia_x !== undefined && j.julia_y !== undefined && j.julia_zoom) {
+      const jz = parseFloat(j.julia_zoom);
+      if (jz > 0 && jz <= 1e14) {
+        const [jm, je] = spanFromZoom(jz);
+        anchors.push({
+          cat: 'reference', mode: 'j', kind: 'mandelbrot', power: 2,
+          julia: { re: String(j.julia_x), im: String(j.julia_y) },
+          cx: '0', cy: '0', spanMant: jm, spanExp: je,
+          maxIter: iter,
+          nameZh: '原项目 · ' + title + '（朱丽叶）',
+          nameEn: 'Reference · ' + title + ' (Julia)'
+        });
+      }
+    }
+  }
+  console.log('参考视点', anchors.filter(a => a.cat === 'reference').length);
+} catch (e) {
+  console.log('参考视点跳过：', e.message);
+}
+
 /* ---------- 展开为 512 个预设 ---------- */
 const presets = [];
 let id = 0;
@@ -281,6 +335,7 @@ for (const a of anchors) {
       customParams: a.customParams,
       cx: a.cx, cy: a.cy,
       spanExp: a.spanExp,
+      spanMant: a.spanMant,
       maxIter: a.maxIter,
       palette: p.id,
       cycle: p.cycle,

@@ -6,19 +6,22 @@ const root = path.resolve(import.meta.dirname, '..');
 
 /** 找 zig（C++ 工具链）；没有则回退到 AssemblyScript 版本 */
 function findZig() {
-  try {
-    let p = execSync('which zig', { encoding: 'utf8' }).trim();
-    if (p) {
+  const probes = process.platform === 'win32' ? ['where zig', 'zig version'] : ['which zig', 'command -v zig'];
+  for (const cmd of probes) {
+    try {
+      const out = execSync(cmd, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).split(/\r?\n/)[0].trim();
+      if (!out) continue;
+      if (cmd === 'zig version') return 'zig';
+      let p = out;
       if (p.startsWith('/')) {
-        try { p = execSync(`cygpath -w "${p}"`, { encoding: 'utf8' }).trim(); } catch { /* ignore */ }
+        try { p = execSync(`cygpath -w "${p}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* ignore */ }
       }
       return p;
-    }
-  } catch { /* ignore */ }
-  try {
-    const p = execSync('where zig', { encoding: 'utf8' }).split(/\r?\n/)[0].trim();
-    if (p) return p;
-  } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  }
   return null;
 }
 

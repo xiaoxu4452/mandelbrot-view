@@ -1,12 +1,12 @@
 /* ------------------------------------------------------------------
- * worker.js — 渲染线程
- *   · WebAssembly 内核（热路径：直算 / 扰动 / 牛顿）
- *   · 纯 JS 回退（自定义公式、无 WASM 环境）
- *   · 高精度参考轨道（BigInt）在本线程计算并缓存
+ * worker.js — render thread
+ *   · WebAssembly kernel (hot paths: direct / perturbation / Newton)
+ *   · Pure-JS fallback (custom formulas, environments without WASM)
+ *   · High-precision reference orbits (BigInt) are computed and cached on this thread
  * ----------------------------------------------------------------*/
 
 import { KERNEL_B64 } from './kernel-wasm.js';
-import { paletteLUT } from './palettes.js';
+import { paletteLUT, registerCustomPalette } from './palettes.js';
 import { resolveBitsFromLog2, requiredBitsFromLog2, contextFor } from './bigfixed.js';
 import { renderTile, _internals } from './render.js';
 import { compile as compileMath } from './mathlib.js';
@@ -14,20 +14,54 @@ import { buildSeries, chooseSkip } from './environment.js';
 import { buildCustomEnvironment } from './customenv.js';
 import { buildReferenceOrbit } from './formulas.js';
 
-/* ---------- WASM 内存布局 ---------- */
-const OUT = 65536;
-const OUT_CAP = 256 * 256 * 4;
-const LUT_PTR = OUT + OUT_CAP;
-const PARAMS = LUT_PTR + 2048;
-const ROOTS = PARAMS + 512;
-const GLITCH = ROOTS + 1024;          // int32 pairs (x, y) reported by the kernel
+/* ---------- WASM memory layout ---------- */
+/* The module is built by zig as `wasm32-freestanding`, so its shadow stack is
+ * reserved at the TOP of the module's *initial* linear memory and grows down
+ * from there.  That initial size is exactly 1 MiB, which means a 512x512 RGBA
+ * tile (also exactly 1 MiB) written at 64 KiB ran straight into the stack: the
+ * kernel's own spilled locals were replaced by pixel data, and every row after
+ * the collision was computed from a destroyed orbit state.  That is the dark
+ * horizontal band that appeared once per 512 px on the CPU path — the solver
+ * was not wrong, its workspace was being painted over.
+ *
+ * The fix is a layout invariant, not a magic constant: the tile slot starts at
+ * or above the module's initial memory size, so it can never overlap the stack,
+ * whatever the linker picks.  `INIT_BYTES` is read before the first grow. */
+let INIT_BYTES = 0;      // wasm initial memory (stack lives below this)
+let OUT = 65536;         // tile slot base; raised to INIT_BYTES in initWasm
+/* The kernel writes one tile as RGBA into linear memory, so this has to cover
+ * the largest tile the page asks for — and that is TILE = 512 (app.js), i.e.
+ * 1 MiB, not the 256x256 this used to reserve.  With the smaller buffer the
+ * guard below (`job.w * job.h * 4 > OUT_CAP`) was true for *every* tile of a
+ * real canvas, so the CPU path silently ran the JS kernel and never touched
+ * WebAssembly at all: 1.7 s a frame on a 2560x1600 canvas with the HUD
+ * reporting "JS". */
+const OUT_CAP = 512 * 513 * 4;   // one spare row: never let a tile write into the LUT
+let LUT_PTR = 0;
+let PARAMS = 0;
+let ROOTS = 0;
+let STATS = 0;                        // 3 doubles written by the kernel: nMin, nMax, nMaxExceptCentre
+let GLITCH = 0;                       // int32 pairs (x, y) reported by the kernel
 const GLITCH_CAP = 8192;
-const ORBIT = GLITCH + GLITCH_CAP * 8;
+let ORBIT = 0;
+
+/** Lay the buffers out above the module's initial memory (see INIT_BYTES). */
+function layoutMemory() {
+  OUT = Math.max(65536, INIT_BYTES);
+  LUT_PTR = OUT + OUT_CAP;
+  PARAMS = LUT_PTR + 2048;
+  ROOTS = PARAMS + 512;
+  STATS = ROOTS + 256;
+  GLITCH = ROOTS + 1024;
+  ORBIT = GLITCH + GLITCH_CAP * 8;
+}
 
 let wasm = null;         // { render, memory }
 let heap = null;         // Uint8Array view
 let params = null;       // Float64Array view
 let memBytes = 0;
+/* Set by the one-shot workspace self-check in processJob (see there). */
+let layoutVerified = false;
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -42,10 +76,16 @@ async function initWasm() {
     const mod = await WebAssembly.compile(bytes);
     const inst = await WebAssembly.instantiate(mod, { env: { abort() { throw new Error('wasm abort'); } } });
     wasm = inst.exports;
-    growMem(1024 * 1024);
+    /* Must be read before the first grow: the module reserves its shadow stack
+     * at the top of this initial region, and `layoutMemory` keeps every buffer
+     * we own above it. */
+    INIT_BYTES = wasm.memory.buffer.byteLength;
+    layoutMemory();
+    /* Reserve the tile buffer up front; growMem() rounds up to whole pages. */
+    growMem(OUT_CAP + 1024 * 1024);
     return true;
   } catch (e) {
-    console.warn('WASM 不可用，回退到 JS 渲染', e);
+    console.warn('WASM unavailable, falling back to JS rendering', e);
     wasm = null;
     return false;
   }
@@ -59,10 +99,10 @@ function growMem(bytes) {
   }
   memBytes = need;
   heap = new Uint8Array(mem.buffer);
-  params = new Float64Array(mem.buffer, PARAMS, 48);
+  params = new Float64Array(mem.buffer, PARAMS, 64);
 }
 
-/* ---------- 参考轨道缓存 ---------- */
+/* ---------- Reference-orbit cache ---------- */
 let orbitCacheEntry = null;   // { key, ptr, len, stride, refPx, refPy }
 
 function viewKey(job, bits) {
@@ -73,8 +113,8 @@ function viewKey(job, bits) {
 }
 
 /**
- * 构建本视图的「环境」：高精度参考轨道 + 级数近似系数。
- * 这一步是整个深层渲染里最贵的部分，因此按视图缓存，所有瓦片共享。
+ * Build the "environment" for this view: high-precision reference orbit + series-approximation coefficients.
+ * This is the most expensive part of any deep render, so it is cached per view and shared by every tile.
  */
 /**
  * Elect a reference point **inside the tile**.
@@ -107,8 +147,8 @@ function pickTileReference(job, bits) {
       im: shiftCoordHP(job.center.im, oy, bits)
     };
     const orb = buildReferenceOrbit(job.spec, c, bits, job.maxIter, 1e20);
-    orb.refPx = px;
-    orb.refPy = py;
+    orb.refPx = px + 0.5;       // pixel (px) is sampled at px + 0.5
+    orb.refPy = py + 0.5;
     orb.lifetime = orb.escaped ? orb.len : job.maxIter;
     if (!best || orb.lifetime > best.lifetime) best = orb;
     if (!orb.escaped) break;
@@ -122,16 +162,32 @@ function ensureOrbit(job, bits) {
 
   self.postMessage({ type: 'stage', stage: 'orbit' });
   const orb = _internals.pickReference(job, bits);
+  /* Double-double reference.
+   *
+   * Below a pixel spacing of ~1e-15 the 53-bit reference orbit is no longer a
+   * usable approximation: its per-step rounding (≈1e-16) is amplified by the
+   * orbit derivative and swamps the perturbation, which is what makes the
+   * picture turn into mosaics past 1e17 zoom.  Rebuilding the elected orbit
+   * with (hi, lo) pairs costs one extra high-precision pass (once per view) and
+   * lets the kernel run the double-double perturbation instead. */
+  const dd = bits > 64 && (job.psLog2 == null || job.psLog2 <= -46);
+  const orbFull = dd ? _internals.orbitWithPairs(job, bits) : orb;
   const stride = job.maxIter + 1;
-  const bytes = stride * 16 + 64;
+  const bytes = stride * (dd ? 32 : 16) + 64;
   growMem(bytes + 1024);
 
-  heap.set(new Uint8Array(orb.re.buffer, orb.re.byteOffset, orb.re.byteLength), ORBIT);
-  heap.set(new Uint8Array(orb.im.buffer, orb.im.byteOffset, orb.im.byteLength), ORBIT + stride * 8);
+  heap.set(new Uint8Array(orbFull.re.buffer, orbFull.re.byteOffset, orbFull.re.byteLength), ORBIT);
+  heap.set(new Uint8Array(orbFull.im.buffer, orbFull.im.byteOffset, orbFull.im.byteLength), ORBIT + stride * 8);
+  if (dd) {
+    heap.set(new Uint8Array(orbFull.reLo.buffer, orbFull.reLo.byteOffset, orbFull.reLo.byteLength), ORBIT + stride * 16);
+    heap.set(new Uint8Array(orbFull.imLo.buffer, orbFull.imLo.byteOffset, orbFull.imLo.byteLength), ORBIT + stride * 24);
+  }
 
-  // ---- 级数近似（只对 z -> z^2 + c 有效）----
+  // ---- Series approximation (only valid for z -> z^2 + c) ----
+  // Skipped on the double-double path: the SA coefficients are plain doubles,
+  // so they reintroduce exactly the 1e-16 truncation the dd pass removes.
   let series = null;
-  if ((job.spec.power | 0) === 2) {
+  if ((job.spec.power | 0) === 2 && !dd) {
     self.postMessage({ type: 'stage', stage: 'env' });
     const built = buildSeries(orb, job.maxIter, job.spec.mode === 'j', job.pixelSize);
     const ps = job.pixelSize;
@@ -146,12 +202,12 @@ function ensureOrbit(job, bits) {
 
   orbitCacheEntry = {
     key, ptr: ORBIT, len: orb.len, stride,
-    refPx: orb.refPx, refPy: orb.refPy, series
+    refPx: orb.refPx, refPy: orb.refPy, series, dd
   };
   return orbitCacheEntry;
 }
 
-/* ---------- 自定义公式的高精度环境 ---------- */
+/* ---------- High-precision environment for custom formulas ---------- */
 let customEnvEntry = null;
 
 /* ---------- Secondary references for glitch repair ---------- *
@@ -178,9 +234,9 @@ function ensureGlitchRefs(job, bits) {
       im: shiftCoordHP(job.center.im, -(py + 0.5 - H * 0.5) * ps, bits)
     };
     const orb = buildReferenceOrbit(job.spec, c, bits, job.maxIter, 1e20);
-    orb.refPx = px;
-    orb.refPy = py;
-    if (orb.len > 16) refs.push({ orbit: orb, px, py });
+    orb.refPx = px + 0.5;       // pixel (px) is sampled at px + 0.5
+    orb.refPy = py + 0.5;
+    if (orb.len > 16) refs.push({ orbit: orb, px: px + 0.5, py: py + 0.5 });
   }
   glitchRefsEntry = { key, refs };
   return refs;
@@ -195,8 +251,8 @@ function customEnvKey(job, bits) {
 }
 
 /**
- * 在视口内挑一个「活得最久」的点作为参考点：
- * 自定义公式没有解析结构可用，只能实测几个候选点的高精度轨道。
+ * Pick the point that "lives longest" inside the viewport as the reference point:
+ * a custom formula offers no analytic structure, so the high-precision orbits of a few candidates are measured.
  */
 function ensureCustomEnv(job, bits) {
   const key = customEnvKey(job, bits);
@@ -219,8 +275,8 @@ function ensureCustomEnv(job, bits) {
     if (!env.escaped) break;
     if (best.len > job.maxIter * 0.9) break;
   }
-  best.refPx = bestPx;
-  best.refPy = bestPy;
+  best.refPx = bestPx + 0.5;    // pixel (px) is sampled at px + 0.5
+  best.refPy = bestPy + 0.5;
   customEnvEntry = { key, env: best };
   return customEnvEntry;
 }
@@ -233,11 +289,11 @@ function shiftCoordHP(base, delta, bits) {
   return ctx.toString(b + d, Math.ceil(bits * 0.3) + 12);
 }
 
-/* ---------- 自定义公式缓存 ---------- */
+/* ---------- Custom-formula cache ---------- */
 const formulaCache = new Map();
 function customFnFor(job) {
   const src = (job.spec.customExpr || '').trim();
-  if (!src) throw new Error('自定义公式为空');
+  if (!src) throw new Error('custom formula is empty');
   let entry = formulaCache.get(src);
   if (!entry) {
     const r = compileMath(src);
@@ -254,15 +310,18 @@ function customFnFor(job) {
   return { fn: entry.fn, step: entry.step, P };
 }
 
-/* ---------- 任务处理 ---------- */
+/* ---------- Job handling ---------- */
 
 let lutPalette = null;
 let lutBytes = null;
 
 /** Upload the palette LUT into the kernel heap and cache it for JS repair. */
-function setLut(palette) {
-  if (lutPalette === palette && lutBytes) return lutBytes;
+function setLut(palette, stops) {
+  // A user-defined palette travels with its stops: the worker has no
+  // localStorage, so the main thread ships the table definition in the job.
+  if (stops) registerCustomPalette(palette, stops);
   const lut = paletteLUT(palette);
+  if (lut === lutBytes) return lutBytes;
   heap.set(lut, LUT_PTR);
   lutBytes = lut;
   lutPalette = palette;
@@ -301,7 +360,7 @@ function setupParams(job, mode, extra) {
   p[26] = spec.newtonDegree || 3;
   p[27] = ROOTS;
   p[28] = extra ? extra.stride : 1;
-  // 级数近似
+  // Series approximation
   const sa = extra && extra.series;
   p[29] = sa ? sa.skip : 0;
   p[30] = sa ? sa.ar : 0; p[31] = sa ? sa.ai : 0;
@@ -311,6 +370,33 @@ function setupParams(job, mode, extra) {
   p[37] = sa ? 1 : 0;
   p[38] = GLITCH;
   p[39] = GLITCH_CAP;
+  p[40] = extra && extra.dd ? 1 : 0;
+  // Distance-estimate rim (see dePixels in kernel.cpp): on unless disabled.
+  const de = job.de || {};
+  p[41] = de.on === false ? 0 : 1;
+  p[42] = de.width > 0 ? de.width : 1.0;
+  p[43] = de.strength != null ? de.strength : 0.85;
+  // Colour scheme (0 = palette bands, 1 = reference "Distance": black field,
+  // one-pixel white rim).  Mirrors the native kernel's Request::scheme.
+  p[44] = job.scheme === 1 ? 1 : 0;
+  /* KF colour pipeline (kernel.cpp Shade/putColor):
+     45 statistics sink, 46/47 Stretched interval from the previous pass,
+     48 enable Stretched, 49 palette loops across the interval (KF iterDiv 0.1 => 10),
+     50 8x8 ordered dither. */
+  p[45] = STATS;
+  const st = job.stretch;
+  p[46] = st ? st.lo : 0;
+  p[47] = st ? st.hi : 0;
+  p[48] = st ? 1 : 0;
+  p[49] = 10;
+  p[50] = job.dither === false ? 0 : 1;
+  p[51] = 0;   // legacy |z'|² spacing (measurement only)
+  /* Singleref rebase (KF glitch center method 3) is opt-in for measurement only:
+     on deep views it diverges from the reference-repair result and costs ~2.7x,
+     while emitting no glitches for the AddReference path.  KF's default method 0
+     (detect glitch, add a reference) is what the worker's repair loop implements,
+     so the kernel is left in "stop at orbit end + report glitch" mode. */
+  p[52] = 1;
 }
 
 function renderWithWasm(job, mode, extra) {
@@ -363,6 +449,36 @@ function inpaintLeftovers(data, job, list, mask, count) {
   }
 }
 
+/**
+ * The pure-JS tile renderer, used for everything the kernel cannot express and
+ * as the fallback when the kernel faults.
+ *
+ * The fallback is not decoration: the kernel writes its pixels into a fixed
+ * buffer, and a trap inside it used to lose the tile outright — the pass never
+ * completed, the page sat on a half-drawn frame, and nothing said why.  A tile
+ * that cannot be produced in WebAssembly is now produced in JavaScript, once,
+ * and the kernel is retired for the rest of the session.
+ */
+function renderJsJob(job, bits, psLog2, t0, why) {
+  let extraJs = {};
+  if (job.spec.mode === 'x') {
+    const { fn, step, P } = customFnFor(job);
+    extraJs = { customFn: fn, customStep: step, customParams: P };
+  }
+  const r = renderTile({ ...job, resolvedBits: bits, ...extraJs });
+  return {
+    type: 'tile', id: job.id, viewId: job.viewId,
+    x: job.x, y: job.y, w: job.w, h: job.h,
+    data: r.data,
+    meta: {
+      mode: r.mode, bits, ms: performance.now() - t0,
+      glitches: r.glitches || 0, refLen: r.refLen || 0,
+      escMin: r.escMin, escMax: r.escMax, bounded: r.bounded,
+      engine: 'js', why: why || '', limited: bits < requiredBitsFromLog2(psLog2)
+    }
+  };
+}
+
 function processJob(job) {
   const t0 = performance.now();
   const ps = job.pixelSize;
@@ -370,7 +486,7 @@ function processJob(job) {
   const bits = resolveBitsFromLog2(job.bits, psLog2);
   const spec = job.spec;
 
-  // 自定义公式：深层交给「高精度环境 + 二阶扰动」
+  // Custom formulas: deep views go through the "high-precision environment + second-order perturbation"
   const customDeep = spec.mode === 'x' && (bits > 64 || psLog2 < -13);
   if (customDeep) {
     const entry = ensureCustomEnv(job, bits);
@@ -382,6 +498,7 @@ function processJob(job) {
       meta: {
         mode: r.mode, bits, ms: performance.now() - t0,
         glitches: r.glitches || 0, refLen: r.refLen || 0,
+        escMin: r.escMin, escMax: r.escMax, bounded: r.bounded,
         engine: r.mode === 'custom-hp' ? 'hp' : 'core',
         limited: bits < requiredBitsFromLog2(psLog2),
         exact: !!(entry.env.deriv && entry.env.deriv.exact)
@@ -389,47 +506,83 @@ function processJob(job) {
     };
   }
 
-  // 走 JS 的路径：不支持扰动的深度放大 / 无 WASM
+  // JS path: deep zooms without perturbation support / no WASM
   const needJs =
     !wasm ||
-    spec.mode === 'x' ||                   // 自定义公式（浅层：双精度直算）
-    psLog2 < -980 ||                       // 超出 double 扰动范围 -> 高精度直算
+    spec.mode === 'x' ||                   // custom formula (shallow: direct double precision)
+    psLog2 < -16300 ||                     // beyond the 16384-bit desktop HP tier -> direct high precision
+    /* The kernel writes RGBA into one fixed buffer; a tile larger than its
+     * capacity would run past the end of linear memory (which is exactly how
+     * the old full-frame deep pass used to trap). */
+    job.w * job.h * 4 > OUT_CAP ||
     (bits > 64 && !(spec.kind === 'mandelbrot' || spec.kind === 'multibrot') && spec.mode !== 'n');
 
-  if (needJs) {
-    let extraJs = {};
-    if (spec.mode === 'x') {
-      const { fn, step, P } = customFnFor(job);
-      extraJs = { customFn: fn, customStep: step, customParams: P };
-    }
-    const r = renderTile({ ...job, resolvedBits: bits, ...extraJs });
-    return {
-      type: 'tile', id: job.id, viewId: job.viewId,
-      x: job.x, y: job.y, w: job.w, h: job.h,
-      data: r.data,
-      meta: {
-        mode: r.mode, bits, ms: performance.now() - t0,
-        glitches: r.glitches || 0, refLen: r.refLen || 0,
-        engine: 'js', limited: bits < requiredBitsFromLog2(psLog2)
-      }
-    };
-  }
+  if (needJs) return renderJsJob(job, bits, psLog2, t0);
 
   let mode = 0, extra = null;
   if (spec.mode === 'n') mode = 2;
-  else if (bits > 64) {
+  /* Perturbation only earns its cost once the centre no longer fits in a
+   * double.  `bits > 64` alone was not that test: the tier list now returns 128
+   * for a shallow view (because 64 bits of *guard* is the reference's rule),
+   * and routing a 800x frame through a 128-bit reference orbit made it both
+   * slower and noisier than the plain double loop it replaced.  The CPU tile
+   * renderer's own deep threshold is -45 (app.js `deepPass`), so use the same
+   * number: below it the direct double kernel is exact, above it we need the
+   * reference orbit. */
+  else if (bits > 64 && psLog2 <= -45) {
     mode = 1;
     const o = ensureOrbit(job, bits);
-    extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refPx, refPy: o.refPy, stride: o.stride, series: o.series };
+    extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refPx, refPy: o.refPy, stride: o.stride, series: o.series, dd: o.dd };
   }
 
-  const lut = setLut(job.palette);
-  const glitches = renderWithWasm(job, mode, extra);
+  const lut = setLut(job.palette, job.paletteStops);
+  /* Workspace self-check, run once per session (and on demand through
+   * `job.dbg`): paint the tail of this tile's slot before the render and see
+   * how much of the marker survives.  Any surviving byte means the kernel did
+   * not write that part of the slot — i.e. the layout invariant above
+   * (`OUT >= INIT_BYTES`, `OUT_CAP >= 512x512`) has been broken and pixels are
+   * again landing somewhere the solver does not own. */
+  const verify = job.dbg || !layoutVerified;
+  let tailMark = 0;
+  if (verify) {
+    tailMark = Math.min(64 * 1024, job.w * job.h * 4);
+    heap.fill(0xAB, OUT + job.w * job.h * 4 - tailMark, OUT + job.w * job.h * 4);
+  }
+  let glitches = 0;
+  try {
+    glitches = renderWithWasm(job, mode, extra);
+  } catch (e) {
+    /* A trap in the kernel must not cost the frame.  Retire it and render the
+     * tile in JS; the rest of the session keeps the working path. */
+    console.warn('wasm render failed, falling back to JS:', e && e.message);
+    wasm = null;
+    return renderJsJob(job, bits, psLog2, t0, 'wasm-trap');
+  }
+  let tailKept = -1;
+  if (tailMark) {
+    let kept = 0;
+    for (let i = OUT + job.w * job.h * 4 - tailMark; i < OUT + job.w * job.h * 4; i++)
+      if (heap[i] === 0xAB) kept++;
+    tailKept = kept;
+    if (!layoutVerified) {
+      layoutVerified = true;
+      if (kept > 0) {
+        console.error(`[kernel] tile slot not fully written (${kept} bytes of ${tailMark}) — ` +
+                      `OUT=0x${OUT.toString(16)} init=0x${INIT_BYTES.toString(16)} ` +
+                      `tile=${job.w}x${job.h}; the buffers overlap the wasm stack again`);
+      }
+    }
+  }
 
   const pixels = job.w * job.h;
   const bytes = pixels * 4;
   const out = new Uint8ClampedArray(bytes);
   out.set(heap.subarray(OUT, OUT + bytes));
+  /* KF frame statistics: nMin/nMax/nMaxExceptCentre of this tile, sampled
+     from the escaped pixels.  The host aggregates them per pass and feeds the
+     result back as the next pass's Stretched interval. */
+  const sv = new Float64Array(wasm.memory.buffer, STATS, 3);
+  const stats = { nMin: sv[0], nMax: sv[1], nMaxNC: sv[2] };
 
   /* Glitch repair.
    *
@@ -462,12 +615,13 @@ function processJob(job) {
       bits, ms: performance.now() - t0,
       glitches, glitchFix, refLen: extra ? extra.orbitLen : 0,
       saSkip: extra && extra.series ? extra.series.skip : 0,
-      engine: 'wasm', limited: bits < requiredBitsFromLog2(psLog2)
+      engine: 'wasm', limited: bits < requiredBitsFromLog2(psLog2),
+      stats, tailKept, tileH: job.h, tileW: job.w
     }
   };
 }
 
-/* ---------- 消息循环 ---------- */
+/* ---------- Message loop ---------- */
 
 const ready = initWasm().then(ok => {
   self.postMessage({ type: 'ready', wasm: ok });

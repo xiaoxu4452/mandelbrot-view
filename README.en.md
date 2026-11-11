@@ -16,9 +16,12 @@ scientific tooling: translucent glass, restrained hierarchy, no decorative gradi
 Use the demo link above. The WebAssembly kernel is compiled on first load; every calculation then
 runs locally.
 
-### 2. Local bundle (recommended for maximum throughput)
+### 2. Desktop app (recommended, no setup)
 
-In the app: **Settings → Render core → Download core**, then unpack `mandelbrot-core.zip` and run:
+In the app: **Settings → Desktop app & render core → Download desktop app** serves the
+Windows build (`download/Mandelbrot-View.exe`) with the same C++ multi-threaded kernel,
+GPU shading and preset library built in — no unpacking and no Node.js required.
+Advanced users can still fetch `mandelbrot-core.zip` from the same panel; unpack it and run:
 
 - **Windows** — double-click `start-core.bat`
 - **macOS / Linux** — `bash start-core.sh`

@@ -14,9 +14,12 @@
 
 访问上面的在线演示地址。首次加载会编译 WebAssembly 内核，之后所有计算都在本机完成。
 
-### 2. 本地完整版（推荐，性能最好）
+### 2. 桌面软件（推荐，开箱即用）
 
-页面内「设置 → 渲染核心 → 下载核心包」可获得 `mandelbrot-core.zip`，解压后：
+页面内「设置 → 桌面软件与渲染核心 → 下载桌面软件」可获得 Windows 桌面版
+（`download/Mandelbrot-View.exe`）。它内置同一套 C++ 多线程内核、GPU 着色与预设库，
+无需解压、无需 Node.js。高级用户仍可在同一面板下载 `mandelbrot-core.zip`，
+解压后：
 
 - **Windows**：双击 `start-core.bat`
 - **macOS / Linux**：`bash start-core.sh`
@@ -156,7 +159,7 @@ css/app.css           Fluent 玻璃风格、深/浅主题、移动端断点
 js/app.js             视图状态、渐进式瓦片调度、交互、窗口
 js/worker.js          渲染线程：WASM 调度、参考轨道/级数缓存、混叠修复
 js/render.js          CPU 瓦片渲染（扰动 / 高精度 / 牛顿 / 自定义）
-js/corepanel.js       「渲染核心」面板（下载本地核、状态探测）
+js/corepanel.js       「桌面软件与渲染核心」面板（下载桌面版、本地核、状态探测）
 js/remote.js          本地核心客户端（127.0.0.1:8778）
 js/formulas.js        分形族定义与高精度参考轨道
 js/bigfixed.js        任意精度定点数（BigInt）
@@ -171,7 +174,8 @@ wasm/kernel.cpp       WASM 内核源码（C++ / SIMD）
 wasm/kernel.ts        AssemblyScript 参考实现
 js/kernel-wasm.js     内联 base64 内核（生成文件）
 server/               本地渲染核心与静态服务
-core/                 可下载的核心包（由 tools/build-core-package.mjs 生成）
+download/             桌面软件安装包（Mandelbrot-View.exe）
+core/                 可选的本地核心包（由 tools/build-core-package.mjs 生成）
 tools/                构建与验证脚本
 ```
 

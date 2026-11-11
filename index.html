@@ -13,10 +13,15 @@
 <meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="css/app.css?v=3" />
+<link rel="stylesheet" href="css/app.css?v=5" />
 </head>
 <body class="booting">
 <canvas id="fractal"></canvas>
+
+<!-- Where the Julia seed sits in the Mandelbrot plane.  Only shown once the
+     seed has been pinned, so the window always says which c it is showing. -->
+<div class="julia-mark" id="julia-mark" hidden><i></i><b></b></div>
+<div class="julia-pick-hint" id="julia-pick-hint" hidden data-i18n="juliaPickHint">点击画布上任意一点固定朱丽叶种子</div>
 
 <!-- 启动加载层（完成后淡出） -->
 <div class="boot" id="boot">
@@ -71,13 +76,10 @@
       <div class="dropdown glass" id="menu-sets" hidden>
         <button data-mode="m"><b>曼德勃罗集</b><small>Mandelbrot</small></button>
         <button data-mode="j"><b>朱丽叶集</b><small>Julia</small></button>
-        <button data-mode="n"><b>牛顿集</b><small>Newton</small></button>
-        <button data-mode="x"><b>自定义公式</b><small>Custom</small></button>
       </div>
     </div>
-    <button class="topbtn" id="btn-presets"><span data-i18n="presets">预设</span><span class="badge">512</span></button>
-    <button class="topbtn" id="btn-formula"><span data-i18n="formula">公式</span></button>
-    <button class="topbtn" id="btn-custom"><span data-i18n="custom">自定义</span></button>
+    <button class="topbtn" id="btn-presets" title="预设库 / Preset library (P)"><span data-i18n="presets">预设</span><span class="badge" id="preset-badge" hidden></span></button>
+    <button class="topbtn" id="btn-formula-top" title="公式编辑器 / Formula editor (F)"><span data-i18n="formula">公式</span></button>
   </nav>
 
   <div class="top-spacer"></div>
@@ -114,7 +116,21 @@
           </div>
         </div>
         <div class="dd-sep"></div>
-        <label class="dd-check"><input type="checkbox" id="chk-hd" /><span data-i18n="hdRender">高清渲染（2× 像素）</span></label>
+        <label class="dd-check"><span data-i18n="renderScale">渲染分辨率</span>
+          <select id="sel-scale" class="mini-select">
+            <option value="1" data-i18n="rsCss">1× CSS（最快）</option>
+            <option value="1.5" data-i18n="rsMid">1.5×</option>
+            <option value="2" data-i18n="rsPhys">2×（物理像素）</option>
+          </select>
+        </label>
+        <label class="dd-check"><span data-i18n="aaRender">抗锯齿（超采样）</span>
+          <select id="sel-aa" class="mini-select">
+            <option value="1" data-i18n="aaOff">关</option>
+            <option value="2" data-i18n="aaHigh">原版 High res（4 采样）</option>
+            <option value="3" data-i18n="aa9">3×（9 采样）</option>
+          </select>
+        </label>
+        <div class="dd-note" id="cfg-note" hidden></div>
         <button class="dd-item" id="btn-core" data-i18n="coreTitle">渲染核心</button>
         <button class="dd-item" id="btn-fullscreen" data-i18n="scFull">全屏</button>
         <button class="dd-item" id="btn-about" data-i18n="about">关于</button>
@@ -129,9 +145,6 @@
   <div class="panel-head" id="panel-drag">
     <span class="panel-title" data-i18n="panelTitle">控制台</span>
     <div class="panel-head-actions">
-      <button class="iconbtn tiny" id="btn-panel-reset" title="复位位置 / Reset position">
-        <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2.2 4.4V2.2h2.2M9.8 7.6v2.2H7.6"/><path d="M2.6 2.6l2.6 2.6M9.4 9.4L6.8 6.8"/></svg>
-      </button>
       <button class="iconbtn tiny" id="btn-panel-collapse" title="最小化到顶栏 / Minimize to top bar">
         <svg viewBox="0 0 12 12" width="11" height="11"><path d="M2 7.5h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
       </button>
@@ -139,17 +152,84 @@
   </div>
 
   <div class="panel-body" id="panel-body">
+    <!-- The reference's second VIEWPORT (00406070.c): a Julia set for the
+         Mandelbrot point under the cursor.  It scrolls with the settings below
+         it, and clicking it opens that set in the main view (the title then
+         turns into the way back).  Its own WebGL surface is compiled from the
+         SAME shader as the main view, so a palette change recolours both. -->
+    <section class="grp julia-dock" id="julia-preview">
+      <div class="julia-dock-head" id="julia-dock-head">
+        <span class="julia-dot"></span>
+        <span class="julia-dock-title" id="julia-dock-title" data-i18n="juliaTitle">朱丽叶集</span>
+        <button class="julia-back" id="btn-julia-back" type="button" hidden>
+          <svg viewBox="0 0 12 12" width="10" height="10"><path d="M7.5 2.5 4 6l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-i18n="juliaBack">返回</span>
+        </button>
+        <button class="julia-btn" id="btn-julia-size" type="button" data-i18n="juliaSize">放大</button>
+      </div>
+      <div class="julia-frame" id="julia-frame">
+        <canvas id="julia-canvas" width="168" height="168" title="打开朱丽叶集 / Open this Julia set"></canvas>
+      </div>
+      <div class="julia-seed mono" id="julia-seed">c = —</div>
+      <div class="julia-dock-ctl">
+        <div class="btnrow">
+          <button class="btn tiny" id="btn-julia-pick" type="button" data-i18n="juliaPick">在画布选点</button>
+          <button class="btn tiny" id="btn-julia-center" type="button" data-i18n="juliaCenter">跟随主视点</button>
+        </div>
+        <label class="chk"><input type="checkbox" id="chk-julia-follow" checked/><span data-i18n="juliaFollow">跟随鼠标换种子</span></label>
+        <div class="row tight">
+          <label data-i18n="juliaZoom">缩放</label>
+          <input type="range" id="rng-julia-zoom" min="0" max="100" step="1" value="12"/>
+          <span class="val mono" id="val-julia-zoom">0.50</span>
+        </div>
+        <div class="row tight">
+          <label data-i18n="juliaRot">旋转</label>
+          <input type="range" id="rng-julia-rot" min="-180" max="180" step="1" value="-90"/>
+          <span class="val mono" id="val-julia-rot">-90°</span>
+        </div>
+      </div>
+    </section>
     <section class="grp">
       <h4 data-i18n="target">观测对象</h4>
       <div class="segment" id="seg-mode">
         <button data-mode="m" class="on" data-i18n="modeM">曼德勃罗集</button>
         <button data-mode="j" data-i18n="modeJ">朱丽叶集</button>
-        <button data-mode="n" data-i18n="modeN">牛顿集</button>
-        <button data-mode="x" data-i18n="modeX">自定义</button>
       </div>
-      <div class="row" id="row-kind">
-        <label>族</label>
-        <select id="sel-kind" class="ctl"></select>
+    </section>
+    <section class="grp">
+      <h4>集合族</h4>
+      <div class="row">
+        <label>公式</label>
+        <select id="sel-family" class="ctl">
+          <option value="mandelbrot">z² + c</option>
+          <option value="multibrot">zᵖ + c</option>
+          <option value="tricorn">z̄² + c（三叉戟）</option>
+          <option value="burningship">|Re|,|Im|（燃烧船）</option>
+          <option value="celtic">凯尔特</option>
+          <option value="perpendicular">垂直</option>
+          <option value="custom">自定义公式…</option>
+        </select>
+      </div>
+      <div class="row" id="row-power" hidden>
+        <label>幂次 p</label>
+        <input id="num-power" class="ctl" type="number" min="2" max="8" step="1" value="3"/>
+      </div>
+      <div class="row" id="row-formula">
+        <button class="btn tiny" id="btn-formula-editor" data-i18n="formulaOpen">编辑公式…</button>
+        <code class="mono" id="formula-current">z^2 + c</code>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="viewAngle">视角</h4>
+      <div class="row">
+        <label data-i18n="rotation">旋转</label>
+        <input type="range" id="rng-rot" min="-180" max="180" step="1" value="0"/>
+        <input class="ctl mono num" id="in-rot" type="number" min="-180" max="180" step="1" value="0"/>
+      </div>
+      <div class="row two">
+        <button class="btn tiny" id="btn-rot-zero" data-i18n="rotZero">归零</button>
+        <button class="btn tiny" id="btn-rot-quarter" data-i18n="rotQuarter">转 90°</button>
       </div>
     </section>
 
@@ -167,27 +247,17 @@
 
     <section class="grp">
       <h4 data-i18n="params">参数</h4>
-      <div class="row" id="row-power" hidden>
-        <label data-i18n="power">幂次</label>
-        <input type="range" id="rng-power" min="2" max="10" step="1" value="2"/>
-        <span class="val mono" id="val-power">2</span>
-      </div>
-      <div class="row" id="row-degree" hidden>
-        <label data-i18n="degree">次数</label>
-        <input type="range" id="rng-degree" min="3" max="9" step="1" value="3"/>
-        <span class="val mono" id="val-degree">3</span>
-      </div>
-      <div class="row" id="row-phoenix" hidden>
-        <label data-i18n="phoenix">p</label>
-        <input type="range" id="rng-phoenix" min="-1" max="1" step="0.01" value="0.5667"/>
-        <span class="val mono" id="val-phoenix">0.57</span>
-      </div>
       <div class="row">
         <label data-i18n="iterations">迭代</label>
         <input type="range" id="rng-iter" min="100" max="200000" step="100" value="600"/>
         <input class="ctl mono num" id="in-iter" value="600"/>
       </div>
       <label class="check"><input type="checkbox" id="chk-autoiter" checked/><span data-i18n="autoIter">自动</span></label>
+      <div class="row" id="row-iterrank">
+        <label data-i18n="iterRank">自动精度</label>
+        <input type="range" id="rng-iterrank" min="1" max="100" step="1" value="100"/>
+        <input class="ctl mono num" id="in-iterrank" value="100"/>
+      </div>
     </section>
 
     <section class="grp">
@@ -208,17 +278,107 @@
       <div class="row">
         <label data-i18n="palette">配色</label>
         <select id="sel-palette" class="ctl"></select>
+        <button class="iconbtn" id="btn-palette-edit" title="调色盘">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
+            <circle cx="4.4" cy="5" r="2.1"/><circle cx="9.6" cy="3.4" r="2.1"/>
+            <circle cx="11.6" cy="9.4" r="2.1"/><circle cx="6" cy="11.6" r="2.1"/>
+          </svg>
+        </button>
       </div>
-      <div class="palette-strip" id="palette-strip"></div>
+      <div class="grad-ed" id="grad-ed">
+        <!-- Three full-width ramps stacked vertically: each one is one third of
+             the palette stretched to the full width, so a stop can be placed
+             three times more precisely than on a single bar. -->
+        <div class="grad-stack" id="grad-stack">
+          <div class="grad-lane" data-zone="1">
+            <div class="grad-bar" data-zone="1" title="点击空白处添加色标，拖动色标改变位置，双击删除">
+              <div class="grad-fill"></div>
+              <div class="grad-handles"></div>
+            </div>
+          </div>
+          <div class="grad-lane" data-zone="2">
+            <div class="grad-bar" data-zone="2" title="点击空白处添加色标，拖动色标改变位置，双击删除">
+              <div class="grad-fill"></div>
+              <div class="grad-handles"></div>
+            </div>
+          </div>
+          <div class="grad-lane" data-zone="3">
+            <div class="grad-bar" data-zone="3" title="点击空白处添加色标，拖动色标改变位置，双击删除">
+              <div class="grad-fill"></div>
+              <div class="grad-handles"></div>
+            </div>
+          </div>
+        </div>
+        <div class="grad-row">
+          <input type="color" id="grad-color" class="grad-color" value="#ffffff"/>
+          <input class="ctl mono num" id="grad-pos" type="number" min="0" max="1" step="0.001" value="0"/>
+          <button class="btn tiny" id="grad-add" data-i18n="gradAdd">加色标</button>
+          <button class="btn tiny" id="grad-del" data-i18n="gradDel">删色标</button>
+          <button class="btn tiny" id="grad-reset" data-i18n="gradReset">还原</button>
+        </div>
+      </div>
       <div class="row">
-        <label data-i18n="cycle">色带</label>
-        <input type="range" id="rng-cycle" min="2" max="256" step="1" value="8"/>
-        <span class="val mono" id="val-cycle">8</span>
+        <label data-i18n="scheme">着色</label>
+        <select id="sel-scheme" class="ctl">
+          <option value="bands" data-i18n="schemeBands">平滑（Smooth）</option>
+          <option value="iteration" data-i18n="schemeIteration">迭代（Iteration）</option>
+          <option value="levels" data-i18n="schemeLevels">迭代 + 轮廓</option>
+          <option value="distance" data-i18n="schemeDistance">轮廓（Distance）</option>
+        </select>
       </div>
+      <!-- Orbit traps.  Everything above colours by the escape count; these
+           colour by where the orbit *went*, which is what draws filigree that
+           keeps its structure at any zoom.  The statistic is accumulated by
+           the same iteration pass, so this costs no extra render. -->
+      <div class="row">
+        <label data-i18n="trap">花纹</label>
+        <select id="sel-trap" class="ctl">
+          <option value="0" data-i18n="trapOff">关闭</option>
+          <option value="1" data-i18n="trapPoint">点陷阱</option>
+          <option value="2" data-i18n="trapLine">线陷阱</option>
+          <option value="3" data-i18n="trapCircle">圆陷阱</option>
+          <option value="4" data-i18n="trapTia">三角平均（TIA）</option>
+        </select>
+      </div>
+      <!-- Trap density.  Both knobs live only in the fragment shader, so
+           moving them repaints the field that is already on the GPU: no
+           iteration pass, no sampling, one draw call. -->
+      <div id="trap-params" hidden>
+        <div class="row tight">
+          <label data-i18n="trapGain">收紧</label>
+          <input type="range" id="rng-trapgain" min="0.02" max="1" step="0.005" value="0.45"/>
+          <span class="val mono" id="val-trapgain">0.45</span>
+        </div>
+        <div class="row tight">
+          <label data-i18n="trapRings">环数</label>
+          <input type="range" id="rng-traprings" min="0" max="1" step="0.005" value="0.40"/>
+          <span class="val mono" id="val-traprings">0.40</span>
+        </div>
+      </div>
+      <!-- Official GLSL schemes declare `nparam` sliders in their JSON.
+           Those params.param[] controls are generated here, exactly one row
+           each.  Changing one re-shades the cached iteration field, so it
+           costs no re-iteration. -->
+      <div id="scheme-params" class="scheme-params" hidden></div>
       <div class="row">
         <label data-i18n="phase">相位</label>
         <input type="range" id="rng-offset" min="0" max="1" step="0.005" value="0"/>
         <span class="val mono" id="val-offset">0.00</span>
+      </div>
+      <div class="tone-grid">
+        <div class="row tight"><label data-i18n="brightness">亮度</label>
+          <input type="range" id="rng-bri" min="0.2" max="2" step="0.01" value="1"/>
+          <span class="val mono" id="val-bri">1.00</span></div>
+        <div class="row tight gain"><label class="gain-lab">R</label>
+          <input type="range" id="rng-gr" min="0.5" max="1.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gr">1.00</span></div>
+        <div class="row tight gain"><label class="gain-lab">G</label>
+          <input type="range" id="rng-gg" min="0.5" max="1.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gg">1.00</span></div>
+        <div class="row tight gain"><label class="gain-lab">B</label>
+          <input type="range" id="rng-gb" min="0.5" max="1.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gb">1.00</span></div>
+        <button class="btn tiny" id="btn-tone-reset" data-i18n="toneReset">重置色调</button>
       </div>
     </section>
 
@@ -262,7 +422,7 @@
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=3"></script>
+<script type="module" src="js/app.js?v=5"></script>
 
 <!-- ==================================================================
      Bootstrap guard (classic script — runs even when ES modules fail).

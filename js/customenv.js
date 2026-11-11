@@ -1,14 +1,14 @@
 /* ------------------------------------------------------------------
- * customenv.js — 自定义公式的「高精度环境」
+ * customenv.js — the "high-precision environment" for custom formulas
  *
- *  1. 用 BigInt 定点求值器（hpeval.js）在任意精度下迭代参考轨道；
- *  2. 在双精度下沿参考轨道求 ∂F/∂z、∂F/∂c、∂²F/∂z²、∂²F/∂z∂c、∂²F/∂c²；
- *  3. 每个像素只需要双精度的二阶泰勒扰动：
+ *  1. Iterate the reference orbit at arbitrary precision with the BigInt fixed-point evaluator (hpeval.js);
+ *  2. In double precision, follow the reference orbit to obtain ∂F/∂z, ∂F/∂c, ∂²F/∂z², ∂²F/∂z∂c, ∂²F/∂c²;
+ *  3. Each pixel then needs only a second-order Taylor perturbation in double precision:
  *
  *       ε' = A ε + B δ + ½C ε² + D εδ + ½E δ²
  *
- *     对 z² + c 来说这就是标准的扰动递推（A=2Z, B=1, C=2, D=E=0）。
- *     —— 于是任意自定义公式也能做深层放大，而每个像素仍是双精度。
+ *     For z² + c this is the standard perturbation recurrence (A=2Z, B=1, C=2, D=E=0).
+ *     — so any custom formula can zoom deep while every pixel stays double precision.
  * ----------------------------------------------------------------*/
 
 import { contextFor } from './bigfixed.js';
@@ -18,7 +18,7 @@ import { compileJet, JET_ORDER } from './jet.js';
 
 const BAIL2 = 1e20;
 
-/** 一阶偏导（中心差分）：非全纯公式只能做线性扰动 */
+/** First-order derivatives (central differences): non-holomorphic formulas only allow a linear perturbation */
 function linearDerivatives(fn, zr, zi, cr, ci, P, n, h) {
   const O = new Float64Array(2);
   const S = { zpr: 0, zpi: 0, cr: 0, ci: 0, on: 0 };
@@ -34,7 +34,7 @@ function linearDerivatives(fn, zr, zi, cr, ci, P, n, h) {
   };
 }
 
-/** 估计多项式的次数（非多项式返回 null） */
+/** Estimate the degree of a polynomial (returns null when not a polynomial) */
 export function polynomialDegree(ast) {
   let bad = false;
   const NONPOLY = new Set(['sin', 'cos', 'tan', 'exp', 'log', 'ln', 'sqrt', 'sinh', 'cosh',
@@ -69,7 +69,7 @@ export function polynomialDegree(ast) {
   return bad ? null : Math.max(1, d);
 }
 
-/** 公式是否全纯（不含 conj / abs / arg / re / im 等非解析运算） */
+/** Whether the formula is holomorphic (no non-analytic operations such as conj / abs / arg / re / im) */
 export function isHolomorphic(ast) {
   let ok = true;
   const NON = new Set(['conj', 'abs', 'abs2', 'norm', 'arg', 're', 'im', 'cabs']);
@@ -84,7 +84,7 @@ export function isHolomorphic(ast) {
 }
 
 /**
- * 构建自定义公式环境
+ * Build the custom-formula environment
  * @param {object} spec { customExpr, customParams }
  * @param {{re:string, im:string}} center
  * @param {number} bits
@@ -94,7 +94,7 @@ export function isHolomorphic(ast) {
 export function buildCustomEnvironment(spec, center, bits, maxIter) {
   const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
   const src = String(spec.customExpr || '').trim();
-  if (!src) throw new Error('自定义公式为空');
+  if (!src) throw new Error('custom formula is empty');
 
   const dbl = compileDouble(src);
   const K = makeBigContext(bits);
@@ -141,7 +141,7 @@ export function buildCustomEnvironment(spec, center, bits, maxIter) {
     st.z = next;
   }
 
-  // 级数系数（每个参考点一组）
+  // Series coefficients (one set per reference point)
   let deriv = null;
   const holy = isHolomorphic(dbl.ast);
   const deg = polynomialDegree(dbl.ast);
@@ -177,7 +177,7 @@ export function buildCustomEnvironment(spec, center, bits, maxIter) {
     }
   }
   if (!deriv) {
-    // 非全纯（abs / conj …）：只能做线性扰动，精度受 ε² 限制
+    // Non-holomorphic (abs / conj …): only a linear perturbation is possible, so precision is capped by ε²
     try {
       const N = Math.min(len, maxIter);
       const coef = new Float64Array((N + 1) * 4);
@@ -197,7 +197,7 @@ export function buildCustomEnvironment(spec, center, bits, maxIter) {
   return {
     re, im, len: Math.min(len, maxIter), escaped, deriv, params: Pdbl, ms: t1 - t0,
     holomorphic: holy, degree: deg,
-    // 多项式：级数在任意深度都精确；其余只在中浅层可靠
+    // Polynomials: the series stays exact at any depth; everything else is only reliable at shallow-to-moderate depth
     perturbMaxDepth: (deg != null && deg <= (deriv ? deriv.order : 6)) ? 1e1000 : 1e-12
   };
 }

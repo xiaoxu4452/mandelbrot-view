@@ -1,19 +1,19 @@
 /* ------------------------------------------------------------------
- * render.js — CPU 瓦片渲染内核
- *   direct   双精度直算（浅层，最快）
- *   perturb  高精度参考轨道 + 双精度扰动 + 混叠聚类修正（深层，可达 10^-300）
- *   hp       全高精度直算（牛顿集 / 不支持扰动的族）
+ * render.js — CPU tile renderer core
+ *   direct   direct double-precision evaluation (shallow, fastest)
+ *   perturb  high-precision reference orbit + double perturbation + glitch-cluster repair (deep, down to 10^-300)
+ *   hp       fully high-precision direct evaluation (Newton sets / families without perturbation support)
  * ----------------------------------------------------------------*/
 
 import { paletteLUT } from './palettes.js';
 import { buildReferenceOrbit } from './formulas.js';
+import { ddAdd, ddSub, ddMul } from './dd.js';
 import { contextFor, resolveBits, requiredBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js';
 import { buildSeries, chooseSkip } from './environment.js';
 import { makeBigContext, compileBig } from './hpeval.js';
 import { compile as compileDouble } from './mathlib.js';
 
-const BAIL2 = 1e20;
-const LOG_BAIL = Math.log(1e10);
+import { BAIL2, LOG_BAIL, putColor as writeColor, smoothIter as smoothOf } from './drawlib.js';
 const INTERIOR = [5, 6, 9];
 
 const KIND_CODE = {
@@ -21,7 +21,7 @@ const KIND_CODE = {
   tricorn: 1, burningship: 2, celtic: 3, perpendicular: 4, phoenix: 5
 };
 
-/* ---------------- 参考轨道缓存 ---------------- */
+/* ---------------- Reference-orbit cache ---------------- */
 
 const orbitCache = new Map();
 const ORBIT_CACHE_MAX = 8;
@@ -35,7 +35,7 @@ export function orbitKey(job) {
   ].join(';');
 }
 
-/** 双精度快速逃逸时间（用于挑选参考点） */
+/** Fast double-precision escape time (used when electing reference points) */
 function escapeTimeDouble(spec, cr, ci, zr0, zi0, limit) {
   const kind = spec.kind, power = spec.power | 0;
   const isJulia = spec.mode === 'j';
@@ -72,10 +72,10 @@ function escapeTimeDouble(spec, cr, ci, zr0, zi0, limit) {
 }
 
 /**
- * 选择参考点：在视口内取若干候选点，用高精度轨道实测它们的存活时间，
- * 取“活得最久”的那个作为参考轨道。
- * 高精度是必需的：深度超过 1e-16 后，double 已经完全区分不出这些候选点，
- * 而参考轨道一旦提前逃逸，整个画面会塌成同一颜色（深层放大的常见假象）。
+ * Elect a reference point: sample several candidates in the viewport, measure how long each survives
+ * with a high-precision orbit, and take the "longest-lived" one as the reference orbit.
+ * High precision is required: at depths below 1e-16, doubles can no longer tell these candidates apart,
+ * and a reference orbit that escapes early collapses the whole frame into a single colour (the classic deep-zoom artefact).
  */
 function pickReference(job, bits) {
   const { width, height, maxIter } = job;
@@ -108,8 +108,14 @@ function pickReference(job, bits) {
       im: offsetCoord(job.center.im, oy, bits)
     };
     const orb = buildReferenceOrbit(spec, centerHP, bits, maxIter, BAIL2);
-    orb.refPx = px;
-    orb.refPy = py;
+    /* refPx/refPy live in coordinate space: pixel (px, py) is sampled at
+     * px + 0.5, which is exactly where centerHP was just placed.  Storing px
+     * instead shifted the whole perturbation layer half a pixel against the
+     * direct layer (invisible at low zoom, catastrophic once the gradient is
+     * steeper than one pixel). */
+    orb.refPx = px + 0.5;
+    orb.refPy = py + 0.5;
+    orb.centerHP = centerHP;
     orb.lifetime = orb.escaped ? orb.len : maxIter;
     if (!best || orb.lifetime > best.lifetime) best = orb;
     // An interior point is the ideal reference: stop immediately.
@@ -132,7 +138,34 @@ export function getOrbit(job, bits) {
   return o;
 }
 
-/* ---------------- 入口 ---------------- */
+/**
+ * Rebuild the elected reference orbit with (hi, lo) low words.
+ *
+ * pickReference() keeps the cheap double orbit (it probes up to 25 candidates),
+ * so the double-double variant is materialised only once per view, from the
+ * coordinate strings the election already produced.
+ */
+export function orbitWithPairs(job, bits) {
+  const key = orbitKey(job) + '|dd';
+  let o = orbitCache.get(key);
+  if (o) return o;
+  const base = getOrbit(job, bits);
+  const centerHP = base.centerHP || {
+    re: job.center.re, im: job.center.im
+  };
+  o = buildReferenceOrbit(job.spec, centerHP, bits, job.maxIter, BAIL2, true);
+  o.refPx = base.refPx;
+  o.refPy = base.refPy;
+  o.centerHP = centerHP;
+  o.lifetime = base.lifetime;
+  if (orbitCache.size >= ORBIT_CACHE_MAX) {
+    orbitCache.delete(orbitCache.keys().next().value);
+  }
+  orbitCache.set(key, o);
+  return o;
+}
+
+/* ---------------- Entry point ---------------- */
 
 export function renderTile(job) {
   const t0 = now();
@@ -169,25 +202,12 @@ function now() {
 
 function makeTile(w, h) { return new Uint8ClampedArray(w * h * 4); }
 
+/* Colouring lives in drawlib.js; the solver only produces (n, m2). */
 function smoothIter(n, m2, power) {
-  const lz = 0.5 * Math.log(m2);
-  const nu = Math.log(lz / LOG_BAIL) / Math.log(power);
-  return n + 1 - (nu === nu ? nu : 0);
+  return smoothOf(n, m2, 1 / Math.log(power));
 }
 
-function writeColor(lut, t, data, o) {
-  let u = t - Math.floor(t);
-  let ix = u * 512;
-  let i0 = ix | 0; if (i0 >= 512) i0 = 511;
-  const f = ix - i0, j0 = (i0 + 1) & 511;
-  const a4 = i0 * 4, b4 = j0 * 4;
-  data[o] = (lut[a4] + (lut[b4] - lut[a4]) * f) | 0;
-  data[o + 1] = (lut[a4 + 1] + (lut[b4 + 1] - lut[a4 + 1]) * f) | 0;
-  data[o + 2] = (lut[a4 + 2] + (lut[b4 + 2] - lut[a4 + 2]) * f) | 0;
-  data[o + 3] = 255;
-}
-
-/* ---------------- 双精度直算 ---------------- */
+/* ---------------- Direct double precision ---------------- */
 
 function renderDirect(job, lut) {
   const { x, y, w, h, width, height, maxIter, offset } = job;
@@ -270,7 +290,7 @@ function renderDirect(job, lut) {
             if (n === 6) { chkR = zr; chkI = zi; chkOn = true; }
             else if (chkOn && (n & 31) === 0) {
               const dx = zr - chkR, dy = zi - chkI;
-              if (dx * dx + dy * dy < 1e-26) { break; }  // 周期 -> 内部
+              if (dx * dx + dy * dy < 1e-30) { break; }  // periodicity -> interior
             }
           }
 
@@ -296,7 +316,7 @@ function renderDirect(job, lut) {
   return { data, mode: 'direct', glitches: 0, refLen: 0 };
 }
 
-/* ---------------- 扰动渲染（多项式族） ---------------- */
+/* ---------------- Perturbation rendering (polynomial families) ---------------- */
 
 function renderPerturb(job, bits, lut) {
   const { x, y, w, h, width, height, maxIter, offset } = job;
@@ -306,13 +326,25 @@ function renderPerturb(job, bits, lut) {
   const power = job.spec.power | 0;
   const isJulia = job.spec.mode === 'j';
   const halfW = width * 0.5, halfH = height * 0.5;
-  const orbit = getOrbit(job, bits);
+  /* Once the pixel spacing is below the 53-bit limit, a double reference
+   * orbit is no longer a usable approximation and the perturbation collapses
+   * into mosaic blocks (see the kernel ddRef comment).  Switch the JS path to
+   * the double-double orbit in exactly the same regime as the WASM kernel. */
+  const wantDd = power === 2 && job.noDd !== true &&
+    (job.psLog2 != null ? job.psLog2 <= -46 : Math.abs(ps) < 1e-14);
+  const orbit = wantDd ? orbitWithPairs(job, bits) : getOrbit(job, bits);
   const Zr = orbit.re, Zi = orbit.im, oLen = orbit.len;
+  const ZrL = orbit.reLo, ZiL = orbit.imLo;
+  const useDd = !!ZrL;
   const refPx = orbit.refPx, refPy = orbit.refPy;
 
-  // ---- 级数近似：把整幅视图统一到一个跳过步数，避免瓦片接缝 ----
+  // ---- Series approximation: one skip count for the whole view, so tiles cannot seam ----
+  // Disabled on the double-double path: the SA coefficients live in plain doubles,
+  // so their truncation error (~1e-16 relative) is exactly the error the dd path
+  // removes.  Measured at 1e-28: SA on -> 0.5% of pixels off by >8 levels,
+  // SA off -> bit-identical to the 256-bit reference; costs ~1.1-1.4x time.
   let sa = null;
-  if (power === 2 && !job.noSeries) {
+  if (power === 2 && !job.noSeries && !useDd) {
     if (!orbit._series || orbit._serIter !== maxIter) {
       orbit._series = buildSeries(orbit, maxIter, isJulia, ps);
       orbit._serIter = maxIter;
@@ -344,7 +376,7 @@ function renderPerturb(job, bits, lut) {
       let dr = poR, di = poI;
       let n = 0, m2 = 0, esc = 0, glitch = false;
 
-      // 级数近似：直接给出第 s 步的扰动值
+      // Series approximation: yields the perturbation at step s directly
       if (sa) {
         const d2r = poR * poR - poI * poI;
         const d2i = 2 * poR * poI;
@@ -359,21 +391,49 @@ function renderPerturb(job, bits, lut) {
         n = sa.skip;
       }
 
-      for (; n < maxIter; n++) {
-        if (n >= oLen) {
-          // 参考轨道已逃逸：像素随之逃逸，除非发生抵消
-          const zr = Zr[oLen] + dr, zi = Zi[oLen] + di;
+      if (useDd) {
+        /* Double-double perturbation: identical recurrence, but δ and the
+         * reference multiplier are carried as (hi, lo) so the reference's
+         * 1e-16 rounding cannot be amplified into the pixel signal. */
+        let drh = dr, drl = 0, dih = di, dil = 0;
+        for (; n < maxIter; n++) {
+          if (n >= oLen) {
+            const zr = Zr[oLen] + drh, zi = Zi[oLen] + dih;
+            m2 = zr * zr + zi * zi;
+            n = oLen - 1;
+            if (m2 > BAIL2) esc = 1; else { esc = 0; glitch = true; }
+            break;
+          }
+          const Zr0 = Zr[n], Zi0 = Zi[n], Zr0L = ZrL[n], Zi0L = ZiL[n];
+          const zr = Zr0 + drh, zi = Zi0 + dih;
           m2 = zr * zr + zi * zi;
-          n = oLen - 1;
-          if (m2 > BAIL2) esc = 1; else { esc = 0; glitch = true; }
-          break;
+          if (m2 > BAIL2) { esc = 1; break; }
+          /* Collision (|Z+δ| ≈ |δ|) is not a defect: the recursion recovers.
+           * Only reference exhaustion is reported (see kernel.cpp). */
+
+          const dz = [drh, drl], dzi = [dih, dil];
+          const tz = ddAdd([2 * Zr0, 2 * Zr0L], dz);
+          const ti = ddAdd([2 * Zi0, 2 * Zi0L], dzi);
+          const nr = ddAdd(ddSub(ddMul(tz, dz), ddMul(ti, dzi)), [dcr, 0]);
+          const ni = ddAdd(ddAdd(ddMul(tz, dzi), ddMul(ti, dz)), [dci, 0]);
+          drh = nr[0]; drl = nr[1];
+          dih = ni[0]; dil = ni[1];
         }
-        const Zr0 = Zr[n], Zi0 = Zi[n];
+      } else {
+        for (; n < maxIter; n++) {
+          if (n >= oLen) {
+            // The reference orbit has escaped: the pixel escapes with it unless cancellation occurs
+            const zr = Zr[oLen] + dr, zi = Zi[oLen] + di;
+            m2 = zr * zr + zi * zi;
+            n = oLen - 1;
+            if (m2 > BAIL2) esc = 1; else { esc = 0; glitch = true; }
+            break;
+          }
+          const Zr0 = Zr[n], Zi0 = Zi[n];
         const zr = Zr0 + dr, zi = Zi0 + di;
         m2 = zr * zr + zi * zi;
         if (m2 > BAIL2) { esc = 1; break; }
-        const d2 = dr * dr + di * di;
-        if (m2 < d2 * 1e-6) glitch = true;
+        /* Collision is not a defect; only reference exhaustion is (kernel.cpp). */
 
         if (power === 2) {
           const t = 2 * Zr0 + dr, u = 2 * Zi0 + di;
@@ -402,6 +462,7 @@ function renderPerturb(job, bits, lut) {
           dr = sr + dcr; di = si + dci;
         }
       }
+      }
 
       if (glitch) {
         glitchCount++;
@@ -421,7 +482,7 @@ function renderPerturb(job, bits, lut) {
   let fixed = 0;
   if (glitchList.length) fixed = fixGlitches(job, bits, lut, data, glitchList);
 
-  return { data, mode: 'perturb', glitches: glitchCount, fixed, refLen: oLen };
+  return { data, mode: useDd ? 'perturb-dd' : 'perturb', glitches: glitchCount, fixed, refLen: oLen };
 }
 
 function fixGlitches(job, bits, lut, data, list, mask, maxClusters, preRefs) {
@@ -430,6 +491,12 @@ function fixGlitches(job, bits, lut, data, list, mask, maxClusters, preRefs) {
   const ps = job.pixelSize;
   const halfW = width * 0.5, halfH = height * 0.5;
   const spec = job.spec, power = spec.power | 0;
+  /* Secondary references must run in the same numeric regime as the primary
+   * pass.  A double-only repair orbit at 1e-28 reintroduces exactly the
+   * 1e-16 truncation the dd path removes, so repaired pixels would stay
+   * noisier than their neighbours. */
+  const useDd = power === 2 && job.noDd !== true &&
+    (job.psLog2 != null ? job.psLog2 <= -46 : Math.abs(ps) < 1e-14);
 
   const count = list.length / 2;
   const CELL = 12;
@@ -451,9 +518,9 @@ function fixGlitches(job, bits, lut, data, list, mask, maxClusters, preRefs) {
       re: offsetCoord(job.center.re, (cxp + 0.5 - halfW) * ps, bits),
       im: offsetCoord(job.center.im, -(cyp + 0.5 - halfH) * ps, bits)
     };
-    const orb = buildReferenceOrbit(spec, centerHP, bits, maxIter, BAIL2);
-    orb.refPx = cxp; orb.refPy = cyp;
-    if (orb.len > 16) refs.push({ orbit: orb, px: cxp, py: cyp });
+    const orb = buildReferenceOrbit(spec, centerHP, bits, maxIter, BAIL2, useDd);
+    orb.refPx = cxp + 0.5; orb.refPy = cyp + 0.5;   // see pickReference()
+    if (orb.len > 16) refs.push({ orbit: orb, px: cxp + 0.5, py: cyp + 0.5 });
   }
   if (!refs.length) return 0;
 
@@ -464,21 +531,39 @@ function fixGlitches(job, bits, lut, data, list, mask, maxClusters, preRefs) {
       const orb = ref.orbit;
       const dcr = (px + 0.5 - ref.px) * ps;
       const dci = -(py + 0.5 - ref.py) * ps;
-      let dr = dcr, di = dci, n = 0, m2 = 0, esc = 0, bad = false;
-      for (; n < maxIter; n++) {
-        if (n >= orb.len) { esc = 2; break; }
-        const Zr0 = orb.re[n], Zi0 = orb.im[n];
-        const zr = Zr0 + dr, zi = Zi0 + di;
-        m2 = zr * zr + zi * zi;
-        if (m2 > BAIL2) { esc = 1; break; }
-        if (m2 < dr * dr + di * di) { bad = true; break; }
-        const t = 2 * Zr0 + dr, u = 2 * Zi0 + di;
-        const ndr = t * dr - u * di + dcr;
-        const ndi = t * di + u * dr + dci;
-        dr = ndr; di = ndi;
+      let dr = dcr, di = dci, n = 0, m2 = 0, esc = 0;
+      if (useDd) {
+        let drh = dcr, drl = 0, dih = dci, dil = 0;
+        for (; n < maxIter; n++) {
+          if (n >= orb.len) { esc = 2; break; }
+          const Zr0 = orb.re[n], Zi0 = orb.im[n];
+          const Zr0L = orb.reLo[n], Zi0L = orb.imLo[n];
+          const zr = Zr0 + drh, zi = Zi0 + dih;
+          m2 = zr * zr + zi * zi;
+          if (m2 > BAIL2) { esc = 1; break; }
+          const dz = [drh, drl], dzi = [dih, dil];
+          const tz = ddAdd([2 * Zr0, 2 * Zr0L], dz);
+          const ti = ddAdd([2 * Zi0, 2 * Zi0L], dzi);
+          const nr = ddAdd(ddSub(ddMul(tz, dz), ddMul(ti, dzi)), [dcr, 0]);
+          const ni = ddAdd(ddAdd(ddMul(tz, dzi), ddMul(ti, dz)), [dci, 0]);
+          drh = nr[0]; drl = nr[1];
+          dih = ni[0]; dil = ni[1];
+        }
+      } else {
+        for (; n < maxIter; n++) {
+          if (n >= orb.len) { esc = 2; break; }
+          const Zr0 = orb.re[n], Zi0 = orb.im[n];
+          const zr = Zr0 + dr, zi = Zi0 + di;
+          m2 = zr * zr + zi * zi;
+          if (m2 > BAIL2) { esc = 1; break; }
+          const t = 2 * Zr0 + dr, u = 2 * Zi0 + di;
+          const ndr = t * dr - u * di + dcr;
+          const ndi = t * di + u * dr + dci;
+          dr = ndr; di = ndi;
+        }
       }
-      if (bad) continue;
-      if (power !== 2 && esc !== 1) { /* 高次幂仅接受幂 2 的修正 */ }
+      if (esc === 2) continue;   // this secondary orbit escaped before the pixel: try the next one
+      if (power !== 2 && esc !== 1) { /* higher powers only accept the repair computed for power 2 */ }
       const oo = ((py - y) * w + (px - x)) * 4;
       if (esc === 0) {
         data[oo] = INTERIOR[0]; data[oo + 1] = INTERIOR[1]; data[oo + 2] = INTERIOR[2];
@@ -492,7 +577,7 @@ function fixGlitches(job, bits, lut, data, list, mask, maxClusters, preRefs) {
   return fixed;
 }
 
-/** 构造 (val × 2^exp) 的定点数，避免 double 下溢 */
+/** Build the fixed-point value (val × 2^exp) so that doubles cannot underflow */
 function scaledOffset(ctx, val, exp) {
   return ctx.shl(ctx.fromNumber(val), exp);
 }
@@ -504,7 +589,7 @@ function offsetCoord(baseStr, delta, bits) {
   return ctx.toString(b + d, Math.ceil(bits * 0.32) + 8);
 }
 
-/* ---------------- 高精度直算 ---------------- */
+/* ---------------- Direct high precision ---------------- */
 
 function renderHpDirect(job, bits, lut) {
   const { x, y, w, h, width, height, maxIter, offset } = job;
@@ -525,6 +610,13 @@ function renderHpDirect(job, bits, lut) {
   const psMant = job.psMant != null ? job.psMant : ps;
   const psExp = job.psExp != null ? job.psExp : 0;
   const ph = ctx.fromNumber(spec.phoenixP != null ? spec.phoenixP : 0.5667);
+  /* Periodicity tolerance.  The old 1e-13 (squared 1e-26) is far too loose for
+   * deep zooms: near a parabolic/minibrot structure an escaping orbit can
+   * revisit an earlier state within 1e-13 long before it escapes, which
+   * misclassifies boundary pixels as interior (hard black specks).  A true
+   * attracting cycle closes to the working precision, so 1e-20 is both safe
+   * and still an effective early exit. */
+  const perSq = mul(ctx.fromNumber(1e-20), ctx.fromNumber(1e-20));
   let o = 0;
 
   for (let py = 0; py < h; py++) {
@@ -540,6 +632,11 @@ function renderHpDirect(job, bits, lut) {
         zr = 0n; zi = 0n;
       }
       let n = 0, m2 = 0, done = false;
+      /* Periodicity bailout.  Interior pixels are the majority of a deep
+       * frame and would otherwise burn the entire iteration budget in BigInt;
+       * detecting a recurring orbit returns them early (same rule as the
+       * kernel's period check). */
+      let chkR = 0n, chkI = 0n, chkOn = false;
       for (; n < maxIter; n++) {
         const ar = sq(zr), bi = sq(zi);
         if (ar + bi > bailSq) { m2 = ctx.toNumber(ar + bi); done = true; break; }
@@ -565,6 +662,12 @@ function renderHpDirect(job, bits, lut) {
           default: nr = ar - bi; ni = 2n * mul(zr, zi);
         }
         zr = nr + cr; zi = ni + ci;
+        if (!chkOn) {
+          if (n >= 12) { chkR = zr; chkI = zi; chkOn = true; }
+        } else if ((n & 63) === 0) {
+          const dx = zr - chkR, dy = zi - chkI;
+          if (dx * dx + dy * dy < perSq) { done = false; n = maxIter; break; }
+        }
       }
       if (job.debugN) { data[o] = n & 255; data[o + 1] = (n >> 8) & 255; data[o + 2] = Math.min(255, Math.log(m2) * 10) | 0; data[o + 3] = 255; }
       else if (!done) {
@@ -579,7 +682,7 @@ function renderHpDirect(job, bits, lut) {
   return { data, mode: 'hp', glitches: 0, refLen: 0 };
 }
 
-/* ---------------- 牛顿集 ---------------- */
+/* ---------------- Newton sets ---------------- */
 
 function newtonCycle(n, dist, root, bandCount, offset, maxIter) {
   return (n + 1 - Math.log2(Math.max(dist, 1e-15)) / 8) / Math.max(bandCount, 1) + root * 0.173 + offset;
@@ -702,7 +805,7 @@ function renderNewtonHP(job, bits, lut) {
   return { data, mode: 'newton-hp', glitches: 0, refLen: 0 };
 }
 
-/* ---------------- 自定义公式 ---------------- */
+/* ---------------- Custom formulas ---------------- */
 
 function renderCustom(job, lut) {
   const { x, y, w, h, width, height, maxIter, offset } = job;
@@ -716,12 +819,15 @@ function renderCustom(job, lut) {
   const jr = spec.julia ? parseFloat(spec.julia.re) : 0;
   const ji = spec.julia ? parseFloat(spec.julia.im) : 0;
   const fn = job.customFn;
-  if (!fn && !job.customStep) throw new Error('自定义公式未编译');
+  if (!fn && !job.customStep) throw new Error('custom formula has not been compiled');
   const step = job.customStep;
   const OUT = job.customOut || (job.customOut = new Float64Array(4));
   const P = job.customParams || new Float64Array(8);
   const S = { zpr: 0, zpi: 0, cr: 0, ci: 0, on: 0 };
   let o = 0;
+  /* Escape span over the whole tile: the HUD's "no structure" hint reads this,
+   * so it must come from the pixels, not from a placeholder. */
+  let escLo = Infinity, escHi = -Infinity, bounded = 0;
 
   for (let py = 0; py < h; py++) {
     for (let px = 0; px < w; px++) {
@@ -751,16 +857,21 @@ function renderCustom(job, lut) {
         escaped = n < maxIter;
       }
 
-      if (!escaped) { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
-      else writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+      if (!escaped) { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; bounded++; }
+      else {
+        if (n < escLo) escLo = n;
+        if (n > escHi) escHi = n;
+        writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+      }
       data[o + 3] = 255;
       o += 4;
     }
   }
-  return { data, mode: 'custom', glitches: 0, refLen: 0 };
+  return { data, mode: 'custom', glitches: 0, refLen: 0,
+    escMin: escLo === Infinity ? 0 : escLo, escMax: escHi === -Infinity ? 0 : escHi, bounded };
 }
 
-/* ---------------- 自定义公式 · 全高精度直算（参照/兜底） ---------------- */
+/* ---------------- Custom formulas · full high-precision direct (reference / fallback) ---------------- */
 
 function renderCustomHpDirect(job, bits, lut) {
   const { x, y, w, h, width, height, maxIter, offset } = job;
@@ -814,13 +925,13 @@ function renderCustomHpDirect(job, bits, lut) {
   return { data, mode: 'custom-hp', glitches: 0, refLen: 0, fixed: 0 };
 }
 
-/* ---------------- 自定义公式 · 二阶扰动 ---------------- */
+/* ---------------- Custom formulas · second-order perturbation ---------------- */
 
 /**
- * 对任意公式 F(z, c)，把像素写成参考点 + δ：
+ * For an arbitrary formula F(z, c), write each pixel as reference point + δ:
  *   ε_{n+1} = A ε + B δ + ½C ε² + D εδ + ½E δ²
- * 其中 A..E 是沿参考轨道的一阶/二阶偏导（在双精度下求得）。
- * 对 z² + c 它自动退化成标准曼德勃罗扰动。
+ * where A..E are the first/second-order partial derivatives along the reference orbit (computed in double precision).
+ * For z² + c it degrades automatically to the standard Mandelbrot perturbation.
  */
 function renderCustomPerturb(job, lut) {
   const { x, y, w, h, width, height, maxIter, offset } = job;
@@ -840,6 +951,8 @@ function renderCustomPerturb(job, lut) {
 
   let glitchCount = 0;
   let o = 0;
+  /* Real escape span for the HUD; see renderCustom. */
+  let escLo = Infinity, escHi = -Infinity, bounded = 0;
 
   for (let py = 0; py < h; py++) {
     for (let px = 0; px < w; px++) {
@@ -863,7 +976,7 @@ function renderCustomPerturb(job, lut) {
         if (m2 > BAIL2) { esc = 1; break; }
         const e2 = er * er + ei * ei;
         if (m2 < e2 * 1e-6) glitch = true;
-        // 非多项式公式：|ε| 变大后截断级数会发散，标记出来
+        // Non-polynomial formulas: the truncated series diverges once |ε| grows, so flag it
         if (!D.exact && e2 > 0.36) { glitch = true; break; }
 
         let ner, nei;
@@ -890,7 +1003,7 @@ function renderCustomPerturb(job, lut) {
           ner = (er * pr - ei * pi) + (dx * qr - dy * qi);
           nei = (er * pi + ei * pr) + (dx * qi + dy * qr);
         } else {
-          // 线性：ε' = A ε + B δ
+          // Linear: ε' = A ε + B δ
           const off = n * 4;
           const Ar = coef[off], Ai = coef[off + 1], Br = coef[off + 2], Bi = coef[off + 3];
           ner = (Ar * er - Ai * ei) + (Br * dx - Bi * dy);
@@ -901,8 +1014,11 @@ function renderCustomPerturb(job, lut) {
       }
 
       if (glitch) glitchCount++;
-      if (esc === 1) writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
-      else { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; }
+      if (esc === 1) {
+        writeColor(lut, smoothIter(n, m2, 2) * bandScale + offset, data, o);
+        if (n < escLo) escLo = n;
+        if (n > escHi) escHi = n;
+      } else { data[o] = INTERIOR[0]; data[o + 1] = INTERIOR[1]; data[o + 2] = INTERIOR[2]; bounded++; }
       data[o + 3] = 255;
       o += 4;
     }
@@ -910,9 +1026,10 @@ function renderCustomPerturb(job, lut) {
 
   return {
     data, mode: isJet ? 'custom-jet' : 'custom-linear',
-    glitches: glitchCount, refLen: oLen, fixed: 0
+    glitches: glitchCount, refLen: oLen, fixed: 0,
+    escMin: escLo === Infinity ? 0 : escLo, escMax: escHi === -Infinity ? 0 : escHi, bounded
   };
 }
 
-// 测试导出（不参与运行时逻辑）
-export const _internals = { renderDirect, renderPerturb, renderHpDirect, pickReference, fixGlitches, renderCustomHpDirect, renderCustomPerturb };
+// Test exports (not used by the runtime logic)
+export const _internals = { renderDirect, renderPerturb, renderHpDirect, pickReference, orbitWithPairs, fixGlitches, renderCustomHpDirect, renderCustomPerturb };

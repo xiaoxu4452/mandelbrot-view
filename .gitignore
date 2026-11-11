@@ -14,12 +14,35 @@ js/app.js.bak
 Thumbs.db
 desktop.ini
 
+# Local-only material: the desktop port, rendered evidence and scratch copies.
+# None of it is served by the page, and `evidence/` alone is hundreds of MB, so
+# it must never reach the Pages artifact (`upload-pages-artifact` uploads `.`).
+Meter Mandelbrot/
+evidence/
+.backup-web/
+download/
+iconic/
+native/
+kf-src/
+release/
+spike-native-canvas/
+# Scratch probes and one-off capture scripts (`_` prefix).  The maintained ones
+# are whitelisted below.
+tools/_*
+
 # NOTE: core/mandelbrot-core.zip is a build artefact but it is committed on
 # purpose — GitHub Pages serves it to the browser so users can download the
 # local render core without a build step.
 
 # Dev scratch harnesses (kept locally, not part of the repo)
 tools/*.mjs
+# Captures and scratch data produced while chasing a bug
+tools/*.bmp
+tools/*.txt
+tools/*.ps1
+tools/*.py
+tools/*.js
+tools/bench*/
 !tools/build-kernel.mjs
 !tools/build-core-package.mjs
 !tools/gen-presets.mjs
@@ -32,6 +55,12 @@ tools/*.mjs
 !tools/shot.mjs
 !tools/fullframe.mjs
 !tools/png.mjs
+# Regression checks that must survive in the repo (they gate a release):
+!tools/tilecheck.mjs
+!tools/pinchcheck.mjs
+!tools/kernel-layout.mjs
+!tools/webprobe.mjs
+!tools/grabcanvas.mjs
 wasm/t/
 tools/*.sh
 tools/*.html

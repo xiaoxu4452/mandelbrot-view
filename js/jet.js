@@ -1,21 +1,21 @@
 /* ------------------------------------------------------------------
- * jet.js — 表达式「喷射」求值（截断幂级数），用于扰动法的任意公式
+ * jet.js — "jet" evaluation of expressions (truncated power series), for arbitrary formulas under perturbation
  *
- * 对每个参考点 Z_n，把 F(Z_n + ε, c0 + δ) 展开成 ε 的幂级数：
+ * At every reference point Z_n, expand F(Z_n + ε, c0 + δ) as a power series in ε:
  *
- *     F = p_0 + p_1 ε + p_2 ε² + … + p_K ε^K        （ε 方向，直到 K 阶）
- *       + (q_0 + q_1 ε + … + q_K ε^K) δ              （δ 方向，只保留一阶）
+ *     F = p_0 + p_1 ε + p_2 ε² + … + p_K ε^K        (ε direction, up to order K)
+ *       + (q_0 + q_1 ε + … + q_K ε^K) δ              (δ direction, first order only)
  *
- * 于是扰动递推变得精确（多项式族在 K ≥ 次数 时完全精确）：
+ * The perturbation recurrence then becomes exact (for polynomial families it is fully exact once K ≥ degree):
  *
  *     ε' = (p_1 + p_2 ε + … ) ε + (q_0 + q_1 ε + …) δ
  *
- * 系数由「幂级数自动微分」在参考轨道上求得，不用有限差分。
+ * The coefficients come from automatic differentiation of the power series along the reference orbit, not from finite differences.
  * ----------------------------------------------------------------*/
 
 export const JET_ORDER = 6;
 
-/* ---------- 复数截断幂级数 ---------- */
+/* ---------- Complex truncated power series ---------- */
 
 function zeros(n) { return new Float64Array(n); }
 
@@ -32,7 +32,7 @@ function clone(v) {
   };
 }
 
-/** c = a * b（截断卷积，复数系数） */
+/** c = a * b (truncated convolution, complex coefficients) */
 function mulSeries(ar, ai, br, bi, K) {
   const cr = zeros(K + 1), ci = zeros(K + 1);
   for (let n = 0; n <= K; n++) {
@@ -66,7 +66,7 @@ function add(a, b, K, sign = 1) {
   return { r, i, dr, di };
 }
 
-/** 1/a（a0 ≠ 0） */
+/** 1/a (a0 ≠ 0) */
 function inv(a, K) {
   const a0r = a.r[0], a0i = a.i[0];
   const d = a0r * a0r + a0i * a0i;
@@ -87,7 +87,7 @@ function inv(a, K) {
     ti[n] = (ir * si + ii * sr);
     br[n] = tr[n]; bi[n] = ti[n];
   }
-  // δ 方向：d(1/a)/dc = -a_c / a²
+  // δ direction: d(1/a)/dc = -a_c / a²
   const [q1r, q1i] = mulSeries(a.dr, a.di, br, bi, K);
   const [q2r, q2i] = mulSeries(q1r, q1i, br, bi, K);
   const dr = zeros(K + 1), di = zeros(K + 1);
@@ -97,7 +97,7 @@ function inv(a, K) {
 
 function div(a, b, K) { return mul(a, inv(b, K), K); }
 
-/** 由导数序列重建函数：g' = h，g0 给定 */
+/** Rebuild the function from its derivative series: g' = h with g0 given */
 function integrate(h, K, g0r, g0i) {
   const r = zeros(K + 1), i = zeros(K + 1);
   r[0] = g0r; i[0] = g0i;
@@ -113,7 +113,7 @@ function deriv(a, K) {
 
 /** exp(a) */
 function expSeries(a, K) {
-  // a = a0 + u，exp(a) = exp(a0) * exp(u)
+  // a = a0 + u, exp(a) = exp(a0) * exp(u)
   const a0r = a.r[0], a0i = a.i[0];
   const m = Math.exp(a0r);
   const e0r = m * Math.cos(a0i), e0i = m * Math.sin(a0i);
@@ -135,7 +135,7 @@ function expSeries(a, K) {
     r[k] = e0r * er[k] - e0i * ei[k];
     i[k] = e0r * ei[k] + e0i * er[k];
   }
-  // δ 方向：exp(a)_c = exp(a) * a_c
+  // δ direction: exp(a)_c = exp(a) * a_c
   const dr = zeros(K + 1), di = zeros(K + 1);
   const base = { r, i };
   const [qx, qy] = mulSeries(base.r, base.i, a.dr, a.di, K);
@@ -156,13 +156,13 @@ function logSeries(a, K) {
   const r = integrate(q, K, lnr, lni);
   const i = zeros(K + 1);
   for (let k = 1; k <= K; k++) i[k] = q.i[k - 1] / k;
-  // δ 方向：d log(a)/dc = a_c / a
+  // δ direction: d log(a)/dc = a_c / a
   const av = inv(a, K);
   const [qr, qi] = mulSeries(a.dr, a.di, av.r, av.i, K);
   return { r, i, dr: qr, di: qi };
 }
 
-/** sqrt(a)：由 g'·g = a'/2 递推 */
+/** sqrt(a): recurse from g'·g = a'/2 */
 function sqrtSeries(a, K) {
   const a0r = a.r[0], a0i = a.i[0];
   const m = Math.hypot(a0r, a0i);
@@ -188,14 +188,14 @@ function sqrtSeries(a, K) {
     // rhs = a'_{n-1}/2 - sum
     const rhsR = 0.5 * n * ar[n] - sr;
     const rhsI = 0.5 * n * ai[n] - si;
-    // 除以 n·g0
+    // divide by n·g0
     const cr = rhsR * g0r + rhsI * g0i;
     const ci = rhsI * g0r - rhsR * g0i;
     const den = n * d0;
     r[n] = cr / den;
     i[n] = ci / den;
   }
-  // δ 方向：a_c / (2 sqrt(a))
+  // δ direction: a_c / (2 sqrt(a))
   const invv = inv({ r, i, dr: zeros(K + 1), di: zeros(K + 1) }, K);
   const [qr2, qi2] = mulSeries(a.dr, a.di, invv.r, invv.i, K);
   const dr = zeros(K + 1), di = zeros(K + 1);
@@ -220,7 +220,7 @@ function negVal(a, K) {
 
 function subVal(a, b, K) { return add(a, b, K, -1); }
 
-/** sin / cos（借助 exp(±i a)） */
+/** sin / cos (via exp(±i a)) */
 function sinSeries(a, K) {
   const ia = imagMul(a, K);
   const ep = expSeries(ia, K);
@@ -272,7 +272,7 @@ export function compileJet(ast, options = {}) {
       case 'var': {
         const name = node.name;
         if (name === 'z') {
-          // 自变量：z = Z + t，且与 c 无关
+          // Independent variable: z = Z + t, and independent of c
           return (st) => {
             const v = makeVal(K, st.zr, st.zi);
             v.r[1] = 1;
@@ -363,7 +363,7 @@ export function compileJet(ast, options = {}) {
                 return r;
               };
             }
-            throw new Error('级数求值不支持函数 ' + node.name);
+            throw new Error('series evaluation does not support function ' + node.name);
           }
         }
       }
