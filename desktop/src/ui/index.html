@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>MANDELBROT · 精密分形观测台</title>
+<meta name="description" content="MANDELBROT — a high-precision fractal observatory. Arbitrary-depth Mandelbrot, Julia, Newton and custom complex maps rendered with perturbation theory, series approximation and a WebAssembly kernel." />
+<meta name="theme-color" content="#08090b" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#e9ebef" media="(prefers-color-scheme: light)" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta property="og:title" content="MANDELBROT · 精密分形观测台" />
+<meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="css/app.css?v=5" />
+</head>
+<body class="booting">
+<canvas id="fractal"></canvas>
+
+<!-- Where the Julia seed sits in the Mandelbrot plane.  Only shown once the
+     seed has been pinned, so the window always says which c it is showing. -->
+<div class="julia-mark" id="julia-mark" hidden><i></i><b></b></div>
+<div class="julia-pick-hint" id="julia-pick-hint" hidden data-i18n="juliaPickHint">点击画布上任意一点固定朱丽叶种子</div>
+
+<!-- 启动加载层（完成后淡出） -->
+<div class="boot" id="boot">
+  <div class="boot-inner">
+    <div class="boot-mark">
+      <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="0.9">
+        <circle cx="9" cy="12" r="7"/>
+        <circle cx="16" cy="12" r="4.2"/>
+        <circle cx="16" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+      </svg>
+    </div>
+    <div class="boot-title">MANDELBROT</div>
+    <div class="boot-sub" data-i18n="appSub">精密分形观测台</div>
+    <div class="boot-bar"><div class="boot-fill" id="boot-fill"></div></div>
+    <div class="boot-meta">
+      <span id="boot-status" class="mono" data-i18n="bootInit">初始化</span>
+      <span id="boot-pct" class="mono">0%</span>
+    </div>
+
+    <!-- 启动诊断：只有在无法启动时才出现（见页面底部内联守卫脚本） -->
+    <div class="boot-note" id="boot-note" hidden>
+      <div class="boot-note-head">
+        <span class="boot-note-dot" id="boot-note-dot"></span>
+        <span id="boot-note-title">需要以服务方式打开</span>
+      </div>
+      <p id="boot-note-desc"></p>
+      <div class="boot-cmd" id="boot-note-cmdwrap" hidden>
+        <code id="boot-note-cmd"></code>
+        <button class="boot-copy" id="boot-note-copy" type="button">复制</button>
+      </div>
+      <div class="boot-note-actions">
+        <button class="btn primary" id="boot-note-primary" type="button">我已启动，重新加载</button>
+        <a class="btn ghost" id="boot-note-docs" href="https://github.com/xiaoxu4452/mandelbrot-view" target="_blank" rel="noopener">文档 / Docs</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 顶栏 -->
+<header class="topbar glass" id="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><circle cx="9" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="16" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="16" cy="12" r="1.5" fill="currentColor"/></svg>
+    </span>
+    <span class="brand-name">MANDELBROT</span>
+    <span class="brand-sub" data-i18n="appSub">精密分形观测台</span>
+  </div>
+
+  <nav class="topnav">
+    <div class="menu-wrap">
+      <button class="topbtn" id="btn-sets"><span data-i18n="sets">集</span><svg class="chev" viewBox="0 0 10 6" width="10" height="6"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
+      <div class="dropdown glass" id="menu-sets" hidden>
+        <button data-mode="m"><b>曼德勃罗集</b><small>Mandelbrot</small></button>
+        <button data-mode="j"><b>朱丽叶集</b><small>Julia</small></button>
+      </div>
+    </div>
+    <button class="topbtn" id="btn-presets" title="预设库 / Preset library (P)"><span data-i18n="presets">预设</span><span class="badge" id="preset-badge" hidden></span></button>
+    <button class="topbtn" id="btn-formula-top" title="公式编辑器 / Formula editor (F)"><span data-i18n="formula">公式</span></button>
+  </nav>
+
+  <div class="top-spacer"></div>
+
+  <div class="top-right">
+    <div class="chip" id="chip-precision" title="当前数值精度">— bit</div>
+    <button class="topbtn console-toggle on" id="btn-console" aria-expanded="true" aria-controls="panel" title="控制台 / Console (P)">
+      <svg class="ct-ico" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3">
+        <rect x="1.4" y="2.6" width="13.2" height="10.8" rx="2"/>
+        <path d="M1.4 5.4h13.2M5.2 8.2h5.6M5.2 10.4h3.4"/>
+      </svg>
+      <span data-i18n="console" class="ct-lbl">控制台</span>
+    </button>
+    <div class="menu-wrap">
+      <button class="iconbtn" id="btn-settings" title="设置">
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.3">
+          <circle cx="10" cy="10" r="2.6"/>
+          <path d="M10 2.2v2M10 15.8v2M2.2 10h2M15.8 10h2M4.5 4.5l1.4 1.4M14.1 14.1l1.4 1.4M15.5 4.5l-1.4 1.4M5.9 14.1l-1.4 1.4"/>
+        </svg>
+      </button>
+      <div class="dropdown glass right" id="menu-settings" hidden>
+        <div class="dd-group">
+          <span class="dd-label" data-i18n="language">语言</span>
+          <div class="segment mini" id="seg-lang">
+            <button data-lang="zh" class="on">中文</button>
+            <button data-lang="en">EN</button>
+          </div>
+        </div>
+        <div class="dd-group">
+          <span class="dd-label" data-i18n="theme">主题</span>
+          <div class="segment mini" id="seg-theme">
+            <button data-theme="dark" class="on" data-i18n="dark">深色</button>
+            <button data-theme="light" data-i18n="light">浅色</button>
+          </div>
+        </div>
+        <div class="dd-sep"></div>
+        <label class="dd-check"><span data-i18n="renderScale">渲染分辨率</span>
+          <select id="sel-scale" class="mini-select">
+            <option value="1" data-i18n="rsCss">1× CSS（最快）</option>
+            <option value="1.5" data-i18n="rsMid">1.5×</option>
+            <option value="2" data-i18n="rsPhys">2×（物理像素）</option>
+          </select>
+        </label>
+        <label class="dd-check"><span data-i18n="aaRender">抗锯齿（超采样）</span>
+          <select id="sel-aa" class="mini-select">
+            <option value="1" data-i18n="aaOff">关</option>
+            <option value="2" data-i18n="aaHigh">原版 High res（4 采样）</option>
+            <option value="3" data-i18n="aa9">3×（9 采样）</option>
+          </select>
+        </label>
+        <div class="dd-note" id="cfg-note" hidden></div>
+        <button class="dd-item" id="btn-core" data-i18n="coreTitle">渲染核心</button>
+        <button class="dd-item" id="btn-fullscreen" data-i18n="scFull">全屏</button>
+        <button class="dd-item" id="btn-about" data-i18n="about">关于</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- 控制台 -->
+<aside class="panel glass" id="panel" aria-label="控制台">
+  <div class="panel-grab" id="panel-grab" aria-hidden="true"><span></span></div>
+  <div class="panel-head" id="panel-drag">
+    <span class="panel-title" data-i18n="panelTitle">控制台</span>
+    <div class="panel-head-actions">
+      <button class="iconbtn tiny" id="btn-panel-collapse" title="最小化到顶栏 / Minimize to top bar">
+        <svg viewBox="0 0 12 12" width="11" height="11"><path d="M2 7.5h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="panel-body" id="panel-body">
+    <!-- The reference's second VIEWPORT (00406070.c): a Julia set for the
+         Mandelbrot point under the cursor.  It scrolls with the settings below
+         it, and clicking it opens that set in the main view (the title then
+         turns into the way back).  Its own WebGL surface is compiled from the
+         SAME shader as the main view, so a palette change recolours both. -->
+    <section class="grp julia-dock" id="julia-preview">
+      <div class="julia-dock-head" id="julia-dock-head">
+        <span class="julia-dot"></span>
+        <span class="julia-dock-title" id="julia-dock-title" data-i18n="juliaTitle">朱丽叶集</span>
+        <button class="julia-back" id="btn-julia-back" type="button" hidden>
+          <svg viewBox="0 0 12 12" width="10" height="10"><path d="M7.5 2.5 4 6l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-i18n="juliaBack">返回</span>
+        </button>
+        <button class="julia-btn" id="btn-julia-size" type="button" data-i18n="juliaSize">放大</button>
+      </div>
+      <div class="julia-frame" id="julia-frame">
+        <canvas id="julia-canvas" width="168" height="168" title="打开朱丽叶集 / Open this Julia set"></canvas>
+      </div>
+      <div class="julia-seed mono" id="julia-seed">c = —</div>
+      <div class="julia-dock-ctl">
+        <div class="btnrow">
+          <button class="btn tiny" id="btn-julia-pick" type="button" data-i18n="juliaPick">在画布选点</button>
+          <button class="btn tiny" id="btn-julia-center" type="button" data-i18n="juliaCenter">跟随主视点</button>
+        </div>
+        <label class="chk"><input type="checkbox" id="chk-julia-follow" checked/><span data-i18n="juliaFollow">跟随鼠标换种子</span></label>
+        <div class="row tight">
+          <label data-i18n="juliaZoom">缩放</label>
+          <input type="range" id="rng-julia-zoom" min="0" max="100" step="1" value="12"/>
+          <span class="val mono" id="val-julia-zoom">0.50</span>
+        </div>
+        <div class="row tight">
+          <label data-i18n="juliaRot">旋转</label>
+          <input type="range" id="rng-julia-rot" min="-180" max="180" step="1" value="-90"/>
+          <span class="val mono" id="val-julia-rot">-90°</span>
+        </div>
+      </div>
+    </section>
+    <section class="grp">
+      <h4 data-i18n="target">观测对象</h4>
+      <div class="segment" id="seg-mode">
+        <button data-mode="m" class="on" data-i18n="modeM">曼德勃罗集</button>
+        <button data-mode="j" data-i18n="modeJ">朱丽叶集</button>
+      </div>
+    </section>
+    <section class="grp">
+      <h4>集合族</h4>
+      <div class="row">
+        <label>公式</label>
+        <select id="sel-family" class="ctl">
+          <option value="mandelbrot">z² + c</option>
+          <option value="multibrot">zᵖ + c</option>
+          <option value="tricorn">z̄² + c（三叉戟）</option>
+          <option value="burningship">|Re|,|Im|（燃烧船）</option>
+          <option value="celtic">凯尔特</option>
+          <option value="perpendicular">垂直</option>
+          <option value="custom">自定义公式…</option>
+        </select>
+      </div>
+      <div class="row" id="row-power" hidden>
+        <label>幂次 p</label>
+        <input id="num-power" class="ctl" type="number" min="2" max="8" step="1" value="3"/>
+      </div>
+      <div class="row" id="row-formula">
+        <button class="btn tiny" id="btn-formula-editor" data-i18n="formulaOpen">编辑公式…</button>
+        <code class="mono" id="formula-current">z^2 + c</code>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="viewAngle">视角</h4>
+      <div class="row">
+        <label data-i18n="rotation">旋转</label>
+        <input type="range" id="rng-rot" min="-180" max="180" step="1" value="0"/>
+        <input class="ctl mono num" id="in-rot" type="number" min="-180" max="180" step="1" value="0"/>
+      </div>
+      <div class="row two">
+        <button class="btn tiny" id="btn-rot-zero" data-i18n="rotZero">归零</button>
+        <button class="btn tiny" id="btn-rot-quarter" data-i18n="rotQuarter">转 90°</button>
+      </div>
+    </section>
+
+    <section class="grp" id="grp-julia" hidden>
+      <h4 data-i18n="juliaSeed">朱丽叶常数 c</h4>
+      <div class="row two">
+        <label data-i18n="real">实部</label>
+        <input class="ctl mono" id="in-jr" value="-0.7435" spellcheck="false"/>
+      </div>
+      <div class="row two">
+        <label data-i18n="imag">虚部</label>
+        <input class="ctl mono" id="in-ji" value="0.1314" spellcheck="false"/>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="params">参数</h4>
+      <div class="row">
+        <label data-i18n="iterations">迭代</label>
+        <input type="range" id="rng-iter" min="100" max="200000" step="100" value="600"/>
+        <input class="ctl mono num" id="in-iter" value="600"/>
+      </div>
+      <label class="check"><input type="checkbox" id="chk-autoiter" checked/><span data-i18n="autoIter">自动</span></label>
+      <div class="row" id="row-iterrank">
+        <label data-i18n="iterRank">自动精度</label>
+        <input type="range" id="rng-iterrank" min="1" max="100" step="1" value="100"/>
+        <input class="ctl mono num" id="in-iterrank" value="100"/>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="render">渲染</h4>
+      <div class="row">
+        <label data-i18n="precision">精度</label>
+        <select id="sel-bits" class="ctl">
+          <option value="auto" data-i18n="precisionAuto">自动</option>
+          <option value="64">64-bit (double)</option>
+          <option value="128">128-bit</option>
+          <option value="256">256-bit</option>
+          <option value="512">512-bit</option>
+          <option value="1024">1024-bit</option>
+          <option value="2048">2048-bit</option>
+          <option value="4096">4096-bit (10⁻¹⁰⁰⁰)</option>
+        </select>
+      </div>
+      <div class="row">
+        <label data-i18n="palette">配色</label>
+        <select id="sel-palette" class="ctl"></select>
+        <button class="iconbtn" id="btn-palette-edit" title="调色盘">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
+            <circle cx="4.4" cy="5" r="2.1"/><circle cx="9.6" cy="3.4" r="2.1"/>
+            <circle cx="11.6" cy="9.4" r="2.1"/><circle cx="6" cy="11.6" r="2.1"/>
+          </svg>
+        </button>
+      </div>
+      <div class="grad-ed" id="grad-ed">
+        <!-- Three full-width ramps stacked vertically: each one is one third of
+             the palette stretched to the full width, so a stop can be placed
+             three times more precisely than on a single bar. -->
+        <div class="grad-stack" id="grad-stack">
+          <div class="grad-lane" data-zone="1">
+            <div class="grad-bar" data-zone="1" title="点击空白处添加色标，拖动色标改变位置，双击删除">
+              <div class="grad-fill"></div>
+              <div class="grad-handles"></div>
+            </div>
+          </div>
+          <div class="grad-lane" data-zone="2">
+            <div class="grad-bar" data-zone="2" title="点击空白处添加色标，拖动色标改变位置，双击删除">
+              <div class="grad-fill"></div>
+              <div class="grad-handles"></div>
+            </div>
+          </div>
+          <div class="grad-lane" data-zone="3">
+            <div class="grad-bar" data-zone="3" title="点击空白处添加色标，拖动色标改变位置，双击删除">
+              <div class="grad-fill"></div>
+              <div class="grad-handles"></div>
+            </div>
+          </div>
+        </div>
+        <div class="grad-row">
+          <input type="color" id="grad-color" class="grad-color" value="#ffffff"/>
+          <input class="ctl mono num" id="grad-pos" type="number" min="0" max="1" step="0.001" value="0"/>
+          <button class="btn tiny" id="grad-add" data-i18n="gradAdd">加色标</button>
+          <button class="btn tiny" id="grad-del" data-i18n="gradDel">删色标</button>
+          <button class="btn tiny" id="grad-reset" data-i18n="gradReset">还原</button>
+        </div>
+      </div>
+      <div class="row">
+        <label data-i18n="scheme">着色</label>
+        <select id="sel-scheme" class="ctl">
+          <option value="bands" data-i18n="schemeBands">平滑（Smooth）</option>
+          <option value="iteration" data-i18n="schemeIteration">迭代（Iteration）</option>
+          <option value="levels" data-i18n="schemeLevels">迭代 + 轮廓</option>
+          <option value="distance" data-i18n="schemeDistance">轮廓（Distance）</option>
+        </select>
+      </div>
+      <!-- Orbit traps.  Everything above colours by the escape count; these
+           colour by where the orbit *went*, which is what draws filigree that
+           keeps its structure at any zoom.  The statistic is accumulated by
+           the same iteration pass, so this costs no extra render. -->
+      <div class="row">
+        <label data-i18n="trap">花纹</label>
+        <select id="sel-trap" class="ctl">
+          <option value="0" data-i18n="trapOff">关闭</option>
+          <option value="1" data-i18n="trapPoint">点陷阱</option>
+          <option value="2" data-i18n="trapLine">线陷阱</option>
+          <option value="3" data-i18n="trapCircle">圆陷阱</option>
+          <option value="4" data-i18n="trapTia">三角平均（TIA）</option>
+        </select>
+      </div>
+      <!-- Trap density.  Both knobs live only in the fragment shader, so
+           moving them repaints the field that is already on the GPU: no
+           iteration pass, no sampling, one draw call. -->
+      <div id="trap-params" hidden>
+        <div class="row tight">
+          <label data-i18n="trapGain">收紧</label>
+          <input type="range" id="rng-trapgain" min="0.02" max="1" step="0.005" value="0.45"/>
+          <span class="val mono" id="val-trapgain">0.45</span>
+        </div>
+        <div class="row tight">
+          <label data-i18n="trapRings">环数</label>
+          <input type="range" id="rng-traprings" min="0" max="1" step="0.005" value="0.40"/>
+          <span class="val mono" id="val-traprings">0.40</span>
+        </div>
+      </div>
+      <!-- Official GLSL schemes declare `nparam` sliders in their JSON.
+           Those params.param[] controls are generated here, exactly one row
+           each.  Changing one re-shades the cached iteration field, so it
+           costs no re-iteration. -->
+      <div id="scheme-params" class="scheme-params" hidden></div>
+      <div class="row">
+        <label data-i18n="phase">相位</label>
+        <input type="range" id="rng-offset" min="0" max="1" step="0.005" value="0"/>
+        <span class="val mono" id="val-offset">0.00</span>
+      </div>
+      <div class="tone-grid">
+        <div class="row tight"><label data-i18n="brightness">亮度</label>
+          <input type="range" id="rng-bri" min="0.2" max="2" step="0.01" value="1"/>
+          <span class="val mono" id="val-bri">1.00</span></div>
+        <div class="row tight gain"><label class="gain-lab">R</label>
+          <input type="range" id="rng-gr" min="0.5" max="1.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gr">1.00</span></div>
+        <div class="row tight gain"><label class="gain-lab">G</label>
+          <input type="range" id="rng-gg" min="0.5" max="1.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gg">1.00</span></div>
+        <div class="row tight gain"><label class="gain-lab">B</label>
+          <input type="range" id="rng-gb" min="0.5" max="1.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gb">1.00</span></div>
+        <button class="btn tiny" id="btn-tone-reset" data-i18n="toneReset">重置色调</button>
+      </div>
+    </section>
+
+    <section class="grp">
+      <h4 data-i18n="view">视图</h4>
+      <div class="kv"><span data-i18n="center">中心</span><code id="kv-center">—</code></div>
+      <div class="kv"><span data-i18n="zoom">缩放</span><code id="kv-zoom">—</code></div>
+      <div class="btnrow">
+        <button class="btn" id="btn-reset" data-i18n="reset">重置</button>
+        <button class="btn" id="btn-fit" data-i18n="fit">适应窗口</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn" id="btn-link" data-i18n="copyLink">复制链接</button>
+        <button class="btn" id="btn-png" data-i18n="exportPng">导出 PNG</button>
+      </div>
+    </section>
+  </div>
+</aside>
+
+<!-- 状态栏 -->
+<div class="hud" id="hud">
+  <div class="hud-line"><span id="hud-depth">—</span><span class="dot"></span><span id="hud-center" class="mono">—</span></div>
+  <div class="hud-line dim"><span id="hud-engine">—</span><span class="dot"></span><span id="hud-progress">—</span></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<div class="modal-root" id="modal-root" hidden>
+  <div class="modal-scrim" data-close></div>
+  <div class="modal glass" id="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div>
+        <h3 id="modal-title">—</h3>
+        <p id="modal-sub" class="sub">—</p>
+      </div>
+      <button class="iconbtn" data-close title="关闭">
+        <svg viewBox="0 0 14 14" width="13" height="13"><path d="M2 2l10 10M12 2L2 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot" id="modal-foot"></div>
+  </div>
+</div>
+
+<script type="module" src="js/app.js?v=5"></script>
+
+<!-- ==================================================================
+     Bootstrap guard (classic script — runs even when ES modules fail).
+     ES modules and Web Workers are blocked on the file:// origin, so a
+     double-clicked index.html can never start the render pipeline.
+     Instead of hanging at "0%", we diagnose the failure and explain the
+     one-line fix.  app.js sets window.__mbModuleLoaded as soon as it runs.
+     ================================================================== -->
+<script>
+(function () {
+  'use strict';
+  var zh = /^zh/i.test(navigator.language || 'zh');
+  var note = document.getElementById('boot-note');
+  var titleEl = document.getElementById('boot-note-title');
+  var descEl = document.getElementById('boot-note-desc');
+  var cmdWrap = document.getElementById('boot-note-cmdwrap');
+  var cmdEl = document.getElementById('boot-note-cmd');
+  var copyBtn = document.getElementById('boot-note-copy');
+  var primary = document.getElementById('boot-note-primary');
+  var dot = document.getElementById('boot-note-dot');
+  var statusEl = document.getElementById('boot-status');
+  var pctEl = document.getElementById('boot-pct');
+  var bar = document.querySelector('.boot-bar');
+  var shown = false;
+
+  function cmd() {
+    return location.protocol === 'file:' && /^win/i.test(navigator.platform || '')
+      ? 'start.bat'
+      : 'python3 -m http.server 8777';
+  }
+
+  function show(opts) {
+    if (!note || shown) return;
+    shown = true;
+    note.hidden = false;
+    document.getElementById('boot').classList.add('failed');
+    if (opts.tone === 'error' && dot) dot.classList.add('bad');
+    if (titleEl) titleEl.textContent = opts.title;
+    if (descEl) descEl.innerHTML = opts.desc;
+    if (cmdWrap && cmdEl) {
+      if (opts.cmd) { cmdWrap.hidden = false; cmdEl.textContent = opts.cmd; }
+      else { cmdWrap.hidden = true; }
+    }
+    if (primary && opts.primary) primary.textContent = opts.primary;
+    if (statusEl) statusEl.textContent = opts.status || '';
+    if (pctEl) pctEl.textContent = '';
+    if (bar) bar.style.display = 'none';
+  }
+
+  if (copyBtn) {
+    copyBtn.addEventListener('click', function () {
+      var text = cmdEl ? cmdEl.textContent : cmd();
+      (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+        .then(function () { copyBtn.textContent = zh ? '已复制' : 'Copied'; })
+        .catch(function () { copyBtn.textContent = zh ? '请手动复制' : 'Copy manually'; });
+    });
+  }
+  if (primary) primary.addEventListener('click', function () { location.reload(); });
+
+  // Expose for app.js (fatal runtime errors, seen from inside the module).
+  window.__mbBootFail = show;
+
+  // 1) file:// — modules + workers are hard-blocked by the origin policy.
+  if (location.protocol === 'file:') {
+    setTimeout(function () {
+      show({
+        title: zh ? '需要以本地服务方式打开' : 'A local server is required',
+        desc: zh
+          ? '浏览器禁止 <code>file://</code> 页面加载 ES 模块与 Web Worker，因此渲染内核无法启动。'
+            + '在项目目录双击 <code>start.bat</code>（或执行下面的命令），然后访问 '
+            + '<code>http://127.0.0.1:8777</code>。'
+          : 'Browsers block ES modules and Web Workers on <code>file://</code> origins, so the render core cannot start. '
+            + 'Run <code>start.bat</code> (or the command below) inside the project folder, then open '
+            + '<code>http://127.0.0.1:8777</code>.',
+        cmd: cmd(),
+        primary: zh ? '重新加载' : 'Reload',
+        status: zh ? '启动中止：来源策略' : 'Halted: origin policy'
+      });
+    }, 80);
+    return;
+  }
+
+  // 2) Module never executed (404 / syntax error / blocked request).
+  window.__mbBootWatch = setTimeout(function () {
+    if (window.__mbModuleLoaded) return;
+    show({
+      title: zh ? '内核脚本未能加载' : 'Core scripts failed to load',
+      tone: 'error',
+      desc: zh
+        ? '页面 9 秒内没有进入启动流程，通常是脚本 404 或被网络策略拦截。'
+          + '请确认通过 <code>http://127.0.0.1:8777</code> 或 GitHub Pages 访问，并按 F12 查看控制台。'
+        : 'The boot sequence never started within 9 s — usually a 404 or a blocked script. '
+          + 'Make sure the page is served over <code>http://127.0.0.1:8777</code> or GitHub Pages, then check the console (F12).',
+      primary: zh ? '重新加载' : 'Reload',
+      status: zh ? '启动中止：脚本未加载' : 'Halted: script not loaded'
+    });
+  }, 9000);
+
+  // 3) Uncaught errors during module evaluation.
+  window.addEventListener('error', function (e) {
+    if (window.__mbModuleLoaded) return;
+    if (!e || !e.filename || e.filename.indexOf('.js') < 0) return;
+    show({
+      title: zh ? '内核初始化失败' : 'Core initialization failed',
+      tone: 'error',
+      desc: (zh ? '脚本抛出异常：' : 'The core script threw: ') + '<code>' + String(e.message || 'error').slice(0, 180) + '</code>',
+      primary: zh ? '重新加载' : 'Reload',
+      status: zh ? '启动中止：异常' : 'Halted: exception'
+    });
+  });
+})();
+</script>
+</body>
+</html>

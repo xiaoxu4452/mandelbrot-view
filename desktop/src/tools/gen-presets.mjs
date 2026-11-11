@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+/* ------------------------------------------------------------------
+ * gen-presets.mjs — build the preset library that ships *inside* the app.
+ *
+ * The library is the reference program's own `examples/*.json`: one entry per
+ * file, plus a name pair and the set it belongs to.  That reverses the previous
+ * generator, which multiplied a few dozen anchors by eight colour variants.
+ * Those 282 cards framed the same eleven pictures with different tints — the
+ * reason the grid looked homogeneous.  Every file below is a different picture:
+ * its own zoom (up to 1e74), rotation, Julia seed and colour recipe.
+ *
+ * `preset-bases.json` is a vendored copy of those files (the reference
+ * distribution is not part of this repository), with every digit of the decimal
+ * coordinates and zoom strings kept verbatim.
+ *
+ * Output: ../ui/js/presets-data.js — one `export const PRESET_LIB = [...]`.
+ *
+ * The library is embedded rather than dropped beside the exe on purpose: a
+ * preset is data the program owns, not a user document.  Being in the page
+ * means it travels with the single binary, needs no folder scan, cannot go
+ * missing, and the language switch is a field swap (`name` / `nameZh`).
+ * Import and export still speak the reference's JSON.
+ * ------------------------------------------------------------------ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, '..', '..');
+const bases = JSON.parse(fs.readFileSync(path.join(here, 'preset-bases.json'), 'utf8'));
+const outFile = path.join(root, 'src', 'ui', 'js', 'presets-data.js');
+
+/* The reference's own default colour table.
+ *
+ * A file that omits `parameters.colors` does not mean "no colour" — the
+ * program fills the 20-slot table with these three terms, and that is why so
+ * many of its shipped pictures are saturated red/green/blue with hard-edged
+ * blobs.  Two of the examples (Retinajulia 1, Retinamandelbrot 3) spell the
+ * table out, so the values below are read straight from those files rather
+ * than invented.  Without this a palette-less preset renders black. */
+const DEFAULT_COLORS = [
+  { rgb: [1, 0, 0], initial: -1.0, frequency: -2.1202635765075684 },
+  { rgb: [0, 1, 0], initial: -1.5, frequency: -1.1363141536712646 },
+  { rgb: [0, 0, 1], initial: -0.5, frequency: -0.023268627002835274 }
+];
+
+/* Display zoom overrides.
+ *
+ * Four shipped files record a viewpoint much deeper than the picture that
+ * travels with them.  At their own zoom the whole frame lands inside one
+ * connected component — measured with the bench harness: interior fraction
+ * 1.00 and a single period for every pixel.  The reference's interior rule is
+ * `pal(-iter + 0.5)`, i.e. colour by period, so one period means one flat
+ * colour, and no amount of iterating will add structure.
+ *
+ * The replacement decades below were not guessed: each candidate decade was
+ * rendered and the one whose interior fraction lands between 0.2 and 0.8 was
+ * kept, i.e. the decade where the frame actually contains the boundary the
+ * accompanying JPEG shows.  Everything else about the preset (centre,
+ * rotation, colour recipe, Julia seed) is untouched.
+ */
+const DISPLAY_ZOOM = {
+  'retinamandelbrot-example-4':  '0.189289e27',   // 1e26: bnd 0.32
+  'retinamandelbrot-example-7':  '0.210467e3',    // 1e2 : bnd 0.36
+  'retinamandelbrot-example-8':  '0.519927e19',   // 1e18: bnd 0.43
+  'retinamandelbrot-example-14': '0.257912e13'    // 1e12: bnd 0.77
+};
+
+const items = [];
+const seen = new Set();
+for (const b of bases) {
+  const src = b.json || {};
+  const id = b.id;
+  if (!id || seen.has(id)) continue;
+  seen.add(id);
+
+  const p = { ...(src.parameters || {}) };
+  const julia = b.set === 'j';
+  /* The shipped files say `juliamode: 2` (the reference's full-screen Julia).
+   * `flags.julia` is the switch the grid reads when it decides which tab a card
+   * belongs to, so make the two agree instead of relying on the older check. */
+  if (julia && p.juliamode == null) p.juliamode = 2;
+  /* Inherit the program's default colour table when the file does not carry
+   * one — the reference behaves the same way. */
+  if (!Array.isArray(p.colors) || !p.colors.length) p.colors = DEFAULT_COLORS;
+
+  items.push({
+    ...src,
+    format: 'retinamandelbrot/preset-1',
+    id,
+    name: b.name,
+    nameZh: b.nameZh,
+    /* The grid filters by set: "m" = 曼德勃罗, "j" = 朱丽叶.  The old
+     * palette-variant categories (hue/density/tone/…) are gone. */
+    category: julia ? 'j' : 'm',
+    flags: { ...(src.flags || {}), julia, inverse: p.inverse === true },
+    /* `showZoom` is ours, not the reference's: it is the decade that actually
+     * frames the picture, used instead of `zoom` when the two disagree.  It is
+     * absent for every file where they agree. */
+    showZoom: DISPLAY_ZOOM[id],
+    parameters: p
+  });
+}
+
+const body =
+  '/* Generated by tools/gen-presets.mjs — do not edit by hand.\n' +
+  ' * One entry per reference example: its own viewpoint, rotation, Julia seed\n' +
+  ' * and colour recipe.  `category` is the set ("m" = Mandelbrot, "j" = Julia).\n' +
+  ' */\n' +
+  'export const PRESET_LIB = ' + JSON.stringify(items, null, 0) + ';\n' +
+  'export const PRESET_COUNT = ' + items.length + ';\n';
+
+fs.writeFileSync(outFile, body, 'utf8');
+const kb = (Buffer.byteLength(body) / 1024).toFixed(0);
+console.log(`[presets] ${items.length} presets, ${kb} KB -> src/ui/js/presets-data.js`);

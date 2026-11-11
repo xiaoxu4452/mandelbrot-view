@@ -1,0 +1,978 @@
+[
+{
+"id": "amethyst-crown",
+"name": "Amethyst Crown",
+"nameZh": "紫晶皇冠",
+"set": "j",
+"json": {
+"x": "-0.7454280003322500000000007785600000000000",
+"rotation": 0.0,
+"julia_mx": "-0.7454280000000005784930000000000000000000",
+"y": "0.1130090000000000000000000000000000000000",
+"julia_y": "0.1200000000000000000000000000000000000000",
+"julia_x": "-0.7454280000000000000000000000000000000000",
+"julia_zoom": "0.800000e2",
+"zoom": "0.100000e5",
+"julia_my": "0.1130090000000000000000000000000000000000",
+"julia_rotation": 0.0,
+"parameters": {
+"colors": [
+{
+"rgb": [
+0.55,
+0.25,
+0.85
+],
+"frequency": -2.0
+},
+{
+"rgb": [
+1.0,
+0.75,
+0.15
+],
+"initial": -0.3,
+"frequency": -1.5
+}
+],
+"juliamode": 2,
+"brightnessinfinite": 0.85,
+"colorscheme": {
+"codegl": "vec3 amethyst(int iter)\n{\n    float f = float(iter);\n    float t = params.time * 0.25;\n    \n    float phase = f * 0.045 + t * 0.2;\n    float breathe = 0.5 + 0.5 * sin(phase);\n    \n    vec3 deepPurple = vec3(0.25, 0.05, 0.35);\n    vec3 orchid = vec3(0.75, 0.45, 0.95);\n    vec3 gold = vec3(1.0, 0.78, 0.25);\n    \n    vec3 c = mix(deepPurple, orchid, breathe);\n    \n    float sparkle = pow(abs(sin(f * 0.18 - t * 1.5)), 16.0);\n    c += gold * sparkle * 0.6;\n    \n    float vein = pow(0.5 + 0.5 * cos(f * 0.07 + t * 0.6), 3.0);\n    c = mix(c, params.color[0].c, vein * 0.4);\n    \n    if(int(mod(f, 7.0)) == 0)\n        c = mix(c, params.color[1].c, 0.45);\n    \n    c *= params.brightnessinfinite;\n    return c;\n}\n\nvec4 color(Data data)\n{\n    vec3 color;\n    if(data.iter <= 0)\n        color = amethyst(-data.iter);\n    else\n        color = vec3(0.12, 0.02, 0.18);\n    \n    vec3 color2;\n    float rr = data.dist * exp(5.0 * params.param[0]);\n    if(rr < 1.0 && rr != 0.0)\n    {\n        float angle = rr * 4.5 - params.time * 0.4;\n        vec3 rimPurple = vec3(0.65, 0.40, 0.90);\n        vec3 rimPink = vec3(0.95, 0.35, 0.60);\n        vec3 rimGold = vec3(1.0, 0.80, 0.30);\n        \n        float w1 = 0.5 + 0.5 * cos(angle);\n        float w2 = 0.5 + 0.5 * cos(angle + 2.094);\n        \n        color2 = mix(rimPurple, rimPink, w1);\n        color2 = mix(color2, rimGold, w2 * 0.5) * (1.0 - rr);\n    }\n    else\n        color2 = vec3(0.0, 0.0, 0.0);\n    \n    vec3 c = color + color2 * params.brightnessfinite;\n    return vec4(c, 1.0);\n}\n",
+"code": "\n\nfloat3 amethyst(constant Params &params, int iter)\n{\n    float f = float(iter);\n    float t = params.time * 0.25;\n    \n    float phase = f * 0.045 + t * 0.2;\n    float breathe = 0.5 + 0.5 * sin(phase);\n    \n    float3 deepPurple = float3(0.25, 0.05, 0.35);\n    float3 orchid = float3(0.75, 0.45, 0.95);\n    float3 gold = float3(1.0, 0.78, 0.25);\n    \n    float3 c = mix(deepPurple, orchid, breathe);\n    \n    float sparkle = pow(abs(sin(f * 0.18 - t * 1.5)), 16.0);\n    c += gold * sparkle * 0.6;\n    \n    float vein = pow(0.5 + 0.5 * cos(f * 0.07 + t * 0.6), 3.0);\n    c = mix(c, params.color[0].c, vein * 0.4);\n    \n    if(int(fmod(f, 7.0)) == 0)\n        c = mix(c, params.color[1].c, 0.45);\n    \n    c *= params.brightnessinfinite;\n    return c;\n}\n\nfloat4 color(constant Params &params, Data input)\n{\n    float3 color;\n    if(input.iter <= 0)\n        color = amethyst(params, -input.iter);\n    else\n        color = float3(0.12f, 0.02f, 0.18f);\n    \n    float3 color2;\n    float rr = input.dist * exp(5.0f * params.param[0]);\n    if(rr < 1.0f && rr != 0.0f)\n    {\n        float angle = rr * 4.5f - params.time * 0.4f;\n        float3 rimPurple = float3(0.65, 0.40, 0.90);\n        float3 rimPink = float3(0.95, 0.35, 0.60);\n        float3 rimGold = float3(1.0, 0.80, 0.30);\n        \n        float w1 = 0.5f + 0.5f * cos(angle);\n        float w2 = 0.5f + 0.5f * cos(angle + 2.094f);\n        \n        color2 = mix(rimPurple, rimPink, w1);\n        color2 = mix(color2, rimGold, w2 * 0.5f) * (1.0f - rr);\n    }\n    else\n        color2 = float3(0.0f, 0.0f, 0.0f);\n    \n    float3 c = color + color2 * params.brightnessfinite;\n    return float4(c, 1.0f);\n}\n",
+"builtin": 0,
+"samples": 2,
+"channels": 17,
+"name": "Amethyst Crown",
+"nparam": 1
+}
+}
+}
+},
+{
+"id": "highprecision-rainbow",
+"name": "High Precision Rainbow",
+"nameZh": "高精度彩虹",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000000000000000",
+"rotation": -1.312199924225269,
+"x": "-0.784554430417046686696000000000",
+"y": "-0.086609416904714283506300000000",
+"zoom": "0.695327000000000000",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"colorscheme": {
+"codegl": "vec4 color(Data data)\n{\n    vec3 c;\n    highp float iterVal = highp float(data.iter);\n    if(abs(iterVal) > highp float(params.param[0]) * 100.0){\n        return vec4(0.0, 0.0, 0.0, 1.0);\n    }\n    highp float t = iterVal * 0.075;\n    if(data.iter >= 0){\n        c = vec3(sin(t), sin(t + 2.125), sin(t + 4.25)) * 0.48 + 0.52;\n    } else {\n        c = vec3(sin(-t), sin(-t + 2.125), sin(-t + 4.25)) * 0.48 + 0.52;\n    }\n    return vec4(c, 1.0);\n}\n",
+"code": "float4 color(constant Params &params, Data input)\n{\n    float3 c;\n    double iterVal = (double)input.iter;\n    if(fabs(iterVal) > (double)params.param[0] * 100.0){\n        return float4(0.0, 0.0, 0.0, 1.0f);\n    }\n    double t = iterVal * 0.075;\n    if(input.iter >= 0){\n        c = float3((float)sin(t), (float)sin(t + 2.125), (float)sin(t + 4.25)) * 0.48f + 0.52f;\n    } else {\n        c = float3((float)sin(-t), (float)sin(-t + 2.125), (float)sin(-t + 4.25)) * 0.48f + 0.52f;\n    }\n    return float4(c, 1.0f);\n}\n",
+"builtin": 0,
+"samples": 4,
+"channels": 1,
+"name": "High Precision Rainbow",
+"nparam": 1
+},
+"custom": [
+0.1170731708407402
+],
+"frequency": -0.512499988079071
+}
+}
+},
+{
+"id": "nebula-bloom",
+"name": "Nebula Bloom",
+"nameZh": "星云绽放",
+"set": "j",
+"json": {
+"x": "-0.7454280000000000000000000000000000000000",
+"rotation": 0.0,
+"julia_mx": "-0.7454280000000000000000000000000000000000",
+"y": "0.1130090000000000000000000000000000000000",
+"julia_y": "0.1200000000000000000000000000000000000000",
+"julia_x": "-0.7454280000000000000000000000000000000000",
+"julia_zoom": "0.800000e2",
+"zoom": "0.100000e5",
+"julia_my": "0.1130090000000000000000000000000000000000",
+"julia_rotation": 0.0,
+"parameters": {
+"colors": [
+{
+"rgb": [
+0.0,
+0.85,
+1.0
+],
+"frequency": -1.8
+},
+{
+"rgb": [
+1.0,
+0.15,
+0.6
+],
+"initial": -0.4,
+"frequency": -2.2
+}
+],
+"juliamode": 2,
+"brightnessinfinite": 0.9,
+"colorscheme": {
+"codegl": "vec3 hsv2rgb(vec3 c)\n{\n    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);\n    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n}\n\nvec3 nebula(int iter)\n{\n    float f = float(iter);\n    float t = params.time * 0.3;\n    \n    float hue = fract(f * 0.035 + t * 0.15 + sin(f * 0.08) * 0.06);\n    float sat = 0.75 + 0.25 * sin(f * 0.12 + t);\n    float val = 0.55 + 0.45 * cos(f * 0.07 - t * 0.4);\n    \n    float pulse = exp(-fract(f * 0.04 + t) * 5.0);\n    val += pulse * 0.3;\n    \n    float sparkle = exp(-abs(sin(f * 0.25 + t * 2.5)) * 12.0);\n    val += sparkle * 0.35;\n    \n    vec3 c = hsv2rgb(vec3(hue, clamp(sat, 0.0, 1.0), clamp(val, 0.0, 1.0)));\n    \n    c = mix(c, params.color[0].c, 0.3 + 0.2 * sin(f * 0.03 + t));\n    if((iter % 5) == 0)\n        c = mix(c, params.color[1].c, 0.5);\n    \n    c *= params.brightnessinfinite;\n    return c;\n}\n\nvec4 color(Data data)\n{\n    vec3 color;\n    if(data.iter <= 0)\n        color = nebula(-data.iter);\n    else\n        color = vec3(0.0, 0.0, 0.0);\n    \n    vec3 color2;\n    float rr = data.dist * exp(5.0 * params.param[0]);\n    if(rr < 1.0 && rr != 0.0)\n    {\n        float phase = rr * 6.28318530718 - params.time * 0.6;\n        color2 = vec3(\n            0.5 + 0.5 * cos(phase),\n            0.5 + 0.5 * cos(phase + 2.09439510239),\n            0.5 + 0.5 * cos(phase + 4.18879020479)\n        ) * (1.0 - rr);\n    }\n    else\n        color2 = vec3(0.0, 0.0, 0.0);\n    \n    vec3 c = color + color2 * params.brightnessfinite;\n    return vec4(c, 1.0);\n}\n",
+"code": "\n\nfloat3 hsv2rgb(float3 c)\n{\n    float4 K = float4(1.0, 2.0/3.0, 1.0/3.0, 3.0);\n    float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n}\n\nfloat3 nebula(constant Params &params, int iter)\n{\n    float f = float(iter);\n    float t = params.time * 0.3;\n    \n    float hue = fract(f * 0.035 + t * 0.15 + sin(f * 0.08) * 0.06);\n    float sat = 0.75 + 0.25 * sin(f * 0.12 + t);\n    float val = 0.55 + 0.45 * cos(f * 0.07 - t * 0.4);\n    \n    float pulse = exp(-fract(f * 0.04 + t) * 5.0);\n    val += pulse * 0.3;\n    \n    float sparkle = exp(-abs(sin(f * 0.25 + t * 2.5)) * 12.0);\n    val += sparkle * 0.35;\n    \n    float3 c = hsv2rgb(float3(hue, clamp(sat, 0.0, 1.0), clamp(val, 0.0, 1.0)));\n    \n    c = mix(c, params.color[0].c, 0.3 + 0.2 * sin(f * 0.03 + t));\n    if((iter % 5) == 0)\n        c = mix(c, params.color[1].c, 0.5);\n    \n    c *= params.brightnessinfinite;\n    return c;\n}\n\nfloat4 color(constant Params &params, Data input)\n{\n    float3 color;\n    if(input.iter <= 0)\n        color = nebula(params, -input.iter);\n    else\n        color = float3(0.0f, 0.0f, 0.0f);\n    \n    float3 color2;\n    float rr = input.dist * exp(5.0f * params.param[0]);\n    if(rr < 1.0f && rr != 0.0f)\n    {\n        float phase = rr * 6.28318530718f - params.time * 0.6f;\n        color2 = float3(\n            0.5f + 0.5f * cos(phase),\n            0.5f + 0.5f * cos(phase + 2.09439510239f),\n            0.5f + 0.5f * cos(phase + 4.18879020479f)\n        ) * (1.0f - rr);\n    }\n    else\n        color2 = float3(0.0f, 0.0f, 0.0f);\n    \n    float3 c = color + color2 * params.brightnessfinite;\n    return float4(c, 1.0f);\n}\n",
+"builtin": 0,
+"samples": 2,
+"channels": 17,
+"name": "Nebula Bloom",
+"nparam": 1
+}
+}
+}
+},
+{
+"id": "rainbow-veins",
+"name": "Rainbow Veins",
+"nameZh": "彩虹脉络",
+"set": "j",
+"json": {
+"x": "-0.7454280000000000000000000000000000000000",
+"rotation": 0.0,
+"julia_mx": "-0.7454280000000000000000000000000000000000",
+"y": "0.1130090000000000000000000000000000000000",
+"julia_y": "0.1200000000000000000000000000000000000000",
+"julia_x": "-0.7454280000000000000000000000000000000000",
+"julia_zoom": "0.800000e2",
+"zoom": "0.100000e5",
+"julia_my": "0.1130090000000000000000000000000000000000",
+"julia_rotation": 0.0,
+"parameters": {
+"colors": [
+{
+"rgb": [
+0.8,
+0.2,
+1.0
+],
+"frequency": -1.6
+},
+{
+"rgb": [
+0.0,
+1.0,
+0.7
+],
+"initial": -0.4,
+"frequency": -2.2
+}
+],
+"juliamode": 2,
+"brightnessinfinite": 0.92,
+"colorscheme": {
+"codegl": "vec3 hsv2rgb(vec3 c)\n{\n    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);\n    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n}\n\nvec3 rainbow(int iter)\n{\n    float f = float(iter);\n    float t = params.time * 0.25;\n\n    float hue = f * 0.03 + t * 0.15;\n    hue += 0.07 * sin(f * 0.08 + t * 0.6);\n    hue += 0.04 * cos(f * 0.13 - t * 0.4);\n    hue = fract(hue);\n\n    float sat = 0.78 + 0.22 * sin(f * 0.05 + t * 0.3);\n    float val = 0.45 + 0.55 * pow(0.5 + 0.5 * sin(f * 0.04 - t * 0.2), 0.8);\n\n    vec3 c = hsv2rgb(vec3(hue, clamp(sat, 0.0, 1.0), clamp(val, 0.0, 1.0)));\n\n    float m1 = smoothstep(0.0, 1.0, 0.5 + 0.5 * sin(f * 0.11 + t));\n    c = mix(c, params.color[0].c, m1 * 0.3);\n\n    float m2 = exp(-abs(sin(f * 0.17 + t * 1.2)) * 6.0);\n    c = mix(c, params.color[1].c, m2 * 0.35);\n\n    float gold = exp(-abs(sin(f * 0.25 - t * 2.0)) * 10.0);\n    c += vec3(1.0, 0.85, 0.2) * gold * 0.25;\n\n    c *= params.brightnessinfinite;\n    return c;\n}\n\nvec4 color(Data data)\n{\n    vec3 color;\n    if(data.iter <= 0)\n        color = rainbow(-data.iter);\n    else\n        color = vec3(0.06, 0.01, 0.12);\n\n    vec3 color2;\n    float rr = data.dist * exp(5.0 * params.param[0]);\n    if(rr < 1.0 && rr != 0.0)\n    {\n        float t = params.time * 0.3;\n        float hue_rim = fract(rr * 4.0 - t + sin(rr * 10.0) * 0.1);\n        vec3 rim = hsv2rgb(vec3(hue_rim, 0.95, 1.0));\n        color2 = rim * (1.0 - rr);\n    }\n    else\n        color2 = vec3(0.0, 0.0, 0.0);\n\n    vec3 c = color + color2 * params.brightnessfinite;\n    return vec4(c, 1.0);\n}\n",
+"code": "\n\nfloat3 hsv2rgb(float3 c)\n{\n    float4 K = float4(1.0, 2.0/3.0, 1.0/3.0, 3.0);\n    float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n}\n\nfloat3 rainbow(constant Params &params, int iter)\n{\n    float f = float(iter);\n    float t = params.time * 0.25;\n\n    float hue = f * 0.03 + t * 0.15;\n    hue += 0.07 * sin(f * 0.08 + t * 0.6);\n    hue += 0.04 * cos(f * 0.13 - t * 0.4);\n    hue = fract(hue);\n\n    float sat = 0.78 + 0.22 * sin(f * 0.05 + t * 0.3);\n    float val = 0.45 + 0.55 * pow(0.5 + 0.5 * sin(f * 0.04 - t * 0.2), 0.8);\n\n    float3 c = hsv2rgb(float3(hue, clamp(sat, 0.0, 1.0), clamp(val, 0.0, 1.0)));\n\n    float m1 = smoothstep(0.0, 1.0, 0.5 + 0.5 * sin(f * 0.11 + t));\n    c = mix(c, params.color[0].c, m1 * 0.3);\n\n    float m2 = exp(-abs(sin(f * 0.17 + t * 1.2)) * 6.0);\n    c = mix(c, params.color[1].c, m2 * 0.35);\n\n    float gold = exp(-abs(sin(f * 0.25 - t * 2.0)) * 10.0);\n    c += float3(1.0, 0.85, 0.2) * gold * 0.25;\n\n    c *= params.brightnessinfinite;\n    return c;\n}\n\nfloat4 color(constant Params &params, Data input)\n{\n    float3 color;\n    if(input.iter <= 0)\n        color = rainbow(params, -input.iter);\n    else\n        color = float3(0.06f, 0.01f, 0.12f);\n\n    float3 color2;\n    float rr = input.dist * exp(5.0f * params.param[0]);\n    if(rr < 1.0f && rr != 0.0f)\n    {\n        float t = params.time * 0.3f;\n        float hue_rim = fract(rr * 4.0f - t + sin(rr * 10.0f) * 0.1f);\n        float3 rim = hsv2rgb(float3(hue_rim, 0.95, 1.0));\n        color2 = rim * (1.0f - rr);\n    }\n    else\n        color2 = float3(0.0f, 0.0f, 0.0f);\n\n    float3 c = color + color2 * params.brightnessfinite;\n    return float4(c, 1.0f);\n}\n",
+"builtin": 0,
+"samples": 2,
+"channels": 17,
+"name": "Rainbow Veins",
+"nparam": 1
+}
+}
+}
+},
+{
+"id": "retinajulia-example-1",
+"name": "Julia 1",
+"nameZh": "朱丽叶 1",
+"set": "j",
+"json": {
+"julia_zoom": "0.271984e+3",
+"julia_my": "0.2017655232865144618411151986496809277013",
+"rotation": -1.9041596252438524,
+"julia_x": "0.6654975376130794296385861781676371654037e-5",
+"x": "-0.8123152605384845261824337685860035062605",
+"julia_rotation": -1.2204723592516227,
+"parameters": {
+"custom": [],
+"colors": [
+{
+"rgb": [
+1,
+0,
+0
+],
+"initial": -1,
+"frequency": -2.1202635765075684
+},
+{
+"rgb": [
+0,
+1,
+0
+],
+"initial": -1.5,
+"frequency": -1.1363141536712646
+},
+{
+"rgb": [
+0,
+0,
+1
+],
+"initial": -0.5,
+"frequency": -0.023268627002835274
+}
+],
+"brightnessfinite": 0.3185955882072449,
+"juliamode": 2,
+"frequency": -3.5148096084594727,
+"colorscheme": {
+"name": "Iteration"
+},
+"brightnessinfinite": 1,
+"initial": 0
+},
+"y": "0.2017649557726131165069535648372437689043",
+"julia_y": "0.7816947247068247970649660092193593968757e-5",
+"julia_mx": "-0.8123116893328952296052283606156134009838",
+"flags": 8,
+"zoom": "0.171432e+6"
+}
+},
+{
+"id": "retinajulia-example-2",
+"name": "Julia 2",
+"nameZh": "朱丽叶 2",
+"set": "j",
+"json": {
+"x": "-0.7509649658712063591181327970071335276",
+"rotation": -1.7898439437622193,
+"julia_mx": "-0.7502400390840114332514630712291092695665",
+"y": "0.23779321417949074559339083358502908716e-1",
+"julia_y": "0.10813600002290141965255056813881561213e-1",
+"julia_x": "-0.5008297240589141520720980946788664783798",
+"julia_zoom": "0.909738e2",
+"zoom": "0.365780e3",
+"julia_my": "0.2121100441902794541038071896195404963947e-1",
+"julia_rotation": 1.384796224585344,
+"parameters": {
+"juliamode": 2
+}
+}
+},
+{
+"id": "retinajulia-example-3",
+"name": "Julia 3",
+"nameZh": "朱丽叶 3",
+"set": "j",
+"json": {
+"x": "-0.3664043871060813307839287671086037079249",
+"rotation": -0.7274560884601828,
+"julia_mx": "-0.3710597184338165937229447703671336711295",
+"y": "0.6104477990868652474975046204330730859056",
+"julia_y": "0.410364986856525896103",
+"julia_x": "-0.197181386785990866917",
+"julia_zoom": "0.661990e1",
+"zoom": "0.628876e2",
+"julia_my": "0.6071761936120077162505918530466253457689",
+"julia_rotation": 1.0499630230508048,
+"parameters": {
+"custom": [
+0.608433723449707,
+0.1592082679271698
+],
+"juliamode": 2,
+"frequency": -0.03060263581573963,
+"colorscheme": {
+"name": "Distance and iteration levels"
+}
+}
+}
+},
+{
+"id": "retinajulia-example-4",
+"name": "Julia 4",
+"nameZh": "朱丽叶 4",
+"set": "j",
+"json": {
+"x": "-0.2301521928745398733061510675572763581255",
+"rotation": -1.4309084941329564,
+"julia_mx": "-0.2306807001473097928051333393011462454848",
+"y": "-0.7538778483031681309167870677333538227682",
+"julia_y": "-0.8446461322773445193444844212188890933413",
+"julia_x": "-0.1273179570167089690618840001239738674021",
+"julia_zoom": "0.145830e2",
+"zoom": "0.608977e3",
+"julia_my": "-0.7545051967687576532679624677056877575521",
+"julia_rotation": 2.547246319326416,
+"parameters": {
+"colors": [
+{
+"rgb": [
+0,
+0.0298922061920166,
+1
+],
+"frequency": -2.205652952194214
+},
+{
+"rgb": [
+1,
+0,
+4.76837158203125e-07
+],
+"initial": -0.5,
+"frequency": -1.2836257219314575
+}
+],
+"juliamode": 2,
+"brightnessinfinite": 0.49821746349334717,
+"colorscheme": {
+"codegl": "vec3 crt(int iter)\n{\n      vec3 c;\n      iter += int(params.time);\n      int five = int(mod(float(iter),3.0));\n      int four = int(mod(float(iter),4.0));\n      int three = int(mod(float(iter),5.0));\n      c = params.color[0].c;\n\n      if(five==0)c = params.color[1].c;\n      if(four!=0)c *= params.brightnessinfinite;\n      if(three==0){c = vec3(0.0,0.0,0.0);}\n      return c;\n}\nvec4 color(Data data)\n{\n    vec3 color;\n    if(data.iter<=0)\n        color = crt(-data.iter);\n    else\n        color = vec3(0.0,0.0,0.0);\n    vec3 color2;\n    float rr = data.dist*exp(5.0*params.param[0]);\n    if(rr<1.0&&rr!=0.0)color2 = vec3(1.0-rr, 1.0-rr, 1.0-rr); else color2 = vec3(0.0,0.0,0.0);\n\n    vec3 c = color+color2*params.brightnessfinite;\n\n    return vec4(c, 1.0);\n}\n",
+"code": "\n\nfloat3 crt(constant Params &params, int iter)\n{\n      float3 c;\n      iter += params.time;\n\t\tint five = iter%3;\n      int four = iter%4;\n      int three = iter%5;\n\n      c = params.color[0].c;\n\t\tif(five==0)c = params.color[1].c;\n      if(four!=0)c *= params.brightnessinfinite;\n      if(three==0){c = float3(0,0,0);}\n      return c;\n}\n\n\nfloat4 color(constant Params &params, Data input)\n{\n    float3 color;\n    if(input.iter<=0)\n        color = crt(params, -input.iter);\n    else\n        color = float3(0.0f,0.0f,0.0f);\n\n    float3 color2;\n    float rr = input.dist*exp(5.0f*params.param[0]);\n    if(rr<1.0f&&rr!=0.0f)color2 = float3(1.0f-rr, 1.0f-rr, 1.0f-rr); else color2 = float3(0.0f,0.0f,0.0f);\n\n    float3 c = color+color2*params.brightnessfinite;\n    \n    return float4(c, 1.0f);\n}\n",
+"builtin": 0,
+"samples": 2,
+"channels": 17,
+"name": "Chinese Remainder Clock ",
+"nparam": 1
+}
+}
+}
+},
+{
+"id": "retinajulia-example-5",
+"name": "Julia 5",
+"nameZh": "朱丽叶 5",
+"set": "j",
+"json": {
+"x": "-0.57780396988640065058902184154742543823",
+"rotation": 2.3487691563339435,
+"julia_mx": "-0.57780396988641184180447168238337492003",
+"y": "0.6311927219047413546049533144424540666651",
+"julia_y": "0.1876254252504683494988076777556338845132e-6",
+"julia_x": "-0.1680208860616067732248197142830196755844e-7",
+"julia_zoom": "0.301368e9",
+"zoom": "0.646772e14",
+"julia_my": "0.63119272190473584762206412399471464424",
+"julia_rotation": -0.6569466067133112,
+"parameters": {
+"inverse": true,
+"colorscheme": {
+"name": "Distance and iteration levels"
+},
+"custom": [
+0.5186793804168701,
+0
+],
+"juliamode": 2,
+"frequency": -4.097050189971924,
+"brightnessfinite": 0.7002700567245483
+}
+}
+},
+{
+"id": "retinajulia-example-6",
+"name": "Julia 6",
+"nameZh": "朱丽叶 6",
+"set": "j",
+"json": {
+"x": "-0.824247489029045916148624195629345162097",
+"rotation": -2.660330654792635,
+"julia_mx": "-0.8257677755011286792538588663046038745326",
+"y": "0.1787526146109617138535448410332204826056",
+"julia_y": "0.2372292418262303635047905971387403688657",
+"julia_x": "0.1277159046194826033739407351679180622236",
+"julia_zoom": "0.271693e5",
+"zoom": "0.487600e3",
+"julia_my": "0.1793070298792082863201265196730613847841",
+"julia_rotation": -0.2736819088445737,
+"parameters": {
+"colorscheme": {
+"name": "Distance and iteration levels"
+},
+"custom": [
+0.39759036898612976,
+-0.006884681526571512
+],
+"juliamode": 2,
+"brightnessinfinite": 0,
+"frequency": -1.5273069143295288
+}
+}
+},
+{
+"id": "retinamandelbrot-example-10",
+"name": "Mandelbrot 10",
+"nameZh": "曼德勃罗 10",
+"set": "m",
+"json": {
+"y": "-0.1039023914244248103331882399401412762524722612077122425226959010911261725444096e-24",
+"zoom": "0.616809e47",
+"rotation": 2.067330628394199,
+"x": "-0.1999999999999158466914555371553326382187918424086154530670429480842306927876374e1",
+"parameters": {
+"frequency": -2.2316384315490723,
+"colors": [
+{
+"frequency": -1.8250486850738525
+},
+{},
+{
+"frequency": 0.0833333358168602
+},
+{
+"rgb": [
+1,
+0.9503001570701599,
+0
+],
+"initial": 1.083201289176941,
+"frequency": -0.570662796497345
+},
+{
+"rgb": [
+0.9978632926940918,
+0,
+1
+],
+"initial": 0.25651660561561584,
+"frequency": -1.5087718963623047
+},
+{
+"rgb": [
+0,
+1,
+0.9523754119873047
+],
+"initial": 0.251327782869339,
+"frequency": -0.5867446660995483
+}
+]
+}
+}
+},
+{
+"id": "retinamandelbrot-example-11",
+"name": "Mandelbrot 11",
+"nameZh": "曼德勃罗 11",
+"set": "m",
+"json": {
+"y": "0.7434020253863138944689129775783564824079e-5",
+"zoom": "0.895007e3",
+"rotation": -1.5593733943475787,
+"x": "-0.1861234551211239242891015175442892102945e1",
+"parameters": {
+"brightnessfinite": 1.4,
+"brightnessinfinite": 1.4,
+"frequency": -0.2325800359249115,
+"colorscheme": {
+"name": "Smooth"
+},
+"colors": [
+{
+"initial": -0.9357696175575256
+},
+{
+"rgb": [
+0,
+1,
+0.9306728839874268
+],
+"initial": -2.5748634338378906,
+"frequency": -1.1174464225769043
+},
+{
+"initial": -0.995907723903656
+}
+]
+}
+}
+},
+{
+"id": "retinamandelbrot-example-12",
+"name": "Mandelbrot 12",
+"nameZh": "曼德勃罗 12",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": -1.312199924225269,
+"x": "-0.784554430417046686696",
+"y": "-0.866094169047142835063e-1",
+"zoom": "0.695327",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"colorscheme": {
+"codegl": "vec4 color(Data data)\n{\n    vec3 c;\n\tif(abs(float(data.iter))>params.param[0]*100.0)return vec4(0.0,0.0,0.0,1.0);\n    if(data.iter>=0)\n        c = pal(float(data.iter)+0.5, params.brightnessfinite/params.brightnessfactor);\n    else\n        c = pal(float(-data.iter)+0.5, params.brightnessinfinite/params.brightnessfactor);\n    return vec4(c, 1.0);\n}\n",
+"code": "float4 color(constant Params &params, Data input)\n{\n    float3 c;\n\tif(abs(input.iter)>params.param[0]*100)return float4(0,0,0,1);\n    if(input.iter>=0)\n        c = pal(params, float(input.iter)+0.5, params.brightnessfinite/params.brightnessfactor);\n    else\n        c = pal(params, float(-input.iter)+0.5, params.brightnessinfinite/params.brightnessfactor);\n    return float4(c, 1.0);\n}\n",
+"builtin": 0,
+"samples": 2,
+"channels": 1,
+"name": "Iteration with limit",
+"nparam": 1
+},
+"custom": [
+0.1170731708407402
+],
+"frequency": -0.512499988079071
+}
+}
+},
+{
+"id": "retinamandelbrot-example-13",
+"name": "Mandelbrot 13",
+"nameZh": "曼德勃罗 13",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": -0.29750553320759643,
+"x": "-0.1884837651491256718964122067377240358911e1",
+"y": "0.5685905142182532266879480983618946908726e-5",
+"zoom": "0.257912e18",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"colors": [
+{
+"initial": -1.6567906141281128,
+"frequency": -1.0400593280792236
+},
+{
+"initial": -1.9316331148147583,
+"frequency": -0.4688427448272705
+},
+{
+"initial": -0.35470566153526306,
+"frequency": 0.2492581605911255
+},
+{
+"rgb": [
+1,
+0.9851012825965881,
+0
+],
+"initial": -2.1216540336608887,
+"frequency": -7.309547424316406
+},
+{
+"rgb": [
+0,
+1,
+0.9913976192474365
+],
+"initial": -1.5025265216827393,
+"frequency": -6.952263832092285
+},
+{
+"rgb": [
+1,
+0,
+0.9428219795227051
+],
+"initial": -2.2120401859283447,
+"frequency": -6.205216407775879
+}
+],
+"frequency": -2.6962928771972656,
+"brightnessinfinite": 1.0233813524246216,
+"brightnessfinite": 0.9874100685119629
+}
+}
+},
+{
+"id": "retinamandelbrot-example-14",
+"name": "Mandelbrot 14",
+"nameZh": "曼德勃罗 14",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": -0.875079538007886,
+"x": "0.3663637024091694259332410278905421919606997777250043430086150873722039549117993565756258541388607",
+"y": "0.59153521167963855895394318674236001402383470750458914715348903229294593663664931860539171744085708",
+"zoom": "0.154422e74",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"initial": -0.04542328044772148,
+"colors": [
+{
+"initial": -1.6567906141281128,
+"frequency": -1.0400593280792236
+},
+{
+"initial": -1.9316331148147583,
+"frequency": -0.4688427448272705
+},
+{
+"initial": -0.35470566153526306,
+"frequency": 0.2492581605911255
+},
+{
+"rgb": [
+1,
+0.9851012825965881,
+0
+],
+"initial": -2.1216540336608887,
+"frequency": -2.639465808868408
+},
+{
+"rgb": [
+0,
+1,
+0.9913976192474365
+],
+"initial": -1.5025265216827393,
+"frequency": -1.8071216344833374
+},
+{
+"rgb": [
+1,
+0,
+0.9428219795227051
+],
+"initial": -2.2120401859283447,
+"frequency": -3.0393176078796387
+}
+],
+"frequency": -2.0366196632385254,
+"brightnessinfinite": 1.4046763181686401,
+"brightnessfinite": 1.2014389038085938
+}
+}
+},
+{
+"id": "retinamandelbrot-example-15",
+"name": "Mandelbrot 15",
+"nameZh": "曼德勃罗 15",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": -2.0668916533857815,
+"x": "-0.1999999999999970414852464912323651037802557934532425976876018758218769423333886e1",
+"y": "-0.6445558101668796948557346465940402809747556268591835574340357470463742580729429e-32",
+"zoom": "0.389443e57",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"colors": [
+{
+"initial": -1.6567906141281128,
+"frequency": -1.0400593280792236
+},
+{
+"initial": -1.9316331148147583,
+"frequency": -0.4688427448272705
+},
+{
+"initial": -0.35470566153526306,
+"frequency": 0.2492581605911255
+},
+{
+"rgb": [
+1,
+0.9851012825965881,
+0
+],
+"initial": -2.1216540336608887,
+"frequency": -2.639465808868408
+},
+{
+"rgb": [
+0,
+1,
+0.9913976192474365
+],
+"initial": -1.5025265216827393,
+"frequency": -1.8071216344833374
+},
+{
+"rgb": [
+1,
+0,
+0.9428219795227051
+],
+"initial": -2.2120401859283447,
+"frequency": -3.0393176078796387
+}
+],
+"custom": [
+0.4696180522441864,
+0.0737847238779068
+],
+"colorscheme": {
+"name": "Distance and iteration levels"
+},
+"brightnessinfinite": 0.9964028596878052,
+"brightnessfinite": 1.0197842121124268
+}
+}
+},
+{
+"id": "retinamandelbrot-example-3",
+"name": "Mandelbrot 3",
+"nameZh": "曼德勃罗 3",
+"set": "m",
+"json": {
+"x": "-0.32097004040033333522119338757184241486",
+"rotation": -1.7897573261722268,
+"parameters": {
+"custom": [],
+"colors": [
+{
+"rgb": [
+1,
+0,
+0
+],
+"initial": -1,
+"frequency": -2.1202635765075684
+},
+{
+"rgb": [
+0,
+1,
+0
+],
+"initial": -1.5,
+"frequency": -1.1363141536712646
+},
+{
+"rgb": [
+0,
+0,
+1
+],
+"initial": -0.5,
+"frequency": -0.023268627002835274
+}
+],
+"brightnessfinite": 1,
+"juliamode": 0,
+"frequency": -3.9191246032714844,
+"colorscheme": {
+"name": "Iteration"
+},
+"brightnessinfinite": 1,
+"initial": 0
+},
+"y": "0.62584959097540058250746389640967109519",
+"julia_zoom": "0.500000",
+"zoom": "0.101913e+16",
+"flags": 11,
+"julia_my": "0.62584959097540063959364546405488249464",
+"julia_rotation": -1.5707963267948966,
+"julia_mx": "-0.32097004040033338704948704528927979895"
+}
+},
+{
+"id": "retinamandelbrot-example-4",
+"name": "Mandelbrot 4",
+"nameZh": "曼德勃罗 4",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": 2.705541142501764,
+"x": "-0.1749956458063285345788697011493116552935419672053965053997639098743669735815852e1",
+"y": "-0.8760951207860079569335499422576655841437733279178194703745407184012754204504906e-18",
+"zoom": "0.189289e57",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"frequency": -2.6822032928466797,
+"colors": [
+{},
+{},
+{},
+{
+"rgb": [
+0.9660762548446655,
+1,
+0
+],
+"initial": -1.5707963705062866,
+"frequency": -0.7582846283912659
+},
+{
+"rgb": [
+0,
+1,
+0.9554576873779297
+],
+"initial": -1.5707963705062866,
+"frequency": -2.473684310913086
+},
+{
+"rgb": [
+1,
+0,
+0.9886317253112793
+],
+"initial": -1.5707963705062866,
+"frequency": -1.819688081741333
+}
+]
+}
+}
+},
+{
+"id": "retinamandelbrot-example-5",
+"name": "Mandelbrot 5",
+"nameZh": "曼德勃罗 5",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": -0.4675443006255421,
+"x": "-0.3557723680892860202247329458897648601709",
+"y": "0.6583602940396694738441513349483505276236",
+"zoom": "0.233898e12",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"inverse": true,
+"custom": [
+0.16953527927398682
+],
+"colorscheme": {
+"name": "Distance"
+}
+}
+}
+},
+{
+"id": "retinamandelbrot-example-6",
+"name": "Mandelbrot 6",
+"nameZh": "曼德勃罗 6",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": 1.323212886101599,
+"x": "-0.3902029635259773209233348018845520905797",
+"y": "0.5869975779312664379646653135482522922339",
+"zoom": "0.832777e19",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"frequency": -7.602165699005127
+}
+}
+},
+{
+"id": "retinamandelbrot-example-7",
+"name": "Mandelbrot 7",
+"nameZh": "曼德勃罗 7",
+"set": "m",
+"json": {
+"julia_zoom": "0.500000",
+"rotation": -2.6751121052729223,
+"x": "0.27673166497459160487485109795772935759198569431284465825373",
+"y": "0.77622920085263821155557341901623218837046466669141785397443e-2",
+"zoom": "0.210467e40",
+"julia_rotation": -1.5707963267948966,
+"parameters": {
+"frequency": -3.7335216999053955,
+"colors": [
+{
+"frequency": -1.7339180707931519
+},
+{
+"frequency": -1.1228070259094238
+},
+{
+"frequency": -0.07212475687265396
+},
+{
+"rgb": [
+0.5,
+0.5,
+0.5
+],
+"initial": -1.5707963705062866,
+"frequency": -0.46345028281211853
+},
+{
+"rgb": [
+0.5,
+0.5,
+0.5
+],
+"initial": -1.5707963705062866,
+"frequency": 0.7909356951713562
+},
+{
+"rgb": [
+0.5,
+0.5,
+0.5
+],
+"initial": -1.5707963705062866,
+"frequency": 0.3245614171028137
+},
+{
+"rgb": [
+0.9651463031768799,
+0.030247032642364502,
+0.883750855922699
+],
+"initial": -1.0543924570083618,
+"frequency": -0.2007797211408615
+},
+{
+"rgb": [
+0.5,
+0.5,
+0.5
+],
+"initial": -1.5707963705062866,
+"frequency": 0.40497076511383057
+},
+{
+"rgb": [
+0.5,
+0.5,
+0.5
+],
+"initial": -1.5707963705062866,
+"frequency": -0.09892787784337997
+}
+]
+}
+}
+},
+{
+"id": "retinamandelbrot-example-8",
+"name": "Mandelbrot 8",
+"nameZh": "曼德勃罗 8",
+"set": "m",
+"json": {
+"x": "-0.17319973197249589263186076496937529712324719358720029390288e+1",
+"rotation": -0.5166334646554018,
+"parameters": {
+"colorscheme": {
+"code": "\nfloat4 color(constant Params &params, Data input)\n{\n    float3 color, color2;\n    if(input.iter<0)\n    {\n        color = pal(params, float(-input.iter)+0.5f, params.brightnessinfinite);\n    }\n    else\n    {\n        float rr = input.dist2*exp(5.0f*params.param[1]-1.5f);\n        if(rr<1.0f&&rr!=0.0f)color = (1.0f-rr)*pal(params, float(input.iter)+0.5f, params.brightnessfinite); else color = float3(0.0f,0.0f,0.0f);\n    }\n    \n    float rr = input.dist*exp(5.0f*params.param[0]);\n    if(rr<1.0f&&rr!=0.0f)color2 = float3(1.0f-rr, 1.0f-rr, 1.0f-rr); else color2 = float3(0.0f,0.0f,0.0f);\n\n    float3 c = color+color2*params.brightnessfinite;\n    \n    return float4(c, 1.0f);\n}\n",
+"builtin": 0,
+"samples": 2,
+"channels": 145,
+"name": "Distance and iteration levels (inverse)",
+"nparam": 2
+},
+"custom": [
+0.48902440071105957,
+-0.039024390280246735
+],
+"frequency": -1.742361068725586
+},
+"y": "0.60084514184641493624904783380299993493670752522452353276068e-6",
+"julia_zoom": "0.500000",
+"zoom": "0.519927e+38",
+"julia_my": "0.600845141846414936249047833802999934908545703123176491818286055136743618294124704286570769706265431217092428388418246711798149925650850132173086669745957352e-6",
+"julia_rotation": -1.5707963267948966,
+"julia_mx": "-0.173199731972495892631860764969375297123247194179277244504094098261503702658799100384763979644730883611937200192661935087782690267911698238005609311009449155e+1"
+}
+},
+{
+"id": "retinamandelbrot-example-9",
+"name": "Mandelbrot 9",
+"nameZh": "曼德勃罗 9",
+"set": "m",
+"json": {
+"y": "0.1257195437470679151207183385794742848726e-8",
+"zoom": "0.428746e16",
+"julia_mx": "-0.19997740591517655818047033267054336646142455093189222457091200391423958467473521889645985215454966e1",
+"x": "-0.1999774059151765581794735255900649799839e1",
+"julia_my": "0.12571954374863722749967366894911685917182812879249789801892870524832571665222499688213333750913341e-8",
+"rotation": 2.9082912894299238
+}
+}
+]
