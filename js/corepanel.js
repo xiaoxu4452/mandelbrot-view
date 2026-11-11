@@ -16,7 +16,8 @@
 
 import { remoteStatus } from './remote.js';
 
-const RELEASES_URL = 'https://github.com/xiaoxu4452/mandelbrot-view/releases';
+/* `latest` rather than a tag: the panel should not need an edit per release. */
+const RELEASES_URL = 'https://github.com/xiaoxu4452/mandelbrot-view/releases/latest';
 
 /**
  * Render the core panel inside the shared modal host.
