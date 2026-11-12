@@ -242,6 +242,17 @@ const SCENE_MIN_PIXEL = 1.0e-9;
  * fractal switch on a real machine back onto the CPU (seconds of stutter). */
 const SCENE_MAX_ITER = 20000;
 const SCENE_IS_SMALL = Math.min(window.innerWidth || 999, window.innerHeight || 999) < 700;
+/* Touch-first devices get a tighter budget than a small desktop window: fewer
+ * workers, a smaller field cache and a capped backing-store scale.  Detected
+ * once at boot; a hybrid laptop with a touch screen still counts as coarse. */
+const TOUCH_UI = (() => {
+  try {
+    return matchMedia('(pointer: coarse)').matches ||
+      (navigator.maxTouchPoints > 0 && SCENE_IS_SMALL);
+  } catch (_) {
+    return SCENE_IS_SMALL;
+  }
+})();
 const SCENE_MAX_COST = (SCENE_IS_SMALL ? 8.0e9 : 6.0e10);   // committed frame
 const SCENE_LIVE_COST = (SCENE_IS_SMALL ? 1.2e9 : 6.0e9);   // one gesture draw
 let sceneLast = null;            // last view the scene drew
@@ -611,7 +622,9 @@ function initWorkers() {
    * 32 is a memory guard, not a performance one — each worker holds its own
    * copy of the kernel plus a reference orbit. */
   const cores = Math.max(2, navigator.hardwareConcurrency || 4);
-  const n = NATIVE ? 1 : clamp(cores - 1, 2, 32);
+  /* A phone that reports 8 cores still cannot feed 7 wasm workers with their
+   * own orbit heaps; four keeps every core busy without swapping. */
+  const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
     const w = new Worker('js/worker.js', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
@@ -1749,9 +1762,12 @@ function paintFrame(f, scale) {
  * on the next pass, so the cached copy must be our own, not a view onto it. */
 const FIELD_MEM = new Map();
 let fieldMemBytes = 0;
-/* 96 MB default; `cachesize` (9/10/11 -> 1/4, 1x, 4x) and `totalmemory`
- * (at most a quarter) from appdata\mandelbrot.json scale it. */
-let FIELD_MEM_BUDGET = 96 * 1024 * 1024;
+/* 96 MB default; phones get 32 MB because a background tab can be killed for
+ * holding a tenth of the device's RAM.  `cachesize` (9/10/11 -> 1/4, 1x, 4x)
+ * and `totalmemory` (at most a quarter) from appdata\mandelbrot.json scale it
+ * on the desktop shell. */
+let FIELD_MEM_BUDGET = (TOUCH_UI ? 32 : 96) * 1024 * 1024;
+const FIELD_MEM_MAX_ENTRIES = TOUCH_UI ? 3 : 8;
 function fieldMemoryKey(p) {
   const s = p.spec || {};
   /* Everything that can change the *field* must be here; everything that
@@ -1775,7 +1791,8 @@ function rememberField(key, w, h, data, meta, ch) {
   if (prev) { fieldMemBytes -= prev.data.byteLength; FIELD_MEM.delete(key); }
   FIELD_MEM.set(key, { w, h, ch: ch === 6 ? 6 : 4, data, meta });
   fieldMemBytes += bytes;
-  while (fieldMemBytes > FIELD_MEM_BUDGET && FIELD_MEM.size > 1) {
+  while ((fieldMemBytes > FIELD_MEM_BUDGET || FIELD_MEM.size > FIELD_MEM_MAX_ENTRIES) &&
+         FIELD_MEM.size > 1) {
     const oldest = FIELD_MEM.keys().next().value;
     const rec = FIELD_MEM.get(oldest);
     fieldMemBytes -= rec.data.byteLength;
@@ -3888,7 +3905,18 @@ function backFromJulia() {
 
 /* ---------------- Presets window ---------------- */
 let modalKind = null;
+/* Thumbnail work that outlives its grid only burns CPU and keeps detached
+ * canvases (and their fields) alive.  Drop every queued job and observer when
+ * the panel is replaced or closed; in-flight worker jobs finish into detached
+ * canvases and are forgotten. */
+function clearThumbWork() {
+  thumbQueue.length = 0;
+  thumbJobs.length = 0;
+  clearTimeout(thumbBackfill);
+  if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
+}
 function openModal(kind, title, sub, bodyHtml, footHtml, cls = '') {
+  if (modalKind === 'presets') clearThumbWork();
   modalKind = kind;
   const root = $('modal-root');
   root.hidden = false;
@@ -3908,8 +3936,8 @@ function closeModal() {
   $('modal-root').hidden = true;
   $('modal-root').classList.remove('previewing');
   stopAnimation();
+  if (modalKind === 'presets') clearThumbWork();
   modalKind = null;
-  thumbQueue.length = 0;
 }
 
 document.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', closeModal));
@@ -6247,13 +6275,13 @@ function resizeCanvas(render = true) {
    * width to be composited into a buffer of a different width; the ratio no
    * longer matches and the result is a frame of misplaced blocks and holes.
    * Dropping the pass costs one re-render, which the resize schedules anyway. */
-  let dpr = Math.max(1, Math.min(2, +state.renderScale || 1));
+  let dpr = Math.max(1, Math.min(TOUCH_UI ? 1.5 : 2, +state.renderScale || 1));
   /* Pixel budget.  "2x" on a 1080p window is an 11 Mpx buffer, and every one
    * of those pixels is iterated on the CPU path and shaded on the GPU path —
    * four times the work of 1x for a difference the eye cannot see at arm's
    * length.  The cap keeps a high setting honest on a large display instead of
    * letting it turn every gesture into a slideshow. */
-  const MAX_PIXELS = 4.2e6;
+  const MAX_PIXELS = TOUCH_UI ? 1.6e6 : 4.2e6;
   while (dpr > 1 && innerWidth * dpr * innerHeight * dpr > MAX_PIXELS) dpr -= 0.25;
   dpr = Math.max(1, dpr);
   const nextW = Math.max(320, Math.round(innerWidth * dpr));
@@ -6461,6 +6489,10 @@ function boot() {
                   seg: (on) => { segOn = !!on; return segOn; },
                   /* Same view, cache off: isolates the field copy's cost. */
                   nocache: (on) => { state.noFieldCache = !!on; return state.noFieldCache; },
+                  /* Field-cache occupancy, so a mobile run can assert that
+                   * switching sets does not accumulate buffers. */
+                  cache: () => ({ fields: FIELD_MEM.size, bytes: fieldMemBytes,
+                                  budget: FIELD_MEM_BUDGET, maxEntries: FIELD_MEM_MAX_ENTRIES }),
                   /* A/B switch for the colour-position capture path. */
                   field: (on) => { fieldCaptureOn = !!on; fieldCache = null; return fieldCaptureOn; },
                   forcecopy: (on) => { state.forceCopy = !!on; return state.forceCopy; },

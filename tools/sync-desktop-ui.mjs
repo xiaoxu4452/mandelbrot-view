@@ -37,12 +37,12 @@ const CHECK = process.argv.includes('--check');
 /* [search, replace, note] — each must apply exactly once. */
 const DELTAS = [
   ['  renderScale: 1,', '  renderScale: 2,', 'retina buffer'],
-  ['  const n = NATIVE ? 1 : clamp(cores - 1, 2, 32);',
+  ['  const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);',
    '  const n = NATIVE ? 1 : clamp((navigator.hardwareConcurrency || 4) - 1, 2, 8);',
    'worker count'],
   ['const REMOTE_MAX = Math.max(8, Math.min(32, (navigator.hardwareConcurrency || 4) - 1));',
    'const REMOTE_MAX = 24;', 'remote queue cap'],
-  ['  let dpr = Math.max(1, Math.min(2, +state.renderScale || 1));',
+  ['  let dpr = Math.max(1, Math.min(TOUCH_UI ? 1.5 : 2, +state.renderScale || 1));',
    '  let dpr = Math.max(1, Math.min(2, +state.renderScale || 2));',
    'dpr fallback']
 ];

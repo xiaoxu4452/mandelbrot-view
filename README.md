@@ -18,27 +18,16 @@ runs locally.
 
 ### 2. Desktop app (recommended, no setup)
 
-In the app: **Settings → Desktop app & render core → Download desktop app** serves the
-Windows build (`download/Mandelbrot-View.exe`) with the same C++ multi-threaded kernel,
-GPU shading and preset library built in — no unpacking and no Node.js required.
-Advanced users can still fetch `mandelbrot-core.zip` from the same panel; unpack it and run:
-
-- **Windows** — double-click `start-core.bat`
-- **macOS / Linux** — `bash start-core.sh`
-
-The launcher starts two loopback-only services and opens the page:
-
-| Service | Address | Purpose |
-| --- | --- | --- |
-| Render core | `http://127.0.0.1:8778` | Node worker-thread pool hosting the C++/WASM kernel, returns raw RGBA |
-| Static page | `http://127.0.0.1:8777` | Serves the bundle over HTTP (required by ES modules) |
+In the app: **Menu → Desktop app → Download for desktop** serves the Windows build
+(`download/Mandelbrot-View.exe`) with the same C++ multi-threaded kernel, GPU shading and preset
+library built in — no unpacking and no Node.js required. The page itself needs no separate core:
+the WebAssembly kernel is fetched and started automatically on first load.
 
 ### 3. From source
 
 ```bash
 git clone https://github.com/xiaoxu4452/mandelbrot-view.git
 cd mandelbrot-view
-node server/render-server.mjs   # optional: local render core on 127.0.0.1:8778
 node server/static-server.mjs   # page on 127.0.0.1:8777
 ```
 
@@ -169,8 +158,8 @@ css/app.css           Fluent glass styling, dark/light themes, mobile breakpoint
 js/app.js             view state, progressive tiling, interaction, dialogs
 js/worker.js          render thread: WASM dispatch, orbit/series cache, glitch repair
 js/render.js          CPU tile renderer (perturbation / high precision / Newton / custom)
-js/corepanel.js       “Render core” panel (download, status probe)
-js/remote.js          local core client (127.0.0.1:8778)
+js/corepanel.js       desktop download panel
+js/remote.js          optional local core client (127.0.0.1:8778)
 js/formulas.js        fractal families and high-precision reference orbits
 js/bigfixed.js        arbitrary-precision fixed point (BigInt)
 js/environment.js     series approximation (A/B/C coefficients, skip count)
@@ -183,8 +172,7 @@ js/presets-data.js    the 512 presets (generated)
 wasm/kernel.cpp       WASM kernel source (C++ / SIMD)
 wasm/kernel.ts        AssemblyScript reference implementation
 js/kernel-wasm.js     inlined base64 kernel (generated)
-server/               local render core and static server
-core/                 downloadable core bundle (built by tools/build-core-package.mjs)
+server/               optional local render core and static server
 tools/                build and verification scripts
 ```
 
@@ -192,7 +180,6 @@ tools/                build and verification scripts
 
 ```bash
 node tools/build-kernel.mjs          # C++ → wasm → js/kernel-wasm.js (requires zig)
-node tools/build-core-package.mjs    # package core/mandelbrot-core.zip
 node tools/gen-presets.mjs           # regenerate the 512 presets
 ```
 
