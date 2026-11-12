@@ -73,6 +73,8 @@ tools/bench*/
 !tools/rebasecheck.mjs
 !tools/servercheck.mjs
 !tools/_desktopshot.mjs
+!tools/_release-upload.mjs
+!tools/_publish.mjs
 !tools/sync-desktop-ui.mjs
 wasm/t/
 tools/*.sh
