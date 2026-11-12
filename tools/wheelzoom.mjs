@@ -14,6 +14,7 @@ const args = process.argv.slice(2);
 const arg = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const PORT = Number(arg('port', 9333));
 const STEPS = Number(arg('steps', 30));
+const GPU_ON = args.indexOf('--nogpu') < 0;   // default: the path a user gets
 const CENTER = { re: '-0.743643887037151', im: '0.131825904205330' };
 
 const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
@@ -47,7 +48,7 @@ for (let i = 0; i < 60; i++) { await new Promise(r => setTimeout(r, 500)); try {
 await new Promise(r => setTimeout(r, 1000));
 
 /* Start at 2^-20 and wheel in: 30 steps of 1.6x is 2^-6.4 deeper each 10 steps. */
-await ev(`(() => { const st = window.__mb.state; st.gpu = false;
+await ev(`(() => { const st = window.__mb.state; st.gpu = ${GPU_ON};
   st.center = { re: '${CENTER.re}', im: '${CENTER.im}' };
   st.span = { m: 1.6, e: -20 }; window.__mb.render(); return 1; })()`);
 for (let i = 0; i < 40; i++) { await new Promise(r => setTimeout(r, 300)); if (await ev('window.__mb.frames() > 1')) break; }

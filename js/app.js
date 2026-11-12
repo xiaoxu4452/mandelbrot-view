@@ -123,7 +123,7 @@ const state = {
    * own scale factor: 1 = CSS (fastest), 1.5, 2 = device pixels on this screen.
    * The gesture cadence already renders well below this (livePlan), so a lower
    * setting only trims the final frame, never the preview. */
-  renderScale: 2,
+  renderScale: 1,
   /* Measurement only: 1 disables the field cache (and therefore the copy that
    * keeping a field requires), so the copy's cost can be measured on the same
    * view instead of being guessed from its byte count. */
@@ -211,23 +211,38 @@ const SCENE_KIND = {
 };
 /* Reach of the two fragment programs.
  *
- * `fast` iterates in float32, `df64` in double-float (48-bit mantissa, ~1e-14
- * relative).  The old 1e-6 gate was eight orders of magnitude short of what
- * df64 actually delivers, so from ~1000x zoom onwards the page refused the
- * shader for *everything* — including a palette change, which then re-ran the
- * whole frame on the CPU (measured 5.5 s at 2^-30).  That is the stutter on
- * "switch a colour / switch a fractal". */
-const SCENE_MIN_PIXEL = 1.2e-14;
+ * `fast` iterates in float32, `df64` in double-float (24+24-bit Dekker pairs).
+ * df64 is only exact while the driver does not fuse its products into FMAs:
+ * every `a*b` in the split-and-residual dance is a mad() candidate, and a fused
+ * one silently breaks the error term.  Measured on a Radeon 780M the shader
+ * still resolves 58 distinct iteration counts at 1e-9 but collapses to *three*
+ * from 1e-11 down — every pixel gets the same orbit and the frame is one flat
+ * colour.  The page used to accept it all the way to 1.2e-14, so every deep
+ * view was painted as a solid block.
+ *
+ * The gate is now where the program was measured correct.  Deeper than that the
+ * CPU path owns the frame: it iterates in 64-512 bit integers, which is what
+ * the reference does, at the cost of a second or two per committed frame — and
+ * the live gesture still gets a low-resolution pass so a pinch stays attached
+ * to the fingers. */
+const SCENE_MIN_PIXEL = 1.0e-9;
 /* Two limits, because a paint is not the same budget as a gesture:
  *
  *   · pixels x iterations — what one fragment pass actually costs.  A deep
  *     view is happy to spend a couple of seconds on a committed frame, but a
  *     pointer event that spends that per move drops the gesture entirely.
  *   · maxIter — the kernel's own loop cap; past it the SA/perturbation path
- *     on the CPU is the only one that finishes. */
-const SCENE_MAX_COST = 2.0e10;  // committed frame
-const SCENE_LIVE_COST = 4.0e8;   // one draw per input event
-const SCENE_MAX_ITER = 4000;
+ *     on the CPU is the only one that finishes.
+ *
+ * Both are scaled by the device class.  A phone at 390x844 has ~0.33 Mpx and a
+ * mobile GPU; letting it take the same budget as a desktop would freeze the
+ * page.  The earlier single set of numbers was tuned on a software rasteriser
+ * and rejected everything past ~4000 iterations, which pushed every palette or
+ * fractal switch on a real machine back onto the CPU (seconds of stutter). */
+const SCENE_MAX_ITER = 20000;
+const SCENE_IS_SMALL = Math.min(window.innerWidth || 999, window.innerHeight || 999) < 700;
+const SCENE_MAX_COST = (SCENE_IS_SMALL ? 8.0e9 : 6.0e10);   // committed frame
+const SCENE_LIVE_COST = (SCENE_IS_SMALL ? 1.2e9 : 6.0e9);   // one gesture draw
 let sceneLast = null;            // last view the scene drew
 let sceneResult = null;          // { program, ms } of the last scene draw
 let sceneFail = '';              // why the shader last declined
@@ -243,13 +258,13 @@ function sceneView() {
   if (spec.mode !== 'm' && spec.mode !== 'j') return null;
   if (state.traps > 0 || state.inverse) return null;
   if (state.scheme === 'distance') return null;
-  /* A preset that ships its own GLSL scheme still has a palette: the additive
-   * terms are registered under IMPORTED_PALETTE.  Refusing the shader here is
-   * what made every GLSL preset look like it "did nothing" — the frame fell
-   * through to the CPU tiles and took minutes, so the user saw the old picture
-   * under a new HUD.  The shader now draws the preset with its palette, and the
-   * exact GLSL look is applied when the CPU pass lands. */
-  if (state.stops && state.stops.length >= 2) return null;
+  /* A gradient ramp is *not* a reason to refuse the shader.  It used to be one:
+   * the shader took only `paletteLUT(state.palette)`, which ignores the ramp, so
+   * a ramp would have been silently dropped.  The page hands the shader the
+   * same table the CPU path uses (`currentLut()`, which registers the ramp
+   * first), so the two agree — and the shader stops being skipped for every
+   * default view, which is why a default page still burned 1.2 s of WASM per
+   * frame and every palette or fractal switch went through a full CPU pass. */
   const p = psPair();
   if (p.e < -1000) return null;
   const pixel = p.m * Math.pow(2, p.e);
@@ -276,23 +291,40 @@ function sceneView() {
 
 /** Palette table for the shader.  The key is what the LUT cache compares. */
 function scenePaletteKey() {
-  return String(state.palette) + '|' + (state.stops ? state.stops.length : 0) +
-         '|' + (state.paletteVersion || 0);
+  /* The ramp's *contents* matter, not just how many handles it has: dragging a
+   * handle keeps the count and used to leave the shader on the old table. */
+  const st = state.stops;
+  const fp = st && st.length
+    ? st.map(s => (s[0] | 0) + '.' + s[1] + '.' + s[2] + '.' + s[3]).join(',')
+    : '';
+  return String(state.palette) + '|' + fp;
+}
+
+/** Can the fragment shader draw this view at this quality?  Pure predicate, so
+ * a gesture can ask *before* choosing a path instead of discovering the refusal
+ * after it has already committed to the shader. */
+function sceneCanDraw(v, final) {
+  if (!v) return false;
+  if (v.pixel < SCENE_MIN_PIXEL) { sceneFail = 'depth'; return false; }
+  if (v.maxIter > SCENE_MAX_ITER) { sceneFail = 'iter'; return false; }
+  const cost = Math.max(1, v.width | 0) * Math.max(1, v.height | 0) * (v.maxIter | 0);
+  if (cost > (final ? SCENE_MAX_COST : SCENE_LIVE_COST)) {
+    sceneFail = final ? 'cost' : 'cost-live';
+    return false;
+  }
+  return true;
 }
 
 /** Draw the current view with the shader.  Returns true when it painted. */
 function sceneDraw(v, opts = {}) {
   if (!v) return false;
-  if (v.pixel < SCENE_MIN_PIXEL) { sceneFail = 'depth'; return false; }
-  if (v.maxIter > SCENE_MAX_ITER) { sceneFail = 'iter'; return false; }
-  const cost = Math.max(1, v.width | 0) * Math.max(1, v.height | 0) * (v.maxIter | 0);
-  if (cost > (opts.final ? SCENE_MAX_COST : SCENE_LIVE_COST)) {
-    sceneFail = opts.final ? 'cost' : 'cost-live';
-    return false;
-  }
+  if (!sceneCanDraw(v, !!opts.final)) return false;
   glCanvas.width = v.width;
   glCanvas.height = v.height;
-  scene.setPalette(paletteLUT(state.palette), scenePaletteKey());
+  /* The same table the CPU path shades with, ramp and additive terms included.
+   * `paletteLUT(state.palette)` alone ignores `state.stops`, so a gradient edit
+   * moved the CPU picture and left the shader on the previous ramp. */
+  scene.setPalette(currentLut(), scenePaletteKey());
   const r = scene.draw(v);
   if (!r.ok) { sceneFail = r.why; setGlSurface(false); return false; }
   sceneFail = '';
@@ -307,6 +339,13 @@ function sceneDraw(v, opts = {}) {
 function scenePass() {
   const v = sceneView();
   if (!v || !sceneDraw(v, { final: true })) return false;
+  /* The shader just painted the whole frame in one draw call.  Any CPU pass
+   * still in flight — the quick preview a wheel event started, a progressive
+   * pass a preset kicked off — will land *on top* of it, tile by tile, and the
+   * HUD will end up reporting the CPU engine while the screen shows a mix of
+   * two different frames.  That is the "blocks + still slow" report: the GPU
+   * had already finished, and then the slow path overwrote it.  Cancel it. */
+  if (pending > 0 || liveBusy || mainQueue.length) cancelAll();
   /* The splash screen is driven by the pass index of the CPU plan; a shader
    * frame has no passes, so it has to close the curtain itself or the page
    * sits at "68%" forever. */
@@ -324,7 +363,11 @@ function scenePass() {
     ms: sceneResult ? sceneResult.ms : 0,
     glitches: 0, refLen: 0
   };
-  frameMs = performance.now() - frameStartAt;
+  /* The HUD's time is the draw, not the wall clock since whatever started the
+   * last CPU pass: a recolour through the shader is one draw, and reporting it
+   * as "7891 ms" because frameStartAt was set by the previous render is worse
+   * than useless. */
+  frameMs = sceneResult ? sceneResult.ms : 0;
   frameSeq++;
   updateHud(true);
   takeSnapshot();
@@ -340,7 +383,12 @@ function scenePass() {
 function sceneLive() {
   if (performance.now() - sceneDrawAt < 6) return false;
   const v = sceneView();
-  if (!v || !sceneDraw(v)) { setGlSurface(false); return false; }
+  /* Do not drop the GL surface for a view the shader simply cannot reach: every
+   * pointer move would flip the page between the shader layer and the 2D canvas,
+   * which is a visible flicker and an extra composite per event.  Let the caller
+   * fall back to the CPU preview with the surface as it is. */
+  if (!v || !sceneCanDraw(v, false)) return false;
+  if (!sceneDraw(v)) { setGlSurface(false); return false; }
   return true;
 }
 
@@ -1518,7 +1566,19 @@ function recolourOnly() {
   scheduleRender(60);
 }
 
-function drawTile(msg, scale) {
+function drawTile(msg, scale, passW, passH) {
+  /* A tile from a pass buffer of a different size can only be a leftover from
+   * a pass that started before the canvas changed shape (a panel opening, a
+   * window drag, a DPR change).  Compositing it would place its pixels at the
+   * wrong scale and leave a hole where it should have been — the block pattern
+   * in the report.  Drop it; the pass it belonged to is already superseded. */
+  if (passW && (msg.width !== passW || msg.height !== passH)) {
+    if (window.__mbDebug) {
+      (window.__mbDropped = window.__mbDropped || []).push(
+        { x: msg.x, y: msg.y, w: msg.w, h: msg.h, tw: msg.width, th: msg.height, pw: passW, ph: passH });
+    }
+    return;
+  }
   /* `tailKept` is the worker's workspace self-check: bytes of the tile slot the
    * kernel failed to write (always 0 on a healthy layout). */
   if (window.__mbDebug) {
@@ -1880,10 +1940,16 @@ function gpuPass(vId, plan, done, planList) {
       const bytes = msg.data.byteLength;
       /* `state.forceCopy` reproduces the old unconditional copy, so its cost can
        * be measured on the same view instead of being estimated. */
+      /* One frame must always fit.  The budget used to be a flat 96 MB with a
+       * 64 MB per-frame ceiling, so a 3282x1920 field (96.2 MB) could never be
+       * kept: every palette change, every return to the same view and every
+       * zoom-out paid for a full re-iteration.  The ceiling is now the larger
+       * of the configured budget and two frames. */
+      const budget = Math.max(FIELD_MEM_BUDGET, bytes * 2);
       const keep = state.forceCopy ||
-                   (bytes > 0 && bytes <= 64 * 1024 * 1024 &&
+                   (bytes > 0 && bytes <= budget &&
                     (FIELD_MEM.has(fk) ||
-                     fieldMemBytes + bytes <= FIELD_MEM_BUDGET) &&
+                     fieldMemBytes + bytes <= budget) &&
                     !state.noFieldCache);
       if (keep) {
         const c0 = performance.now();
@@ -1940,7 +2006,7 @@ function runPass(vId, plan, done, planList) {
    * crossing, not from point samples), so supersampling buys very little
    * there: measured 3732 ms -> ~950 ms for the same frame at ss=1.
    * Keep one sample and spend the budget on the live cadence instead. */
-  if (final && psLog2Now() <= -45) ss = 1;
+  if (final && psLog2Now() <= -34) ss = 1;
   /* NB: the pass buffer is declared to the shell as cw*ss x ch*ss, and the
    * compositor maps it 1:1 onto the canvas, so a pass may not be rendered at
    * an arbitrary fraction of the canvas.  Depth therefore buys its speed from
@@ -1957,7 +2023,7 @@ function runPass(vId, plan, done, planList) {
    * picture (and, past the reference's precision, whole blocks of flat
    * colour).  prepareEnv() now builds the orbit once for the view and every
    * tile adopts it, so the deep pass tiles like any other. */
-  const deepPass = psLog2Now() <= -45;
+  const deepPass = psLog2Now() <= -34;
   const shareEnv = deepPass && envShareable(state.spec, psLog2Now());
   /* One tile must fit the shell's 1 MB shared slot (512x512 RGBA), so the
    * upper bound is a hard 512 even when supersampling asks for more. */
@@ -2016,9 +2082,20 @@ function runPass(vId, plan, done, planList) {
   const passT0 = performance.now();
   startPassClock(passT0);
 
-  /* The final CPU pass doubles as the colour-position capture: the tiles come
+  /* The compositor ratio belongs to this *pass*, not to the window it happens
+   * to be running in.  `pw` was computed from canvas.width at the top of this
+   * function; reading canvas.width again per tile meant that anything resizing
+   * the canvas while a pass was in flight — the console panel opening, the
+   * window being dragged — changed the ratio mid-pass.  Every tile already in
+   * flight then landed scaled by a different factor, which is exactly the
+   * "big misaligned blocks with black gaps" picture.  Capture it once, and
+   * reject any tile that does not belong to this pass buffer.
+   *
+   * The final CPU pass doubles as the colour-position capture: the tiles come
    * back as one float per pixel, the page shades them, and the raw positions
    * are kept so a palette change is a table lookup instead of a re-render. */
+  const passScale = pw / Math.max(1, W);
+  const passPw = pw, passPh = ph;
   /* The out-of-browser core returns raw RGBA over HTTP (JSON meta + binary
    * body), so the field capture stays on the in-page worker path. */
   const captureField = final && !useFrame && !state.glsl && !remoteEnabled() && fieldCaptureOn;
@@ -2051,7 +2128,7 @@ function runPass(vId, plan, done, planList) {
          * was blitted at 1:1 into a canvas that is half that size — twice too
          * large, at the wrong place, over the top of an already correct frame.
          * That is the black band that appeared every 256 pixels. */
-        if (!msg.frame) drawTile(msg, pw / ctx.canvas.width);
+        if (!msg.frame) drawTile(msg, passScale, passPw, passPh);
         addPassStats(msg.meta);
         lastMeta = msg.meta;
         got++;
@@ -2100,7 +2177,7 @@ function runPass(vId, plan, done, planList) {
                * drawImage per commit.  Only paint when this frame is what the
                * user actually sees, i.e. before the first successful commit or
                * after a fallback pass. */
-              if (!nativeSurface) paintFrame(f, pw / ctx.canvas.width);
+              if (!nativeSurface) paintFrame(f, passScale);
               // A landed commit means the swapchain now holds this frame; from
               // here on the page can be transparent without going blank.
               if (f && f.w && f.ok !== false) setNativeSurface(true);
@@ -2226,8 +2303,27 @@ function scheduleRender(delay = 90) {
   renderTimer = setTimeout(() => renderNow(), delay);
 }
 
-/** Quick passes while zooming: low resolution + full iteration count, so the thumbnail never collapses into black blocks */
+/** Quick passes while zooming: the shader if it can take the frame, otherwise a
+ * low-resolution CPU pass.
+ *
+ * The CPU preview is what made a wheel burst feel heavy: every 55 ms it
+ * dispatched a fresh set of 40-512 px tiles, each one a worker round trip plus
+ * a putImageData, and the final frame still had to wait for the last of them.
+ * The fragment shader redraws the *whole* view in a single draw call, at full
+ * resolution, from the same iteration — so it is both sharper and cheaper. */
 function quickPreview() {
+  /* If the shader can take this view, it takes *every* live frame.  Falling
+   * back to the CPU when sceneLive() throttles (it refuses to draw twice inside
+   * 6 ms) is what put a slow CPU pass under a fast GPU one: the gesture drew
+   * instantly, then a background pass landed on top of it, and the HUD ended up
+   * reporting the WASM engine at 1.5 s while the GPU had needed 5 ms.
+   *
+   * `sceneCanDraw` — not `sceneView()` alone — because the view may be one the
+   * shader builds but cannot draw (past df64's reach): asking only sceneView
+   * made a deep pinch draw nothing at all, so the picture froze under the
+   * fingers until the committed pass landed. */
+  const v = sceneView();
+  if (v && sceneCanDraw(v, false)) { sceneLive(); return; }
   renderPlan(QUICK_PLAN);
 }
 
@@ -2797,13 +2893,28 @@ function glideApply(factor, px, py) {
 
 /* ---------------- HUD ---------------- */
 let hudPending = false;
+/* A pass that has just finished must not be repainted as "rendering 0%" by an
+ * updateHudSoon() scheduled a frame earlier.  That ordering is the normal one:
+ * the last tile calls updateHudSoon() on its way past the `got === total`
+ * check, the synchronous updateHud(true) writes "done", and the rAF callback
+ * then runs afterwards and overwrites it with the live state.  The HUD sat at
+ * "rendering 0%" forever even though the frame had landed. */
+let hudDoneStamp = 0;
 function updateHudSoon() {
   if (hudPending) return;
   hudPending = true;
-  requestAnimationFrame(() => { hudPending = false; updateHud(); });
+  requestAnimationFrame(() => {
+    hudPending = false;
+    /* Only repaint the live state if a *newer* pass has started since. */
+    if (performance.now() - hudDoneStamp < 120) return;
+    updateHud();
+  });
 }
 
 function updateHud(done = false) {
+  /* Every "this pass is finished" call stamps the clock, so a queued live
+   * repaint cannot overwrite it (see updateHudSoon). */
+  if (done) hudDoneStamp = performance.now();
   const d = depthNow();
   const ps = psNow();
   /* The width on screen is the width the renderer actually used.  Before this
@@ -2856,7 +2967,12 @@ function updateHud(done = false) {
     }
   }
   $('hud-engine').textContent = `${modeLabel} · ${bits} bit` + (lastMeta ? ` · ${t('refLen')} ${lastMeta.refLen}` : '') + colourHint + limitHint;
-  $('hud-progress').textContent = done || pct >= 100
+  /* "rendering N%" only makes sense while a CPU pass actually exists.  A
+   * shader frame never builds one, so tileTotal stays 0 and the HUD used to
+   * read "rendering 0%" for every GPU frame — including the one it had just
+   * finished.  The 500 ms pass clock repainting the same stale text is why it
+   * never settled. */
+  $('hud-progress').textContent = (done || pct >= 100 || !tileTotal)
     ? `${t('statusDone')} · ${ms}`
     : `${t('statusRendering')} ${pct}%` + (ms ? ` · ${ms}` : '')
       + (liveMs > 15000 ? ` · ${t('slowDeep')}` : '');
@@ -5853,12 +5969,28 @@ function applyI18n() {
 
 /* ---------------- Canvas sizing ---------------- */
 function resizeCanvas(render = true) {
-  /* state.renderScale is a multiple of CSS pixels, not of device pixels: on a
-   * 175% display "2" is 2 CSS px per CSS px, which is what the user sees as
-   * "device pixels".  Clamp to the range the option offers. */
-  const dpr = Math.max(1, Math.min(2, +state.renderScale || 2));
-  canvas.width = Math.max(320, Math.round(innerWidth * dpr));
-  canvas.height = Math.max(240, Math.round(innerHeight * dpr));
+  /* A pass in flight is measured in the *old* buffer geometry.  Resizing the
+   * canvas without cancelling it leaves tiles that were dispatched at the old
+   * width to be composited into a buffer of a different width; the ratio no
+   * longer matches and the result is a frame of misplaced blocks and holes.
+   * Dropping the pass costs one re-render, which the resize schedules anyway. */
+  let dpr = Math.max(1, Math.min(2, +state.renderScale || 1));
+  /* Pixel budget.  "2x" on a 1080p window is an 11 Mpx buffer, and every one
+   * of those pixels is iterated on the CPU path and shaded on the GPU path —
+   * four times the work of 1x for a difference the eye cannot see at arm's
+   * length.  The cap keeps a high setting honest on a large display instead of
+   * letting it turn every gesture into a slideshow. */
+  const MAX_PIXELS = 4.2e6;
+  while (dpr > 1 && innerWidth * dpr * innerHeight * dpr > MAX_PIXELS) dpr -= 0.25;
+  dpr = Math.max(1, dpr);
+  const nextW = Math.max(320, Math.round(innerWidth * dpr));
+  const nextH = Math.max(240, Math.round(innerHeight * dpr));
+  if ((canvas.width !== nextW || canvas.height !== nextH) &&
+      !nativeCanvasMode() && (pending > 0 || liveBusy)) {
+    cancelAll();
+  }
+  canvas.width = nextW;
+  canvas.height = nextH;
   ctx.fillStyle = '#05060a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   // One line in shell.log per resize: the only way to see the real viewport,

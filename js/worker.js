@@ -593,11 +593,13 @@ function processJob(job) {
    * double.  `bits > 64` alone was not that test: the tier list now returns 128
    * for a shallow view (because 64 bits of *guard* is the reference's rule),
    * and routing a 800x frame through a 128-bit reference orbit made it both
-   * slower and noisier than the plain double loop it replaced.  The CPU tile
-   * renderer's own deep threshold is -45 (app.js `deepPass`), so use the same
-   * number: below it the direct double kernel is exact, above it we need the
-   * reference orbit. */
-  else if (bits > 64 && psLog2 <= -45) {
+   * slower and noisier than the plain double loop it replaced.  The threshold is
+   * where the direct kernel stops being exact, i.e. where the pixel is smaller
+   * than a double's ulp of the centre (~2^-52) — not -45, which was merely
+   * where the page used to split its passes.  Between -34 and -52 the direct
+   * path still ran a 128-bit integer loop per pixel: 1.6 s for a 1248x704 frame
+   * at 2^-42, against 200 ms with one reference orbit and double pixels. */
+  else if (bits > 64 && psLog2 <= -34) {
     mode = 1;
     const o = ensureOrbit(job, bits);
     /* The elected reference is stored normalised (see viewKey); the kernel
