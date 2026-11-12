@@ -22,7 +22,8 @@
  * ------------------------------------------------------------------ */
 import { PRESET_LIB } from './presets-data.js';
 import { MORE_LIB, SET_LIB } from './sets-data.js';
-import { importRefPreset, exportRefPreset } from './refpreset.js';
+import { importRefPreset, exportRefPreset, defaultRefColors,
+         readColors, readGlobals } from './refpreset.js';
 import { registerAdditivePalette } from './palettes.js';
 
 const USER_KEY = 'mb.userPresets.v1';
@@ -61,8 +62,14 @@ function emit() { for (const cb of listeners.slice()) cb(LIB); }
  */
 function itemOf(obj, forceCat) {
   const p = obj.parameters || {};
-  const cols = Array.isArray(p.colors) ? p.colors : [];
-  const julia = !!(obj.flags && obj.flags.julia) || Number(p.juliamode) === 1;
+  const g = readGlobals(p);
+  /* readParams resets to INITIALCOLORS before applying the file, so a
+   * thumbnail must use the *resolved* table, not a literal copy of `colors`
+   * (eight shipped presets omit `rgb` on purpose). */
+  const cols = readColors(p);
+  const julia = !!(obj.flags && obj.flags.julia) ||
+                Number(p.juliamode) === 2 ||
+                !!(obj.spec && obj.spec.mode === 'j');
   return {
     f: obj.id,
     n: obj.name || obj.id,
@@ -72,14 +79,12 @@ function itemOf(obj, forceCat) {
     /* `zo` drives the card's framing and its iteration budget, so it has to be
      * the same decade the view opens at (see showZoom). */
     x: obj.x, y: obj.y, zo: obj.showZoom != null ? obj.showZoom : obj.zoom,
-    bf: p.brightnessfinite, bi: p.brightnessinfinite,
+    bf: g.briFinite, bi: g.briInfinite,
+    /* The file's global log-frequency / phase travel with the table: the
+     * thumbnail applies exp(f_i + F) exactly like the main render does. */
+    cf: g.frequency, ci: g.initial,
     /* [r,g,b,frequency,initial] — the shape the thumbnail palette wants. */
-    col: cols.map(c => {
-      const rgb = Array.isArray(c.rgb) ? c.rgb : [0, 0, 0];
-      return [+rgb[0] || 0, +rgb[1] || 0, +rgb[2] || 0,
-              c.frequency != null ? +c.frequency : (p.frequency != null ? +p.frequency : 0),
-              c.initial != null ? +c.initial : (p.initial != null ? +p.initial : 0)];
-    }),
+    col: cols.map(c => [c.r, c.g, c.b, c.frequency, c.initial]),
     cg: !!(p.colorscheme && String(p.colorscheme.codegl || '').trim()),
     an: !!obj.animation,
     obj
@@ -170,7 +175,10 @@ export function patchOf(obj) {
     julia: p.julia,
     juliaView: p.juliaView,
     juliaSeed: p.juliaSeed,
-    colors: p.colors || [],
+    /* readParams (005472c0) resets params->color[] to INITIALCOLORS on every
+     * load, so a file with no `colors` key still has the three-term default
+     * table — it does not inherit the palette of the previously opened view. */
+    colors: (p.colors && p.colors.length) ? p.colors : defaultRefColors(),
     /* Global log-frequency / phase from the file (00546630.c:79/:87).
      * They travel with the raw colour table; without them exp() would be
      * applied against the program's default and the palette would drift. */
@@ -178,7 +186,9 @@ export function patchOf(obj) {
     colorInit: p.colorInit,
     briFinite: p.briFinite,
     briInfinite: p.briInfinite,
+    briFactor: p.briFactor,
     glsl: p.glsl || '',
+    hlsl: p.hlsl || '',
     schemeName: p.schemeName || cs.name || '',
     /* A file that only *names* a built-in scheme (Example 5 asks for "Distance
      * and iteration levels" and ships no source) still has to reach that
@@ -186,8 +196,15 @@ export function patchOf(obj) {
     schemeBuiltin: p.schemeBuiltin || '',
     nparam: p.nparam,
     samples: p.samples,
+    channels: p.channels,
+    auxfile: p.auxfile || '',
+    builtin: p.builtin,
     param: p.param,
     inverse: p.inverse === true || (obj.flags && obj.flags.inverse === true),
+    juliamode: p.juliamode,
+    juliaDock: p.juliaDock,
+    initialZoom: p.initialZoom,
+    realmFlags: p.realmFlags,
     animation: p.animation || null,
     /* Our own extension: an edited gradient ramp.  The reference format has no
      * ramp, and rewriting one as a sum of sinusoids is lossy, so a hand-edited
@@ -225,7 +242,8 @@ export function thumbPalette(item) {
   }));
   if (!cols.length) return null;
   const id = 'lib:' + item.f;
-  registerAdditivePalette(id, cols, item.bf, item.bi, item.n || item.f);
+  registerAdditivePalette(id, cols, item.bf, item.bi, item.n || item.f,
+                          { gf: item.cf, gi: item.ci });
   paletteIds.set(item.f, id);
   return id;
 }
@@ -254,12 +272,20 @@ export function buildObject(view) {
     colorInit: view.colorInit,
     briFinite: view.briFinite,
     briInfinite: view.briInfinite,
-    briFactor: 1,
+    briFactor: view.briFactor != null ? view.briFactor : 1,
+    inverse: view.inverse,
     glsl: view.glsl || '',
     hlsl: view.hlsl || '',
     schemeName: view.schemeName || undefined,
     samples: view.samples,
+    nparam: view.nparam,
+    channels: view.channels,
+    auxfile: view.auxfile,
+    builtin: view.builtin,
     param: view.param,
+    juliamode: view.juliamode,
+    realmFlags: view.realmFlags,
+    initialZoom: view.initialZoom,
     animation: view.animation
   });
   obj.format = 'retinamandelbrot/preset-1';

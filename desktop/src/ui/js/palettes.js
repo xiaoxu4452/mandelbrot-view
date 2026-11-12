@@ -323,7 +323,13 @@ export function customPaletteStops(id) { return CUSTOM.get(id) || null; }
 function stopTableFor(id) {
   const entry = PALETTE_LIST.find(p => p.id === id);
   if (entry && entry.stops && STOPS[entry.stops]) return STOPS[entry.stops];
-  return STOPS[id] || null;
+  if (STOPS[id]) return STOPS[id];
+  /* An additive scheme has no stop table of its own.  Sample its pal() over
+   * exactly one slowest-term period so every downstream consumer — the CPU
+   * LUT, the per-pixel GPU LUT, the native `stops` message and the swatch —
+   * sees the same colours.  Returning null here made every official preset
+   * fall back to STOPS.ice on the CPU path. */
+  return sampledStops(id);
 }
 
 export function paletteStops(id) {
@@ -371,6 +377,25 @@ export function resampleStops(list, n = 64) {
 }
 
 
+/** One slowest-term period of pal(), in ITERATIONS.
+ *
+ * The reference's pal(iter) is a sum of sin(iter*f_i + init_i) with f_i in
+ * radians per iteration.  The LUT is indexed by the colour position
+ * u = fract(iter / cycle), so setting cycle to this span makes the 512-entry
+ * table a faithful sample of pal() rather than a compression of it.  Clamped
+ * because a pathological table (or a pure DC term) must not produce an
+ * unusable iteration scale. */
+export function paletteCycle(id) {
+  const c = COLORS[id];
+  if (!c) return 0;
+  let minF = Infinity;
+  for (const k of c.colors) {
+    const f = Math.abs(k.frequency);
+    if (f > 1e-6 && f < minF) minF = f;
+  }
+  return minF < Infinity ? Math.max(8, Math.min(4096, 2 * Math.PI / minF)) : 140;
+}
+
 /** The additive scheme behind an id, or null.  Returned as an array of
  *  {r,g,b,frequency,initial} with the two region brightnesses attached, so a
  *  caller can iterate it and still read the brightness figures. */
@@ -389,12 +414,9 @@ export function paletteColors(id) {
 function sampledStops(id) {
   const c = COLORS[id];
   if (!c) return null;
-  let minF = Infinity;
-  for (const k of c.colors) {
-    const f = Math.abs(k.frequency);
-    if (f > 1e-6 && f < minF) minF = f;
-  }
-  const span = minF < Infinity ? (2 * Math.PI / minF) : 64;
+  /* The same span the caller uses as `cycle`, so u = iter/cycle addresses
+   * exactly this table instead of squeezing it into a different period. */
+  const span = paletteCycle(id);
   const N = 256, out = new Array(N);
   let peak = 1e-9;
   for (let i = 0; i < N; i++) {

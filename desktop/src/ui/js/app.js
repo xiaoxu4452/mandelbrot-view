@@ -1,8 +1,8 @@
-﻿/* ------------------------------------------------------------------
+/* ------------------------------------------------------------------
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, shaderTerms, REF_DEFAULT_LOG_FREQ } from './palettes.js';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, shaderTerms, paletteCycle, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js';
 import { SCHEME_LIB, findScheme } from './schemes-data.js';
 import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js';
 import { setLang, t, getLang } from './i18n.js';
@@ -17,7 +17,8 @@ import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
          readColorschemes, writeColorschemes, newColorscheme } from './gpu.js';
 import { initJuliaView } from './juliaview.js';
 import { PRESET_THUMBS } from './preset-thumbs.js';
-import { importRefPreset, glslToHlsl } from './refpreset.js';
+import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
+         REF_MAX_PARAM } from './refpreset.js';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
          savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js';
 
@@ -416,7 +417,22 @@ function dispatch(job) {
     /* The worker LUT has no notion of handle positions, so an edited ramp is
      * resampled for it.  The native kernel gets the real stops and does not
      * come through here. */
-    else if (Array.isArray(state.stops)) pl.paletteStops = resampleStops(state.stops, 64);
+    else if (pl.palette === state.palette && Array.isArray(state.stops)) {
+      const rs = resampleStops(state.stops, 64);
+      pl.paletteStops = rs;
+      registerCustomPalette(pl.palette, rs);
+    }
+    /* A worker is a separate module instance: palettes registered only on
+     * this thread (an imported additive preset) do not exist in its registry.
+     * Ship the exact 512-entry table, keyed by content so it is uploaded once
+     * per palette change rather than once per tile. */
+    const lut = paletteLUT(pl.palette);
+    if (lut && lut.length === 2048) {
+      pl.paletteLUT = new Uint8Array(lut);
+      let h = 2166136261;
+      for (let i = 0; i < lut.length; i += 7) { h ^= lut[i]; h = Math.imul(h, 16777619); }
+      pl.paletteKey = (h >>> 0).toString(36);
+    }
   }
   if (!job.thumb && remoteEnabled()) return remoteDispatch(job);
   return dispatchLocal(job);
@@ -513,10 +529,17 @@ function effectiveStops() {
   return paletteStopList(state.palette);
 }
 
-/* Flat [pos,r,g,b] x n for the shell's tiny parser. */
+/* Flat [pos,r,g,b] x n for the shell's tiny parser.
+ * host.cpp reads at most 4*64 numbers and installs at most 32 stops
+ * (:807 / :1607).  An additive scheme is sampled at 256 points, so resample
+ * across the whole range instead of sending only its first eighth. */
 function stopsPayload() {
+  const list = effectiveStops();
+  const src = list.length > 32
+    ? Array.from({ length: 32 }, (_, i) => list[Math.round(i * (list.length - 1) / 31)])
+    : list;
   const out = [];
-  for (const s of effectiveStops()) {
+  for (const s of src) {
     out.push(+s.pos.toFixed(5), +s.r.toFixed(5), +s.g.toFixed(5), +s.b.toFixed(5));
   }
   return out;
@@ -3634,8 +3657,11 @@ function resolveScheme(patch) {
   const out = {
     src: sanitizeGlsl(patch.glsl || ''),
     schemeId: null,
-    nparam: patch.nparam | 0,
-    params: (patch.param || []).slice(0, 4).map(v => +v || 0),
+    /* NPARAM is 10 in the reference shader; the old 4-slot clamp silently
+     * discarded params.param[4..9] of a scheme that declares them. */
+    nparam: Math.max(0, Math.min(REF_MAX_PARAM, patch.nparam | 0)),
+    params: (patch.param || []).slice(0, REF_MAX_PARAM).map(v => +v || 0),
+    channels: patch.channels == null ? null : (patch.channels >>> 0),
     colors: shaderTerms((patch.colors || []).map(c => ({
       r: c.r, g: c.g, b: c.b,
       frequency: c.frequency != null ? c.frequency : 0,
@@ -3662,7 +3688,7 @@ function resolveScheme(patch) {
         out.nparam = s.nparam;
         /* The file's `custom` is the authored setting; the library value is
          * only the fallback when a file names the scheme but not its params. */
-        if (!(patch.param && patch.param.length)) out.params = (s.params || []).slice(0, 4);
+        if (!(patch.param && patch.param.length)) out.params = (s.params || []).slice(0, REF_MAX_PARAM);
         /* Three of the built-in schemes (Distance, Distance and iteration
          * levels, Texture) are compiled into the reference together with the
          * program's *default* colour table, so their JSON carries no `colors`
@@ -3777,7 +3803,7 @@ function applyRefPresetPatch(patch, file) {
       })),
       samples: rec.samples
     };
-    state.schemeParams = rec.params.slice(0, 4);
+    state.schemeParams = rec.params.slice(0, REF_MAX_PARAM);
     state.schemeColors = rec.colors;
     state.schemeBri = rec.bri;
     /* The file's own scheme joins the library under its own name, which is
@@ -3798,6 +3824,10 @@ function applyRefPresetPatch(patch, file) {
                             { gf: patch.colorFreq, gi: patch.colorInit });
     state.palette = IMPORTED_PALETTE;
     state.stops = null;
+    /* The LUT now samples this table over one slowest-term period; the colour
+     * cycle has to be that same period or the palette is phase-compressed. */
+    const cyc = paletteCycle(IMPORTED_PALETTE);
+    if (cyc > 0) { state.cycle = cyc; state.cycleAuto = false; }
   }
   /* An edited ramp comes back as a ramp; without one the preset's own colour
    * table is the source, so any earlier edit is dropped. */
@@ -3818,8 +3848,18 @@ function applyRefPresetPatch(patch, file) {
   state.presetFile = file || '';
   state.presetName = patch.name || '';
   state.presetId = file || patch.id || null;
+  /* Keep the file-only fields that have no UI control, so exporting the view
+   * writes them back instead of silently dropping realm flags, the legacy
+   * home zoom, the scheme's aux texture path and its builtin marker. */
+  state.presetMeta = {
+    realmFlags: patch.realmFlags,
+    juliamode: patch.juliamode,
+    initialZoom: patch.initialZoom,
+    auxfile: patch.auxfile || '',
+    builtin: patch.builtin
+  };
 
-  nativeLog(`[preset] open ${file || '-'} mode=${mode} ` +
+  nativeLog(`[preset] open ${file || '-'} mode=${state.spec.mode} ` +
             `center=${state.center.re},${state.center.im} ` +
             `span=${state.span.m}*2^${state.span.e} rot=${(state.rotation || 0).toFixed(3)} ` +
             `glsl=${state.glsl ? 'yes' : 'no'} colors=${patch.colors ? patch.colors.length : 0} ` +
@@ -3852,6 +3892,33 @@ function applyRefPresetPatch(patch, file) {
   return true;
 }
 
+/**
+ * The reference reads four JSON shapes through four loaders (00539080,
+ * 005472c0, 00547070 and 0055ef40).  A colorschemes.json library or a
+ * mandelbrot.json settings file used to be fed to patchOf(), which produced
+ * an empty view instead of installing what the file describes.
+ */
+function applyRefConfigText(obj, kind, name) {
+  if (kind === 'colorschemes' || kind === 'scheme') {
+    const list = Array.isArray(obj) ? obj : [obj];
+    const r = readColorschemes(JSON.stringify(list));
+    let added = 0;
+    for (const [k, cs] of r.dict) { schemeDict.set(k, cs); added++; }
+    schemeStoreSave();
+    refreshReferenceSchemes();
+    nativeLog('[cfg] imported ' + added + ' colorscheme(s) from ' + (name || 'file'));
+    toast(added + ' schemes ✓');
+    return true;
+  }
+  if (kind === 'settings') {
+    applyConfig(readRefSettings(obj));
+    nativeLog('[cfg] imported appdata/mandelbrot.json from ' + (name || 'file'));
+    toast('settings ✓');
+    return true;
+  }
+  return false;
+}
+
 /** Text entry point, used by the file dialog and by a file named on the CLI. */
 function applyRefPresetText(text, name) {
   let obj;
@@ -3860,6 +3927,13 @@ function applyRefPresetText(text, name) {
   } catch (e) {
     nativeLog('[preset] parse failed: ' + (e && e.message));
     toast('JSON ✗');
+    return false;
+  }
+  const kind = classifyRefJson(obj);
+  if (kind !== 'preset') {
+    if (applyRefConfigText(obj, kind, name)) return true;
+    nativeLog('[preset] unsupported JSON shape: ' + kind);
+    toast('unsupported JSON ✗');
     return false;
   }
   let patch;
@@ -3990,11 +4064,20 @@ function makeRefPreset(name) {
     ramp: Array.isArray(state.stops) ? state.stops : null,
     briFinite: terms.briFinite,
     briInfinite: terms.briInfinite,
+    briFactor: state.schemeBri ? state.schemeBri.factor : 1,
+    inverse: !!state.inverse,
     glsl: state.glsl || '',
     hlsl: state.glsl ? glslToHlsl(state.glsl) : '',
     schemeName: state.schemeName || (state.glsl ? 'Imported scheme' : undefined),
     samples: state.aa,
-    param: null,
+    nparam: state.schemeMeta ? state.schemeMeta.nparam : 0,
+    channels: state.schemeChannels == null ? undefined : state.schemeChannels,
+    auxfile: (state.presetMeta && state.presetMeta.auxfile) || '',
+    builtin: state.presetMeta && state.presetMeta.builtin,
+    param: state.schemeParams ? state.schemeParams.slice(0, REF_MAX_PARAM) : null,
+    juliamode: state.presetMeta ? state.presetMeta.juliamode : undefined,
+    realmFlags: state.presetMeta ? state.presetMeta.realmFlags : undefined,
+    initialZoom: state.presetMeta ? state.presetMeta.initialZoom : undefined,
     animation: state.animation || null
   });
 }
@@ -4928,6 +5011,11 @@ function bindUi() {
       installScheme(id);           // official codegl + its own param sliders
     } else {
       state.palette = id;
+      /* An additive scheme's frequencies are in radians/iteration, so its
+       * LUT spans exactly one slowest-term period.  Align the colour cycle
+       * with that period instead of leaving the ramp's default 140. */
+      const cyc = paletteCycle(id);
+      if (cyc > 0) { state.cycle = cyc; state.cycleAuto = false; }
       installScheme(null);
       gradSel = 0;
       syncPaletteStrip();

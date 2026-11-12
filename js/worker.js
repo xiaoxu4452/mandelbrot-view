@@ -380,11 +380,24 @@ let lutPalette = null;
 let lutBytes = null;
 
 /** Upload the palette LUT into the kernel heap and cache it for JS repair. */
-function setLut(palette, stops) {
+let lutKey = '';
+function setLut(palette, stops, supplied, key) {
   // A user-defined palette travels with its stops: the worker has no
   // localStorage, so the main thread ships the table definition in the job.
   if (stops) registerCustomPalette(palette, stops);
-  const lut = paletteLUT(palette);
+  /* An exact 512x4 table from the page wins: palettes registered only on the
+   * main thread (imported additive presets) do not exist in this module's
+   * registry, where paletteLUT(id) would silently return Ice.  `key` keeps
+   * the upload to once per palette change, not once per tile. */
+  let lut;
+  if (supplied && supplied.length === 2048) {
+    if (key === lutKey && lutBytes) return lutBytes;
+    lut = new Uint8Array(supplied);
+    lutKey = key || '';
+  } else {
+    lut = paletteLUT(palette);
+    lutKey = '';
+  }
   if (lut === lutBytes) return lutBytes;
   heap.set(lut, LUT_PTR);
   lutBytes = lut;
@@ -608,7 +621,7 @@ function processJob(job) {
               stride: o.stride, series: o.series, dd: o.dd, fromEnv: !!o.fromEnv };
   }
 
-  const lut = setLut(job.palette, job.paletteStops);
+  const lut = setLut(job.palette, job.paletteStops, job.paletteLUT, job.paletteKey);
   /* Workspace self-check, run once per session (and on demand through
    * `job.dbg`): paint the tail of this tile's slot before the render and see
    * how much of the marker survives.  Any surviving byte means the kernel did

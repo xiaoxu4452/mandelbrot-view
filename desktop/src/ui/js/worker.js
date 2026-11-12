@@ -277,11 +277,22 @@ let lutPalette = null;
 let lutBytes = null;
 
 /** Upload the palette LUT into the kernel heap and cache it for JS repair. */
-function setLut(palette, stops) {
+let lutKey = '';
+function setLut(palette, stops, supplied, key) {
   // A user-defined palette travels with its stops: the worker has no
   // localStorage, so the main thread ships the table definition in the job.
   if (stops) registerCustomPalette(palette, stops);
-  const lut = paletteLUT(palette);
+  /* Exact LUT from the page wins: a palette registered only on the main
+   * thread does not exist in this module's registry. */
+  let lut;
+  if (supplied && supplied.length === 2048) {
+    if (key === lutKey && lutBytes) return lutBytes;
+    lut = new Uint8Array(supplied);
+    lutKey = key || '';
+  } else {
+    lut = paletteLUT(palette);
+    lutKey = '';
+  }
   if (lut === lutBytes) return lutBytes;
   heap.set(lut, LUT_PTR);
   lutBytes = lut;
@@ -472,7 +483,7 @@ function processJob(job) {
     extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refPx, refPy: o.refPy, stride: o.stride, series: o.series, dd: o.dd };
   }
 
-  const lut = setLut(job.palette, job.paletteStops);
+  const lut = setLut(job.palette, job.paletteStops, job.paletteLUT, job.paletteKey);
   const glitches = renderWithWasm(job, mode, extra);
 
   const pixels = job.w * job.h;

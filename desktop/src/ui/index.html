@@ -404,6 +404,13 @@
   <div class="hud-line dim"><span id="hud-engine">—</span><span class="dot"></span><span id="hud-progress">—</span></div>
 </div>
 
+<!-- Whole frame escapes at a single iteration: there is no structure to draw,
+     and a solid field reads as a broken renderer unless it says so. -->
+<div class="nodetail" id="nodetail" hidden>
+  <b data-i18n="noDetailTitle">No structure in this area</b>
+  <span data-i18n="noDetailHint">every pixel escapes at the same iteration — zoom out or go back</span>
+</div>
+
 <div class="toast" id="toast" hidden></div>
 <div class="modal-root" id="modal-root" hidden>
   <div class="modal-scrim" data-close></div>
@@ -422,7 +429,7 @@
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=5"></script>
+<script type="module" src="js/app.js?v=6"></script>
 
 <!-- ==================================================================
      Bootstrap guard (classic script — runs even when ES modules fail).
