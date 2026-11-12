@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU 深度缩放 · Mandelbrot</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg: #05070b;
+    --panel: rgba(12, 18, 28, .82);
+    --line: rgba(120, 190, 255, .16);
+    --text: #dbe9ff;
+    --dim: #7f93ad;
+    --accent: #59e1ff;
+    --warn: #ffb45e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.55 ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    overflow: hidden; }
+  #gpu-canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    cursor: grab; touch-action: none; background: #05070b; }
+  #gpu-canvas.grabbing { cursor: grabbing; }
+  .topbar { position: fixed; top: 0; left: 0; right: 0; z-index: 5; display: flex;
+    align-items: center; gap: 14px; padding: 10px 16px;
+    background: linear-gradient(180deg, rgba(4, 8, 14, .92), rgba(4, 8, 14, 0)); }
+  .brand { font-size: 15px; letter-spacing: .08em; }
+  .brand b { color: var(--accent); font-weight: 600; }
+  .badge { padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px;
+    color: var(--dim); font-size: 11px; }
+  .topbar a { color: var(--dim); text-decoration: none; font-size: 12px; }
+  .topbar a:hover { color: var(--accent); }
+  .spacer { flex: 1; }
+
+  .hud { position: fixed; top: 52px; left: 16px; z-index: 4; width: 268px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 12px 14px; backdrop-filter: blur(10px); }
+  .hud h4 { margin: 0 0 8px; font-size: 11px; font-weight: 500; letter-spacing: .14em;
+    color: var(--dim); text-transform: uppercase; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0;
+    border-bottom: 1px dashed rgba(120, 190, 255, .08); }
+  .row:last-child { border-bottom: 0; }
+  .row span:first-child { color: var(--dim); }
+  .row span:last-child { color: var(--text); text-align: right; }
+  .warn { color: var(--warn) !important; }
+
+  #controls { position: fixed; left: 16px; bottom: 16px; z-index: 4; width: 268px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 12px 14px; backdrop-filter: blur(10px); max-height: 46vh; overflow: auto; }
+  #controls h4 { margin: 0 0 10px; font-size: 11px; font-weight: 500; letter-spacing: .14em;
+    color: var(--dim); text-transform: uppercase; }
+  label.field { display: block; margin: 8px 0 4px; color: var(--dim); font-size: 11px; }
+  input[type="number"], select { width: 100%; background: rgba(255,255,255,.04);
+    border: 1px solid var(--line); border-radius: 8px; color: var(--text);
+    padding: 6px 8px; font: inherit; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--dim); }
+  .check input { accent-color: var(--accent); }
+  .btns { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; margin-top: 10px; }
+  .btns button { background: rgba(89, 225, 255, .07); border: 1px solid var(--line);
+    border-radius: 9px; color: var(--text); padding: 7px 6px; font: inherit;
+    font-size: 11px; cursor: pointer; }
+  .btns button:hover { border-color: var(--accent); color: var(--accent); }
+  .val { float: right; color: var(--text); }
+
+  #loading { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    z-index: 8; padding: 12px 22px; border-radius: 999px; background: rgba(5, 10, 18, .9);
+    border: 1px solid var(--line); color: var(--accent); opacity: 0; pointer-events: none;
+    transition: opacity .2s; }
+  #loading.on { opacity: 1; }
+
+  #fallback { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center;
+    background: rgba(3, 6, 11, .94); padding: 24px; }
+  #fallback[hidden] { display: none; }
+  .card { max-width: 560px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 18px; padding: 26px 28px; }
+  .card h2 { margin: 0 0 10px; font-size: 18px; color: var(--accent); }
+  .card p { color: var(--dim); margin: 8px 0; }
+  .card ul { color: var(--dim); margin: 10px 0 16px 18px; padding: 0; }
+  .card a { color: var(--accent); }
+  .err { color: var(--warn); word-break: break-all; }
+
+  .note { position: fixed; right: 16px; bottom: 16px; z-index: 4; max-width: 320px;
+    color: var(--dim); font-size: 11px; text-align: right; line-height: 1.7; }
+  .note b { color: var(--text); font-weight: 500; }
+  @media (max-width: 860px) {
+    .hud { display: none; }
+    #controls { width: calc(100% - 32px); max-height: 40vh; }
+    .note { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="gpu-canvas"></canvas>
+
+<header class="topbar">
+  <div class="brand"><b>WebGPU</b> 深度缩放</div>
+  <span class="badge">WGSL · Extended Float · gmp-wasm/MPFR</span>
+  <div class="spacer"></div>
+  <span class="badge" id="hud-phase">初始化</span>
+  <a href="./index.html">返回主程序</a>
+</header>
+
+<aside class="hud">
+  <h4>渲染状态</h4>
+  <div class="row"><span>深度</span><span id="hud-depth">—</span></div>
+  <div class="row"><span>参考精度</span><span id="hud-bits">—</span></div>
+  <div class="row"><span>精度余量</span><span id="hud-margin">—</span></div>
+  <div class="row"><span>轨道长度</span><span id="hud-ref">—</span></div>
+  <div class="row"><span>轨道 / 帧</span><span id="hud-time">—</span></div>
+  <div class="row"><span>Glitch</span><span id="hud-glitch">—</span></div>
+  <div class="row"><span>BLA</span><span id="hud-bla">—</span></div>
+  <div class="row"><span>分辨率</span><span id="hud-size">—</span></div>
+  <div class="row"><span>目标</span><span id="hud-format">rgb10a2unorm</span></div>
+</aside>
+
+<aside id="controls">
+  <h4>控制</h4>
+  <label class="field">迭代上限</label>
+  <input id="opt-iter" type="number" min="200" max="30000" step="100" value="2000">
+  <label class="field">着色模式</label>
+  <select id="opt-mode">
+    <option value="0">IQ 余弦调色板</option>
+    <option value="1">距离估计</option>
+  </select>
+  <label class="field">调色频率 <span class="val" id="v-freq">0.035</span></label>
+  <input id="freq" type="range" min="0.002" max="0.4" step="0.001" value="0.035">
+  <label class="field">相位 <span class="val" id="v-phase">0.080</span></label>
+  <input id="phase" type="range" min="0" max="1" step="0.005" value="0.08">
+  <label class="field">色彩偏移 <span class="val" id="v-offset">0.000</span></label>
+  <input id="offset" type="range" min="0" max="6.283" step="0.01" value="0">
+  <label class="field">曝光 <span class="val" id="v-exposure">1.000</span></label>
+  <input id="exposure" type="range" min="0.2" max="2.5" step="0.05" value="1">
+  <label class="check"><input id="opt-bla" type="checkbox" checked> 启用 BLA 跳过</label>
+  <label class="field">精度安全系数</label>
+  <select id="opt-safety">
+    <option value="1">1×（按需）</option>
+    <option value="3" selected>3×（3000+ 位十进制 @ 1e1000）</option>
+  </select>
+  <div class="btns">
+    <button data-depth="-100" data-iter="2000">1e-100</button>
+    <button data-depth="-300" data-iter="3000">1e-300</button>
+    <button data-depth="-660" data-iter="6000">1e-660</button>
+    <button data-depth="-1000" data-iter="8000">1e-1000</button>
+  </div>
+  <div class="btns">
+    <button id="btn-reset">重置视图</button>
+  </div>
+</aside>
+
+<div class="note">
+  <b>像素层</b> WGSL 计算着色器 · 扰动 δ + 共享额外指数<br>
+  <b>参考层</b> gmp-wasm（MPFR C/wasm）· 一次计算多帧复用<br>
+  <b>显示层</b> rgb10a2unorm 目标 + IQ 余弦调色板
+</div>
+
+<div id="loading">计算 MPFR 参考轨道…</div>
+
+<div id="fallback" hidden>
+  <div class="card">
+    <h2>WebGPU 不可用</h2>
+    <p class="err" id="fallback-reason"></p>
+    <p>本页的逐像素扰动迭代完全运行在 WebGPU 计算着色器中，不使用 Wasm 或 JS 像素循环，也不依赖 WebGL / float64。需要以下浏览器版本：</p>
+    <ul>
+      <li>Chrome 113+ / Edge 113+</li>
+      <li>Firefox 141+</li>
+      <li>Safari 26+</li>
+    </ul>
+    <p>请开启浏览器硬件加速，或更新浏览器后重试。</p>
+    <p><a href="./index.html">返回主程序</a></p>
+  </div>
+</div>
+
+<script type="module" src="./js/wgpu/app.js"></script>
+</body>
+</html>

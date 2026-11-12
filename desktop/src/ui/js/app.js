@@ -13,7 +13,7 @@ import { openCorePanel } from './corepanel.js';
 import { initGlassSelects } from './glass-select.js';
 import { composeTile } from './drawlib.js';
 import { SceneRenderer } from './glscene.js';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasExport, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig } from './native.js';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig } from './native.js';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
          readColorschemes, writeColorschemes, newColorscheme } from './gpu.js';
 import { initJuliaView } from './juliaview.js';
@@ -324,6 +324,12 @@ function sceneCanDraw(v, final) {
   return true;
 }
 
+/** The page's own shader may only own the picture while the page canvas is
+ * what the user sees.  After the shell's GL canvas has presented, a draw here
+ * lands in a hidden layer — and, worse, it satisfies every "the shader already
+ * painted this frame" check, so the shell never renders the real one. */
+function pageShaderOwns() { return !nativeGLPresented(); }
+
 /** Draw the current view with the shader.  Returns true when it painted. */
 function sceneDraw(v, opts = {}) {
   if (!v) return false;
@@ -346,6 +352,7 @@ function sceneDraw(v, opts = {}) {
 
 /** Committed frame through the shader, or false to let the CPU pass run. */
 function scenePass() {
+  if (!pageShaderOwns()) return false;
   const v = sceneView();
   if (!v || !sceneDraw(v, { final: true })) {
     /* The shader declined.  `html.gl-surface` sets #fractal opacity:0, so
@@ -398,6 +405,7 @@ function scenePass() {
  * fragment pass per event is both cheaper and sharp, so the shader takes the
  * gesture whenever it can and the blit remains the fallback. */
 function sceneLive() {
+  if (!pageShaderOwns()) return false;
   if (performance.now() - sceneDrawAt < 6) return false;
   const v = sceneView();
   /* Do not drop the GL surface for a view the shader simply cannot reach: every
@@ -508,8 +516,25 @@ function depthNow() {
   return -psLog2Now() / Math.log2(10);
 }
 
+/* Magnification of what is on screen, measured on the pixel scale -- the same
+ * quantity the renderer uses to place a pixel.  `depthNow()` is that scale
+ * against 1.0 (10^3.2 for a wide opening frame), which is a precision input,
+ * not a zoom.  Captured on the first HUD update so "1x" is exactly the opening
+ * frame.  (Using state.span here read 795x at start-up: its mantissa/exponent
+ * pair is not a plain decimal.) */
+let homeDepth = null;
+function zoomDepthNow(capture) {
+  const d = depthNow();
+  /* Capture on the first *completed* frame, not on the first paint: boot
+   * restores the saved view a moment later, so a capture taken during the
+   * first paint made the opening frame read 8.5x. */
+  if (homeDepth === null && capture) homeDepth = d;
+  if (homeDepth === null) return 0;
+  return Math.max(0, d - homeDepth);
+}
+
 function bitsNow() {
-  return resolveBitsFromLog2(state.bits, psLog2Now());
+  return resolveBitsFromLog2(state.bits, psLog2Now(), effectiveIterTotal());
 }
 
 function shiftCoord(baseStr, delta, bits) {
@@ -521,10 +546,17 @@ function shiftCoord(baseStr, delta, bits) {
 
 /** Shift a coordinate by a mant×2^exp offset so that doubles cannot underflow */
 function shiftCoordScaled(baseStr, val, exp, bits) {
-  const ctx2 = contextFor(Math.max(128, bits));
+  /* `bits` is the single precision decision for this frame, taken once from
+   * requiredBitsFromLog2() -- the reference's `depth + 0x40` rule.  This used
+   * to raise it to 128 regardless and then print `bits * 0.32` decimal digits,
+   * so the HUD, this arithmetic and the renderer were three different widths.
+   * Use exactly the width that was chosen; log10(2) digits per bit is the
+   * correct decimal length, not a 0.32 fudge. */
+  const ctx2 = contextFor(bits);
   const b = ctx2.fromString(baseStr);
   const d = ctx2.shl(ctx2.fromNumber(val), exp);
-  return ctx2.toString(b + d, Math.ceil(bits * 0.32) + 10);
+  const digits = Math.max(20, Math.floor(bits * 0.30103));
+  return ctx2.toString(b + d, digits);
 }
 
 /**
@@ -901,7 +933,7 @@ function stopsPayload() {
   return out;
 }
 
-/* The 区间 slider is logarithmic: 0 means "fit the cycle to the frame", and
+/* The span slider is logarithmic: 0 means "fit the cycle to the frame", and
  * everything above it maps to 0.05 … 2000 iterations per palette cycle. */
 const SPAN_MIN = 0.05;
 const SPAN_MAX = 2000;
@@ -1383,7 +1415,19 @@ function passProgress(idx, frac) {
  * so a broken swapchain can never leave the window blank. */
 let nativeSurface = false;
 function setNativeSurface(on) {
-  if (!NATIVE || !nativeCanvasMode() || nativeSurface === on) return;
+  /* Once the shell's GL canvas is presenting, the page canvas must stay hidden:
+   * it has no pixels to contribute.  Before the first committed frame the page
+   * must keep painting, so `nativeGLPresented()` (not `nativeGLOwned()`) gates
+   * the *enabling*.
+   *
+   * Disabling is always allowed.  Forcing `on` here made the page unable to
+   * come back to its own canvas when the shell cannot render the pass at all
+   * (a custom formula, a scheme on the JS path): the window then showed the
+   * shell's last frame forever, because the fresh pixels were painted into a
+   * layer with `opacity: 0`. */
+  if (!NATIVE || !nativeCanvasMode()) return;
+  if (on && !nativeGLPresented()) on = false;
+  if (nativeSurface === on) return;
   nativeSurface = on;
   if (document.documentElement)
     document.documentElement.classList.toggle('native-surface', on);
@@ -1960,7 +2004,7 @@ function gpuPass(vId, plan, done, planList) {
     currentPass = idx;
     resetPassStats();
     addPassStats(meta);
-    lastMeta = Object.assign({}, meta || {}, { ms });
+    lastMeta = Object.assign({}, meta || {}, { ms, done: true, final: !!final });
     updateHud();
     takeSnapshot();
     if (!splash.finished && final) splash.finish();
@@ -2038,7 +2082,7 @@ function runPass(vId, plan, done, planList) {
    * field carries (the smooth count, the distance estimate, the escape count)
    * is exactly what the reference's shaders read — and a colour change then
    * costs one draw call instead of another iteration pass. */
-  if (gpuOk && state.gpu && NATIVE &&
+  if (gpuOk && state.gpu && NATIVE && pageShaderOwns() &&
       gpuPass(vId, plan, done, planList)) return;
   /* The 2D canvas is the picture from here on: with a custom formula (or a
    * scheme that failed to compile) the shader layer must not stay on top of
@@ -2208,7 +2252,11 @@ function runPass(vId, plan, done, planList) {
          * That is the black band that appeared every 256 pixels. */
         if (!msg.frame) drawTile(msg, passScale, passPw, passPh);
         addPassStats(msg.meta);
-        lastMeta = msg.meta;
+        /* The per-tile meta describes ONE tile.  Everything the HUD derives
+         * from it that claims something about the whole frame (the "no
+         * structure" overlay above all) waits for `done`, which is only set
+         * once every tile of the pass has landed. */
+        lastMeta = Object.assign({}, msg.meta, { done: false, final });
         got++;
         tileTotal = total;
         tileDone = Math.round(passProgress(idx, got / total) / 100 * total);
@@ -2219,7 +2267,9 @@ function runPass(vId, plan, done, planList) {
           // The HUD's "done" time must be this pass, not the last tile's:
           // the final pass is split into many small tiles whose per-tile
           // renderMs rounds to 0, which made the HUD look timing-less.
-          lastMeta = Object.assign({}, msg.meta, { ms: performance.now() - passT0 });
+          lastMeta = Object.assign({}, msg.meta, {
+            ms: performance.now() - passT0, done: true, final
+          });
           stopPassClock();
           updateHud();
           /* A complete final pass in field mode becomes the re-shade cache.
@@ -2336,7 +2386,7 @@ function maybeLivePass() {
   /* The shader is already drawing every gesture frame at full resolution; a
    * CPU live pass on top of it would fight for the same canvas and overwrite
    * the HUD with a tile that never reaches the screen. */
-  if (scene.ok && state.gpu && sceneView()) return;
+  if (pageShaderOwns() && scene.ok && state.gpu && sceneView()) return;
   if (!NATIVE && !wasmEnabled) return;
   if (liveBusy) { liveQueued = true; return; }
   const now = performance.now();
@@ -2431,11 +2481,11 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
   const W = canvas.width, H = canvas.height;
   // Route 1: the frame lives in the native swapchain, so the gesture feedback
   // is a GPU transform in the shell instead of a JS canvas blit.
-  if (nativeCanvasMode()) {
+  if (nativePreviewTarget()) {
     if (!W || !H) return;
     const ndx = dx / W, ndy = dy / H, ncx = cx / W, ncy = cy / H;
     liveApply(ndx, ndy, scale, ncx, ncy);
-    nativeCanvasPreview(ndx, ndy, scale, ncx, ncy);
+    nativeCanvasPreview(ndx, ndy, scale, ncx, ncy, viewId);
     return;
   }
   /* A shader gesture is a fresh draw rather than a transform of the previous
@@ -2444,14 +2494,25 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
   /* The shader frame is still the visible picture when it merely throttled
    * this event (one draw per 6 ms).  Painting the gesture transform into the
    * hidden 2D canvas is wasted work, and when the class later flips it exposes
-   * a magnified low-resolution bitmap instead of the shader's sharp frame. */
-  if (glSurface && scene.ok && state.gpu && sceneView()) return;
+   * a magnified low-resolution bitmap instead of the shader's sharp frame.
+   *
+   * `sceneCanDraw` — not `sceneView()` alone: a view the shader builds but
+   * cannot draw (past df64's reach) returned truthy here and every pointer
+   * event was swallowed, so a deep pan did not move the picture at all. */
+  if (glSurface && scene.ok && state.gpu) {
+    const sv = sceneView();
+    if (sv && sceneCanDraw(sv, false)) return;
+  }
   if (!snap.width) return;
   setGlSurface(false);
   ctx.save();
-  ctx.fillStyle = getComputedStyle(document.body).backgroundColor || '#000';
-  ctx.fillRect(0, 0, W, H);
+  /* A pinch scales the snapshot, so it exposes a border on all four sides and
+   * there is no edge to continue; the page colour is the honest fill there.
+   * (A pan does the opposite — see the edge stretch below.) */
   if (scale !== 1) {
+    ctx.fillStyle = getComputedStyle(document.documentElement).backgroundColor ||
+                    getComputedStyle(document.body).backgroundColor || '#06080c';
+    ctx.fillRect(0, 0, W, H);
     ctx.translate(cx, cy);
     ctx.scale(scale, scale);
     ctx.translate(-cx, -cy);
@@ -2460,6 +2521,18 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(snap, dx, dy);
   ctx.restore();
+  /* A pan exposes a strip of the frame the snapshot does not cover.  Filling
+   * it with the page background reads as a hard seam — the picture's own
+   * background is whatever the renderer painted, and with the native surface
+   * active the body colour is transparent, i.e. pure black.  Stretching the
+   * snapshot's last row/column into the gap continues the picture instead:
+   * one blit, no resampling of the visible area, no seam. */
+  if (scale === 1) {
+    if (dx > 0) ctx.drawImage(snap, 0, 0, 1, snap.height, 0, 0, dx, H);
+    else if (dx < 0) ctx.drawImage(snap, snap.width - 1, 0, 1, snap.height, W + dx, 0, -dx, H);
+    if (dy > 0) ctx.drawImage(snap, 0, 0, snap.width, 1, 0, 0, W, dy);
+    else if (dy < 0) ctx.drawImage(snap, 0, snap.height - 1, snap.width, 1, 0, H + dy, W, -dy);
+  }
 }
 
 function takeSnapshot() {
@@ -2486,8 +2559,15 @@ function takeSnapshot() {
   }
 }
 
-/* ---- drag preview (low quality while panning, full quality on release) ---- */
-let dragPreviewTimer = 0, lastDragPreviewAt = 0;
+/* ---- pan ---------------------------------------------------------------
+ * A pan moves the view, not a bitmap.  The old path translated the previous
+ * frame and started a fresh (cancelling) pass every 55 ms; whichever renderer
+ * owned the picture then either ignored the transform (a pass landed at the
+ * old centre and snapped the image back) or never finished a pass at all,
+ * which is exactly what "dragging does nothing, the picture flickers" was.
+ * The gesture now only ever does two things per pointer event: update the
+ * centre, and ask the surface that is actually visible to show it.
+ * ---------------------------------------------------------------------- */
 
 /**
  * A screen-pixel offset expressed in the plane's own axes.
@@ -2564,30 +2644,19 @@ function panCenter(base, dx, dy) {
 }
 
 /**
- * While a pan is in progress, draw a live medium-resolution pass of the panned
- * view at the same ~55 ms cadence as the wheel zoom, so the exposed edges fill
- * in with real content instead of staying stretched/blurry.  The full
- * progressive render still runs on release.
+ * Hand one pan step to the shell's own GL canvas.
+ *
+ * The transform is ABSOLUTE — the state of the committed frame relative to the
+ * view the hand is asking for — not a delta.  The shell composes previews, so
+ * feeding it the running offset on every pointer event multiplied the pan by
+ * the number of events: the picture flew away from the cursor and snapped back
+ * on release.  With an absolute transform a duplicated or dropped event can
+ * only ever leave the picture at a slightly older position, never accumulate.
  */
-function scheduleDragPreview() {
-  clearTimeout(dragPreviewTimer);
-  const nowT = performance.now();
-  dragPreviewTimer = setTimeout(() => {
-    dragPreviewTimer = 0;
-    if (!drag || !drag.moved) return;
-    const vf = viewFit();
-    const dx = (drag.px - drag.sx) / vf.k;
-    const dy = (drag.py - drag.sy) / vf.k;
-    if (Math.hypot(dx, dy) < 3) return;
-    lastDragPreviewAt = performance.now();
-    state.center = panCenter(drag.baseCenter, dx, dy);
-    renderPlan(QUICK_PLAN, () => {
-      // Rebase the gesture on the frame just drawn, so later blits line up.
-      if (!drag) return;
-      drag.sx = drag.px; drag.sy = drag.py;
-      drag.baseCenter = { re: state.center.re, im: state.center.im };
-    });
-  }, Math.max(0, 55 - (nowT - lastDragPreviewAt)));
+function nativePan(dxPx, dyPx, W, H) {
+  if (!W || !H) return false;
+  nativeCanvasSetPreview({ sx: 1, ox: -dxPx / W, sy: 1, oy: -dyPx / H }, viewId);
+  return true;
 }
 
 /* ---------------- Interaction ---------------- */
@@ -2730,9 +2799,27 @@ canvas.addEventListener('pointermove', (e) => {
   const dy = (e.clientY - drag.sy) / vf.k;
   drag.px = e.clientX;
   drag.py = e.clientY;
-  if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 1) drag.moved = true;
-  blitSnapshot(dx, dy);
-  scheduleDragPreview();
+  if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 1) {
+    /* First real movement: a pass that is already computing renders the *old*
+     * centre, and if it lands mid-gesture it paints the pre-drag view over the
+     * panned one — the image jumps back under the hand.  Drop it here rather
+     * than on pointerdown, so a plain click does not cancel a render. */
+    if (!drag.moved) cancelAll();
+    drag.moved = true;
+  }
+  /* Rebuild the centre from the gesture's anchor on every event.  Accumulating
+   * would drift with the device's event rate, and a centre that has already
+   * been applied cannot be un-applied when a stale frame lands. */
+  state.center = panCenter(drag.baseCenter, dx, dy);
+  updateHudSoon();
+  /* Whichever surface is visible gets the new view in the cheapest way it can:
+   * the shell's GL canvas is a GPU transform of the committed frame, the page's
+   * shader is one fragment pass, and only the CPU fallback moves a bitmap. */
+  if (nativePreviewTarget()) {
+    nativePan(dx, dy, canvas.width, canvas.height);
+  } else if (!sceneLive()) {
+    blitSnapshot(dx, dy);
+  }
 });
 
 canvas.addEventListener('pointerup', (e) => {
@@ -2757,25 +2844,22 @@ canvas.addEventListener('pointerup', (e) => {
   }
 
   if (!drag) return;
-  clearTimeout(dragPreviewTimer);
-  dragPreviewTimer = 0;
   canvas.classList.remove('dragging');
-  const vf = viewFit();
-  const dxCss = e.clientX - drag.sx;
-  const dyCss = e.clientY - drag.sy;
-  const dx = dxCss / vf.k;
-  const dy = dyCss / vf.k;
   const wasDrag = drag.moved;
-  const base = drag.baseCenter;
   drag = null;
   if (!wasDrag) return;
-  commitPan(base, dx, dy);
+  /* The view already moved with the pointer events; the release only has to
+   * turn that gesture view into a full-quality frame.  Re-applying the offset
+   * here (the old commitPan) moved the picture a second time.  No reset is
+   * sent for the native surfaces: the commit that is about to land carries the
+   * transform, and clearing it here would visibly snap the picture back for
+   * the duration of the render. */
+  liveReset();
+  renderNow();
 });
 
 canvas.addEventListener('pointercancel', (e) => {
   pointers.delete(e.pointerId);
-  clearTimeout(dragPreviewTimer);
-  dragPreviewTimer = 0;
   if (pinch) { pinch = null; return; }
   drag = null;
   canvas.classList.remove('dragging');
@@ -2842,7 +2926,8 @@ function zoomView(px, py, factor) {
    * (1 - factor) of the offset — rotated, because the offset is measured on
    * screen and applied on the plane. */
   const cx = (px - W / 2), cy = (py - H / 2);
-  const bits = Math.max(160, requiredBitsFromLog2(log2New) + 40);
+  // Same width the renderer will use: the core folds in log2(maxIter).
+  const bits = requiredBitsFromLog2(log2New, effectiveIterTotal());
   const d = planeDelta(cx, cy);
   const k = 1 - factor;
   state.center = {
@@ -2961,7 +3046,8 @@ function glideApply(factor, px, py) {
   if (spanNum() * factor > MAX_SPAN) return false;
 
   const cx = (px - W / 2), cy = (py - H / 2);
-  const bits = Math.max(160, requiredBitsFromLog2(log2New) + 40);
+  // Same width the renderer will use: the core folds in log2(maxIter).
+  const bits = requiredBitsFromLog2(log2New, effectiveIterTotal());
   const d = planeDelta(cx, cy);
   const k = 1 - factor;
   state.center = {
@@ -2978,7 +3064,11 @@ function glideApply(factor, px, py) {
    * depth.  Keep the committed snapshot as the single source and apply the
    * accumulated gesture scale once. */
   glide.bitmapScale = clamp(glide.bitmapScale / factor, 0.08, 12);
-  blitSnapshot(0, 0, glide.bitmapScale, px, py);
+  /* The 2D path resamples ONE committed snapshot, so it wants the running
+   * scale.  A native surface composes the transform on its side, so it wants
+   * this frame's step only: sending the running scale there squared the zoom
+   * on every event. */
+  blitSnapshot(0, 0, nativeCanvasMode() ? factor : glide.bitmapScale, px, py);
   updateHudSoon();
   return true;
 }
@@ -3013,7 +3103,8 @@ function updateHud(done = false) {
    * it was the page's own guess, which stayed at 64 for every zoom shallower
    * than 2^-45 — the "auto precision" menu looked like it did nothing. */
   const bits = (lastMeta && lastMeta.bits > 0) ? lastMeta.bits : bitsNow();
-  $('hud-depth').textContent = `${t('zoom')} ${fmtZoomFactor(d)}`;
+  const zd = zoomDepthNow(done);
+  $('hud-depth').textContent = `${t('zoom')} ${fmtZoomFactor(zd)}`;
   /* A phone HUD is ~46 characters wide in total, so the coordinate line has to
    * give up digits rather than overflow: 16 sig-figs on a desktop, 10 here.
    * The value itself is untouched — this is display only. */
@@ -3045,19 +3136,34 @@ function updateHud(done = false) {
   /* The status row is one line and clips this on a narrow window, so the same
    * fact is also stated in the middle of the picture. */
   let noDetail = false;
-  if (lastMeta) {
+  /* Only a *finished, final* pass may say anything about the frame's content.
+   * A skeleton pass runs on a deliberately small iteration budget, so every
+   * pixel "escapes" at the cap and the union looks like a flat frame — that is
+   * where the "no structure" banner came from, flickering in and out during
+   * every zoom and every drag. */
+  if (lastMeta && lastMeta.done && lastMeta.final !== false) {
     /* Union over the pass, not the last tile: a single uniform tile must not
-     * label a frame full of filaments as "no structure".  Only claim it when
-     * the escape counts actually came from pixels — the JS renderers used to
-     * omit them, and 0/0 silently meant "structureless" for every frame. */
+     * label a frame full of filaments as "no structure". */
     const stats = passStats;
     const lo = stats && isFinite(stats.escMin) ? stats.escMin : lastMeta.escMin;
     const hi = stats && isFinite(stats.escMax) ? stats.escMax : lastMeta.escMax;
     const bounded = stats ? stats.bounded : (lastMeta.bounded | 0);
     const known = Number.isFinite(lo) && Number.isFinite(hi);
+    /* A pixel that reached the cap did not prove there is nothing to draw —
+     * it proved the budget was too small.  That is a different message, and
+     * not one this banner is allowed to make. */
+    const cap = lastMeta.cap | 0;
+    const atLimit = cap > 0 && hi >= cap - 1;
     if (known && hi > lo) colourHint = ` · ${t('escRange')} ${lo | 0}–${hi | 0}`;
-    if (known && hi - lo <= 1 && !(bounded > 0)) {
+    if (!atLimit && known && hi - lo <= 1 && !(bounded > 0)) {
       colourHint += ` · ${t('noDetail')}`;
+      noDetail = true;
+    }
+    /* A frame with no escaping pixel at all is *inside* the set: it has one
+     * colour by definition, and without saying so a full-frame black reads as
+     * a broken renderer rather than as the maths it is. */
+    if (!atLimit && known && hi === 0 && lo === 0 && bounded > 0) {
+      colourHint += ` · ${t('allInterior')}`;
       noDetail = true;
     }
     if (lastMeta.cyc > 0 && lastMeta.cyc < 1000) {
@@ -3076,7 +3182,7 @@ function updateHud(done = false) {
       + (liveMs > 15000 ? ` · ${t('slowDeep')}` : '');
 
   $('kv-center').textContent = `${trimNum(state.center.re, 22)} , ${trimNum(state.center.im, 22)}`;
-  $('kv-zoom').textContent = fmtZoomFactor(d);
+  $('kv-zoom').textContent = fmtZoomFactor(zd);
 
   const nd = $('nodetail');
   if (nd) nd.hidden = !noDetail;
@@ -3602,7 +3708,7 @@ function syncFormulaUi() {
 
 function setFamily(kind, power) {
   /* Choosing a built-in family leaves custom mode; the formula stays stored so
-   * picking 自定义公式… again brings it back. */
+   * picking the custom-formula entry again brings it back. */
   if (kind === 'custom') { openFormula(); return; }
   state.spec.mode = 'm';
   state.spec.kind = kind || 'mandelbrot';
@@ -6208,6 +6314,11 @@ function onWindowResize() {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => renderNow(), 150);
 }
+/* The shell tells us when its own GL canvas has something on screen; from then
+ * on the page is chrome only. */
+window.addEventListener('mbNativeCommit', () => {
+  if (nativeGLPresented()) setNativeSurface(true);
+});
 window.addEventListener('resize', onWindowResize);
 window.addEventListener('orientationchange', onWindowResize);
 
@@ -6405,7 +6516,7 @@ function boot() {
   // Framing model: resizing / maximising / restoring only changes the frame.
   // The rendered bitmap keeps its size and content; CSS `object-fit: contain`
   // presents it proportionally inside the new frame, and no render pass is
-  // triggered.  (HD toggle and "适应窗口" still re-render on purpose.)
+  // triggered.  (The HD toggle and "fit to window" still re-render on purpose.)
   updateHud();
 }
 

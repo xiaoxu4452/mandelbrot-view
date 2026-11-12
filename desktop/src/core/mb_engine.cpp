@@ -12,10 +12,16 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace mbc {
 
 using namespace detail;
+
+extern "C" double mbm_exp2(double);
+extern "C" double mbm_pow(double, double);
 
 /* Fingerprint of everything that can change the colour of a vertex.
  *
@@ -96,7 +102,7 @@ int requiredBits(double psLog2, int maxIter) {
   double need = -psLog2 + 64.0;
   if (maxIter > 1) need += std::log2((double)maxIter);
   if (!(need > 64.0)) need = 64.0;
-  if (need > 16384.0) need = 16384.0;
+  if (need > 32768.0) need = 32768.0;
   int b = (int)(std::ceil(need / 64.0) * 64.0);
   if (b < 96) b = 96;
   return b;
@@ -274,8 +280,12 @@ static void canvasFillCell(const CFill& f, int x0, int y0, int s, double sa,
         const int n = (int)fl;
         /* shade() reads the smooth count through |z|^2.  Solve for the |z|^2
          * that reproduces `si` exactly: smoothIteration(n, m2, 0) =
-         * n - log2(log2 m2), so log2 m2 = 2^(n - si). */
-        const double m2 = std::exp2(std::exp2((double)n - si));
+         * n - log2(log2 m2), so log2 m2 = 2^(n - si).
+         *
+         * The musl entry points, not std::exp2: the CRT's exp2 in this binary
+         * returns garbage (see pixelScale() in mb_core.h for the measurement),
+         * while the vendored libm is the one the project already depends on. */
+        const double m2 = mbm_exp2(mbm_exp2((double)n - si));
         shade(px, *f.g, n, m2, 0.0, 0.0);
       }
       px[3] = 255;
@@ -380,7 +390,7 @@ static void canvasFillCellZ(const CFill& f, int x0, int y0, int s, int n,
                           B.si * u * (1.0 - v) + C.si * (1.0 - u) * v +
                           D.si * u * v;
         const int nn = (int)std::floor(std::max(si, 0.0));
-        const double m2c = std::exp2(std::exp2((double)nn - si));
+        const double m2c = mbm_exp2(mbm_exp2((double)nn - si));
         shade(px, *f.g, nn, m2c, 0.0, 0.0);
       }
       px[3] = 255;
@@ -986,6 +996,21 @@ struct Engine::Impl {
 
 void Engine::Impl::parallelFor(int count, const std::function<void(int)>& fn) {
   if (count <= 0) return;
+#if defined(_OPENMP)
+  /* OpenMP is an opt-in second backend for the same strip loop.  The spin-wait
+   * pool stays the default because it keeps worker threads parked on the
+   * interactive path; OpenMP rebuilds its team per region and only wins when
+   * the region is long.  MB_OPENMP=1 selects it for a measurement. */
+  static const bool useOmp = [] {
+    const char* s = std::getenv("MB_OPENMP");
+    return s && s[0] != '0';
+  }();
+  if (useOmp && threads > 1 && count > 1 && !omp_in_parallel()) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (int i = 0; i < count; ++i) fn(i);
+    return;
+  }
+#endif
   if (threads <= 1 || count == 1 || !pool) {
     for (int i = 0; i < count; ++i) fn(i);
     return;
@@ -1005,11 +1030,11 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
   const int h = std::max(1, q.height);
   const int pitch = q.outPitch > 0 ? q.outPitch : w;
 
-  double psLog2 = std::log2(q.spanMant) + (double)q.spanExp -
-                  std::log2((double)std::max(1, std::max(vw, vh)));
-  if (psLog2 < -1020.0) psLog2 = -1020.0;    // keep the plane math in range
-  double ps = std::exp2(psLog2);
-  if (!(ps > 0.0)) ps = 1e-307;
+  const double psLog2 = pixelScaleLog2(q);
+  double psMant = 1.0;
+  int psExp = 0;
+  pixelScaleParts(q, psMant, psExp);
+  const double ps = pixelScale(q);
 
   /* Explicit ceiling from the caller.  No zoom-derived iteration limit: the
    * reference program's examples carry no iteration key and its disassembly
@@ -1101,7 +1126,8 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
    * of a stored table.  p > 2 uses the general coefficients. */
   const bool famSupported =
       (q.spec.kind == 0 && q.spec.power >= 2 && q.spec.power <= 8) ||
-      (q.spec.kind >= 1 && q.spec.kind <= 4 && q.spec.power == 2);
+      (q.spec.kind >= 1 && q.spec.kind <= 4 && q.spec.power == 2) ||
+      (q.spec.kind == 5 && q.spec.power == 2);
   static const bool forcePerturb = std::getenv("MB_FORCEPERT") != nullptr;
   static const bool noPerturb = std::getenv("MB_NOPERT") != nullptr;
   /* Burning ship and celtic fold along the orbit: a single reference cannot
@@ -1175,6 +1201,24 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
   Ctx g;
   g.q = &q;
   g.ps = ps;
+  /* The exact pair behind ps.  `ps` is zero from ~1e-308 on; the pair still
+   * names the pitch, and `deepScale` switches the kernels that need it. */
+  g.psMant = psMant;
+  g.psExp = psExp;
+  g.psLog2 = psLog2;
+  /* MB_NODEEP=1 pins the old plain-double kernels, which is how the deep path
+   * is A/B checked against it at the depth where both still work (1e-300). */
+  static const bool noDeep = std::getenv("MB_NODEEP") != nullptr;
+  g.deepScale = !noDeep && (!(ps > 0.0) || psLog2 < -1000.0);
+  if (const char* pslog = std::getenv("MB_PSLOG")) {
+    if (FILE* f = std::fopen(pslog, "a")) {
+      std::fprintf(f, "[ps] w=%d h=%d vw=%d vh=%d psLog2=%.9f ps=%.17g span=%g*2^%d "
+                      "cre=%s cim=%s\n",
+                   w, h, vw, vh, psLog2, ps, q.spanMant, q.spanExp,
+                   q.centerRe.c_str(), q.centerIm.c_str());
+      std::fclose(f);
+    }
+  }
   g.halfW = 0.5 * (double)vw;
   g.halfH = 0.5 * (double)vh;
   g.rotC = std::cos(q.rotation);
@@ -1182,6 +1226,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
   g.julia = q.spec.mode == 1;
   g.kind = q.spec.kind;
   g.power = q.spec.power;
+  g.phoenixP = q.spec.phoenixP;
   g.maxIter = maxIter;
   g.offset = q.offset;
   g.pal = q.pal;
@@ -1288,11 +1333,19 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
           if (d > dcMax) dcMax = d;
         }
       }
+      /* Below the double range (ps == 0) the geometric form above evaluates
+       * to zero, and a zero extent makes every threshold test pass: the series
+       * would claim to be valid for the whole orbit.  The farthest corner is
+       * the half-diagonal by construction, so carry the whole test in logs
+       * from the exact pitch pair instead. */
+      const double dcMaxLog2 =
+          ps > 0.0 ? std::log2(dcMax > 0.0 ? dcMax : 1e-300)
+                   : psLog2 + std::log2(std::hypot((double)vw, (double)vh) + 1.0);
       buildFolds(r, q.spec.kind);
       /* The coefficient table has to exist before the series is built: for
        * p > 2 the series recursions read J/H/K out of it. */
       if (famKernel) buildDevTable(r, q.spec.power);
-      buildSeries(r, dcMax, q.spec.mode != 1, q.spec.power, q.spec.kind);
+      buildSeries(r, dcMaxLog2, q.spec.mode != 1, q.spec.power, q.spec.kind);
     }
     st.skip = refs.empty() ? 0 : refs[0].skip;
   }
@@ -1311,7 +1364,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
    * it and defaults to 8 iterations.
    *
    * One rule is enforced for both, because breaking it is what produced the
-   * fan-shaped colour "断层" at depth: a band that is shorter than the frame
+   * fan-shaped colour "seam" at depth: a band that is shorter than the frame
    * can resolve is not detail, it is moiré.  The frame's own escape-count
    * span, measured on a coarse grid, says how many bands it can carry.
    */
@@ -1398,7 +1451,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
    * palette phase depend on `maxIter`.  Since the observation machinery may
    * raise `maxIter` between passes of the *same* view, that turned into whole
    * frames changing colour halfway through a render, and tiles of one pass
-   * disagreeing with tiles of the next: the hard-edged colour breaks ("断层")
+   * disagreeing with tiles of the next: the hard-edged colour breaks ("seam")
    * at depth had no other cause.
    *
    * Local aliasing is still handled, but downstream and locally: see the
@@ -1610,7 +1663,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
      * palette is a function of, so its gradient across one pixel says how many
      * palette cycles that pixel covers.  More than half a cycle per pixel is
      * below the sampling limit: the palette can no longer be drawn, only
-     * aliased, which is the fan-shaped "断层" seen at depth.  Averaging the
+     * aliased, which is the fan-shaped "seam" seen at depth.  Averaging the
      * palette over exactly that interval is the band-limited result — no
      * invented structure, no moiré.
      *
@@ -1698,9 +1751,15 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
         float* f = fieldOut->at(x, y);
         if (n < 0) {
           const double cyc = (n < -1) ? (double)(-n - 1) : 0.0;
-          f[0] = (float)(-cyc);      // smoothiter: negated period
+          /* Negated period.  A pixel the cycle finder never named has period
+           * 0, and writing -0.0 would compare as NOT negative — every shader
+           * tests `smoothiter < 0` to pick the interior colour, so those
+           * pixels would paint as "escaped at iteration 0".  The smallest
+           * negative float carries "interior, period unknown" instead. */
+          const double enc = cyc > 0.0 ? -cyc : -1e-30;
+          f[0] = (float)enc;         // smoothiter: negated period
           f[1] = 0.0f;               // distance is meaningless inside
-          f[2] = (float)(-cyc);      // iter: the same encoding
+          f[2] = (float)enc;         // iter: the same encoding
           f[3] = 0.0f;
           /* CHANNEL_VALUE is only read on the escaped branch of the scheme,
            * but write the channels anyway so a stale texel from the previous
@@ -1715,7 +1774,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
            * scheme uses, which is `|z|·log|z| / |dz/dc|` divided by the pixel
            * size — i.e. already in the units the shader's `dist` expects. */
           double px = 0.0;
-          if (der2 > 0.0) {
+          if (der2 > 0.0 && g.ps > 0.0) {
             const double lz = 0.5 * std::log(std::max(m2 / (1.0 + rel), 1e-300)) +
                               0.5 * std::log1p(rel);
             px = std::sqrt(std::max(m2, 0.0)) * lz / std::sqrt(der2) / g.ps;
@@ -1751,7 +1810,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
           double tv = trapAcc();
           if (g.trapMode == 4) tv = tv / (double)std::max(1, n);
           double d2 = 0.0;
-          if (der2 > 0.0) {
+          if (der2 > 0.0 && g.ps > 0.0) {
             const double lin = (2.0 - std::sqrt(std::max(m2, 0.0))) /
                                std::sqrt(der2) / g.ps;
             if (lin > 0.0 && std::isfinite(lin)) d2 = lin;
@@ -1823,7 +1882,7 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
      * inside the normal escape band.  Until the finder can be made cheap, the
      * scalar kernel keeps the field path. */
     const bool quad = !noQuad && perturb && !onlyGlitch && src.size() == 1 &&
-                      !g.wantDist && !g.wantTrap &&
+                      !g.wantDist && !g.wantTrap && !g.deepScale &&
                       q.spec.kind == 0 && q.spec.power == 2;
     /* Same four-wide treatment for the shallow frames: no reference orbit, so
      * the four lanes are simply four neighbouring pixels of z^2+c.  Opening
@@ -2050,8 +2109,17 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
       drawRange(y0, y1, src, onlyGlitch);
     });
   };
+  /* Diagnostic: skip the perturbation pass entirely and iterate every pixel at
+   * full precision.  Two pixels that a double cannot separate (the Julia
+   * deviation underflows to zero) still differ in their 192-bit orbit, so this
+   * is the only way to tell a genuinely flat view from a collapsed one. */
+  static const bool bigAll = std::getenv("MB_BIGALL") != nullptr;
+  if (bigAll) {
+    std::fill(glitchMask.begin(), glitchMask.end(), 1);
+    glitchCount.store((int)glitchMask.size());
+  }
   const auto tPass0 = clock::now();
-  runPass(refs, false);
+  if (!bigAll) runPass(refs, false);
   if (const char* tf = std::getenv("MB_TIMING")) {
     const double ms = std::chrono::duration<double, std::milli>(
                           clock::now() - tPass0).count();
@@ -2075,7 +2143,8 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
   /* ---- glitch repair (KF's AddReference) --------------------------- */
   int glitches = glitchCount.load();
   st.glitches = glitches;
-  if (perturb && glitches > 0 && gen.load(std::memory_order_relaxed) == myGen) {
+  if (!bigAll && perturb && glitches > 0 && !g.deepScale &&
+      gen.load(std::memory_order_relaxed) == myGen) {
     /* Bucket the glitched pixels on a 32x32 grid and drop a reference on the
      * busiest buckets; a reference there makes the deviation small again. */
     const int bw = (w + 31) / 32, bh = (h + 31) / 32;
@@ -2118,9 +2187,11 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
           if (d > eMax) eMax = d;
         }
       }
+      (void)dcMax;
       buildFolds(extra, q.spec.kind);
       if (famKernel) buildDevTable(extra, q.spec.power);
-      buildSeries(extra, eMax, q.spec.mode != 1, q.spec.power, q.spec.kind);
+      buildSeries(extra, std::log2(eMax > 0.0 ? eMax : 1e-300),
+                  q.spec.mode != 1, q.spec.power, q.spec.kind);
       refs.push_back(std::move(extra));
     }
     st.references = (int)refs.size();
@@ -2159,7 +2230,9 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
     /* Bound the work: a pathological frame must not turn one pass into a
      * minute of silence.  Everything that fits is fixed; past that the pass
      * ends and the count says so. */
-    const long long budgetPx = std::max<long long>(20000, (long long)w * h / 8);
+    const long long budgetPx = g.deepScale
+        ? 512
+        : std::max<long long>(20000, (long long)w * h / 8);
     std::atomic<long long> done{0};
     parallelFor(nStrips, [&](int s) {
       if (gen.load(std::memory_order_relaxed) != myGen) return;

@@ -20,6 +20,7 @@
 // ------------------------------------------------------------------
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -32,6 +33,10 @@ struct Spec {
   int kind = 0;            // 0 poly, 1 tricorn, 2 burning ship, 3 celtic,
                            // 4 perpendicular, 5 phoenix
   int power = 2;
+  /* Phoenix only (kind 5): z' = z^2 + phoenixP*z_prev + c.  The classic
+   * parameter is p = -0.5; the field exists so the deep path and the direct
+   * path read the same number. */
+  double phoenixP = -0.5;
   double juliaRe = 0.0;
   double juliaIm = 0.0;
   std::string juliaReS;    // full-precision Julia seed, kept as text so its
@@ -134,7 +139,7 @@ struct Request {
    * averaged instead of drawn, which is what the reference program does
    * implicitly — its fine structure only appears once you zoom in far enough
    * for it to be bigger than a pixel.  Without it a deep frame turns into a
-   * field of sub-pixel speckle ("密密麻麻") where no line is readable. */
+   * field of dense sub-pixel speckle where no line is readable. */
   int detail = 3;
 
   /* Band density.  The visible iteration range of a frame collapses as you
@@ -398,5 +403,75 @@ int vertexIterBudget(int known, int observedMax);
 /* Bits needed to place one pixel at this scale, with the orbit-accuracy and
  * guard allowances folded in. */
 int requiredBits(double psLog2, int maxIter);
+
+/* The pixel scale, derived once for the whole product.
+ *
+ * It is NOT span/width: the span is a width, but the frame is normalised by
+ * its longer side so a resize never changes the plane coverage, and the value
+ * travels through log2/exp2 so a deep exponent cannot overflow.  Any second
+ * implementation (the OpenCL kernel, the page's shader) must use these two
+ * functions instead of recomputing it, or a one-ulp difference in the pixel
+ * size puts every deep frame one pixel out. */
+/* Defined inline, in the header: the value must be identical in the core, the
+ * OpenCL host glue and the shell, and an out-of-line definition let the two
+ * translation units disagree (LTCG inlined a stale body into one of them and
+ * every field request came back with a nonsense pixel size). */
+inline double pixelScaleLog2(const Request& req) {
+  const int vw = req.viewWidth > 0 ? req.viewWidth : req.width;
+  const int vh = req.viewHeight > 0 ? req.viewHeight : req.height;
+  const int longer = vw > vh ? vw : vh;
+  const int denom = longer > 1 ? longer : 1;
+  const double logSpan = std::log2(req.spanMant > 0.0 ? req.spanMant : 1.0);
+  /* No floor: a 1e6000 view has psLog2 ~= -19940, and clamping it is what
+   * pinned every deep request at 1152 bits (the old -1020 limit). */
+  return logSpan + (double)req.spanExp - std::log2((double)denom);
+}
+
+/* Pixel scale as an exact (mantissa, exponent) pair: value = mant * 2^exp,
+ * |mant| in [0.5, 1).  The pair keeps naming the pixel pitch when the value
+ * itself is far below the double range, which is what a 1e6000 view needs:
+ * the per-pixel offset is (integer pixel index) * (mant * 2^exp), so the
+ * exponent travels separately and never has to be multiplied into a double.
+ *
+ * The split is a frexp, i.e. exact; computing it once per pass keeps the CPU,
+ * the OpenCL host glue and the shell in agreement to the last bit. */
+inline void pixelScaleParts(const Request& req, double& mant, int& exp) {
+  const int vw = req.viewWidth > 0 ? req.viewWidth : req.width;
+  const int vh = req.viewHeight > 0 ? req.viewHeight : req.height;
+  const int longer = vw > vh ? vw : vh;
+  const int denom = longer > 1 ? longer : 1;
+  double m = (req.spanMant > 0.0 ? req.spanMant : 1.0) / (double)denom;
+  int e = req.spanExp;
+  int k = 0;
+  if (m > 0.0) {
+    m = std::frexp(m, &k);
+    e += k;
+  }
+  mant = m;
+  exp = e;
+}
+
+inline double pixelScale(const Request& req) {
+  /* Built from the mantissa and a power-of-two scaling, NOT from exp2().
+   *
+   * Two reasons, and both are load-bearing:
+   *
+   *  - Scaling by 2^k is exact, so this is the same value to the last bit in
+   *    every translation unit.  A round trip through exp2() costs a few ulps,
+   *    and at depth a one-ulp pixel size is a one-pixel shift.
+   *  - exp2() cannot be trusted in this binary: measured on the shipping
+   *    build, `std::exp2(-9.635944799)` returned 0.0345 (and a negative value
+   *    for -6.99) while the musl entry point in the same process returned
+   *    0.00125687 — the correct answer.  A pixel size 27x too large is what
+   *    made the whole picture shrink into the middle of the frame.
+   *
+   * Returns 0.0 once the exponent is below the double range.  Callers that
+   * work at that depth use pixelScaleParts() and carry the exponent instead;
+   * the old 1e-307 floor silently painted such a frame as if it were 1e-307. */
+  double m = 1.0;
+  int e = 0;
+  pixelScaleParts(req, m, e);
+  return std::ldexp(m, e);
+}
 
 }  // namespace mbc

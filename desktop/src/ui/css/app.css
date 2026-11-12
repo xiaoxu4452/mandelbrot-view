@@ -1592,6 +1592,11 @@ body.booting .hud {
 html.native-surface,
 html.native-surface body { background: transparent; }
 html.native-surface #fractal { opacity: 0; }
+/* The shell's canvas is *behind* this page.  The page's own shader layer is a
+ * sibling of #fractal, not a child, so hiding #fractal alone left the WebGL
+ * copy on top: two renderers of the same view, one of them the page's, and
+ * whichever had drawn last was what the user saw.  That is the flicker. */
+html.native-surface #glfractal { opacity: 0; }
 
 /* ------------------------------------------------------------------
  * Presets panel: library toolbar, colour footer.

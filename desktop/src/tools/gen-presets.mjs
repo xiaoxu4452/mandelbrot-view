@@ -90,7 +90,7 @@ for (const b of bases) {
     id,
     name: b.name,
     nameZh: b.nameZh,
-    /* The grid filters by set: "m" = 曼德勃罗, "j" = 朱丽叶.  The old
+    /* The grid filters by set: "m" = Mandelbrot, "j" = Julia.  The old
      * palette-variant categories (hue/density/tone/…) are gone. */
     category: julia ? 'j' : 'm',
     flags: { ...(src.flags || {}), julia, inverse: p.inverse === true },

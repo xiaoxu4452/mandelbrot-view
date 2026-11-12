@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------------
-rem env-msvc.bat — set the compiler environment WITHOUT vcvars64.bat.
+rem env-msvc.bat - set the compiler environment WITHOUT vcvars64.bat.
 rem
 rem vcvars shells out to `reg.exe`, which is blocked on this machine, so it
 rem returns success while leaving INCLUDE/LIB empty (the first failure is then

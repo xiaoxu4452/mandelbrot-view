@@ -23,10 +23,334 @@ namespace detail {
 
 /* Perturbation.  Returns n >= 0 for an escaped pixel, -1 for one that stays
  * bounded, -2 for one the reference could not describe (a glitch). */
+/* Deep perturbation: the same recurrence as perturbPixel, with the deviation
+ * carried as a normalised complex (mantissa + binary exponent).
+ *
+ * The plain-double kernel needs dc as a double, and dc is the pixel offset
+ * from the anchor — at a 1e6000 view that is 2^-19940, exactly zero.  Every
+ * pixel would then be the anchor's own orbit and the frame would come back as
+ * one flat colour.  Carrying the exponent separately fixes that at both ends:
+ * dc starts at 2^-19940, the series turns it into a deviation of whatever
+ * magnitude the geometry implies, and the recurrence grows it until |Z+d|
+ * crosses the bailout.  Mantissa arithmetic is the same 53-bit double work as
+ * before; only the alignment adds a few ldexp per step, which is why the
+ * shallow path keeps the old kernel untouched. */
+static int perturbPixelDeep(const Ctx& g, const Ref& R, double fx, double fy,
+                            double& m2Out, double& relOut, double& der2Out,
+                            ValueProbe* probe) {
+  SC dc;
+  screenDeltaScaled(g, fx, fy, dc);
+  /* The anchor's own offset from the frame centre is a double; at this depth
+   * it is either zero or representable, so subtracting it is exact. */
+  dc.r -= R.dRe;
+  dc.i -= R.dIm;
+  scNorm(dc);
+
+  /* Dynamic start, in the log domain: |dc| itself is below the double range,
+   * so the threshold table is compared as log|dc|. */
+  int sk = R.skip;
+  if (g.dynSkip && R.skip > 0 && R.len > 3 &&
+      R.dcthLog.size() >= (size_t)R.len) {
+    const double ad = std::hypot(dc.r, dc.i);
+    const double logAd = ad > 0.0 ? std::log(ad) + (double)dc.e * kLn2 : -1e300;
+    int lo = 1, hi = R.len - 2;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (R.dcthLog[(size_t)mid] >= logAd) lo = mid; else hi = mid - 1;
+    }
+    sk = lo;
+  }
+
+  const bool walkDer = (g.wantDist && !g.skipDeriv) || (probe != nullptr && !g.zOnly);
+  if (walkDer && sk > R.derSkip) sk = R.derSkip;
+
+  SC d;
+  int ridx;
+  if (sk > 0) {
+    d = seriesDeviationScaled(R, sk, dc);
+    ridx = sk;
+  } else {
+    /* z_0 is a constant; the first update adds dc. */
+    d = SC{0.0, 0.0, 0};
+    ridx = 0;
+  }
+
+  double derR = 0.0, derI = 0.0;
+  if (walkDer) {
+    if (sk > 0) { derR = R.ar[(size_t)sk]; derI = R.ai[(size_t)sk]; }
+  }
+  double chkR = 0.0, chkI = 0.0;
+  bool chkOn = false;
+  double rollR = 0.0, rollI = 0.0;
+  CycleFinder cyc;
+  const int chkStart = ridx > kCycleChk ? ridx : kCycleChk;
+  const bool doFixed = ridx <= kCycleChk;
+
+  /* Convert a scaled component to a double, saturating at zero below the
+   * double range.  Everything that is compared against |Z|~1 tolerates that:
+   * a deviation that small changes no decision yet. */
+  auto toD = [](const SC& a, double& r, double& i) {
+    r = a.e > -900 ? std::ldexp(a.r, a.e) : 0.0;
+    i = a.e > -900 ? std::ldexp(a.i, a.e) : 0.0;
+  };
+
+  for (int n = ridx; n < g.maxIter; ++n) {
+    if (ridx >= R.len) {
+      m2Out = 0.0; relOut = 0.0; der2Out = 0.0;
+      return kGlitch;
+    }
+    double Zr = R.re[(size_t)ridx], Zi = R.im[(size_t)ridx];
+    double dr, di;
+    toD(d, dr, di);
+    const double Z2 = Zr * Zr + Zi * Zi;
+    double cross = 2.0 * (Zr * dr + Zi * di);
+    double d2 = dr * dr + di * di;
+    double m2 = Z2 + cross + d2;
+    if (d2 > m2) {
+      SC zR{Zr, Zi, 0}, z0{-R.z0r, -R.z0i, 0};
+      d = scAdd(scAdd(zR, d), z0);
+      ridx = 0;
+      cyc.reset();
+      Zr = R.re[0];
+      Zi = R.im[0];
+      toD(d, dr, di);
+      const double Z2n = Zr * Zr + Zi * Zi;
+      cross = 2.0 * (Zr * dr + Zi * di);
+      d2 = dr * dr + di * di;
+      m2 = Z2n + cross + d2;
+    }
+    if (probe && g.zOnly && !probe->valid && m2 > 4.0) {
+      probe->zr = Zr + dr;
+      probe->zi = Zi + di;
+      probe->valid = true;
+    }
+    if (m2 > kBail2) {
+      m2Out = m2;
+      relOut = Z2 > 0.0 ? (cross + d2) / Z2 : 0.0;
+      der2Out = g.skipDeriv ? 0.0 : derR * derR + derI * derI;
+      if (probe) {
+        if (!g.zOnly) { probe->zr = Zr + dr; probe->zi = Zi + di; }
+        probe->dr = derR;
+        probe->di = derI;
+        probe->valid = true;
+        probe->hasDer = walkDer;
+      }
+      return n;
+    }
+    if (g.wantTrap && d.e > -900) {
+      const double zrT = Zr + dr, ziT = Zi + di;
+      if (g.trapMode == 2) {
+        const double dd = ziT * ziT;
+        if (dd < trapAcc()) trapAcc() = dd;
+      } else if (g.trapMode == 4) {
+        trapAcc() += 0.5 * std::log(zrT * zrT + ziT * ziT + 1e-300);
+      } else {
+        const double r2T = zrT * zrT + ziT * ziT;
+        double dd = r2T;
+        if (g.trapMode == 3) {
+          const double r = std::sqrt(r2T);
+          dd = (r - 1.0) * (r - 1.0);
+        }
+        if (dd < trapAcc()) trapAcc() = dd;
+      }
+    }
+    {
+      const int per = cyc.step(Zr + dr, Zi + di, m2);
+      if (per > 0) { m2Out = 0.0; relOut = 0.0; der2Out = 0.0; return -1 - per; }
+    }
+    if (walkDer) {
+      const double zrD = Zr + dr, ziD = Zi + di;
+      const double odr = 2.0 * (zrD * derR - ziD * derI) + 1.0;
+      const double odi = 2.0 * (zrD * derI + ziD * derR);
+      derR = odr;
+      derI = odi;
+    }
+    const SC lin = scMulC(d, 2.0 * Zr, 2.0 * Zi);
+    const SC quad = scMul(d, d);
+    d = scAdd(scAdd(lin, quad), dc);
+    ++ridx;
+    if (n == chkStart || (chkOn && (n & 31) == 0)) {
+      const int zi = ridx < R.len ? ridx : R.len - 1;
+      toD(d, dr, di);
+      const double zrNow = R.re[(size_t)zi] + dr;
+      const double ziNow = R.im[(size_t)zi] + di;
+      if (n == chkStart) {
+        chkR = zrNow; chkI = ziNow; chkOn = true;
+        rollR = zrNow; rollI = ziNow;
+      } else {
+        if (doFixed) {
+          const double dx = zrNow - chkR, dy = ziNow - chkI;
+          const double zz = zrNow * zrNow + ziNow * ziNow;
+          if (dx * dx + dy * dy < 1e-24 * (zz + 1.0)) {
+            m2Out = 0.0; relOut = 0.0; der2Out = 0.0;
+            return -1 - (n - kCycleChk);
+          }
+        }
+        const double rx = zrNow - rollR, ry = ziNow - rollI;
+        const double z2 = zrNow * zrNow + ziNow * ziNow;
+        if (rx * rx + ry * ry < 1e-24 * (z2 + 1.0)) {
+          m2Out = 0.0; relOut = 0.0; der2Out = 0.0;
+          return -1;
+        }
+        rollR = zrNow; rollI = ziNow;
+      }
+    }
+  }
+  m2Out = 0.0;
+  relOut = 0.0;
+  der2Out = 0.0;
+  return -1;
+}
+
+/* Deep counterpart of perturbFam.  Every quantity that used to be a plain
+ * double offset is carried as a scaled complex {double,double,int exponent},
+ * so a frame at 1e-660 keeps its per-pixel structure instead of collapsing to
+ * dc = 0.  The family itself (fold, conjugation, power, Phoenix memory) is the
+ * same recurrence the double kernel and buildSeries use. */
+static int perturbFamDeep(const Ctx& g, const Ref& R, double fx, double fy,
+                          double& m2Out, double& relOut, double& der2Out) {
+  SC dc;
+  screenDeltaScaled(g, fx, fy, dc);
+  dc.r -= R.dRe;
+  dc.i -= R.dIm;
+  scNorm(dc);
+
+  /* Constant the map adds each step.  Burning ship subtracts c (real part
+   * negated), perpendicular conjugates it, everything else adds it. */
+  SC cc = dc;
+  if (g.kind == 2) cc.r = -cc.r;
+  else if (g.kind == 4) cc.i = -cc.i;
+
+  int sk = R.skip;
+  if (g.dynSkip && R.skip > 0 && R.len > 3 &&
+      R.dcthLog.size() >= (size_t)R.len) {
+    const double ad = std::hypot(dc.r, dc.i);
+    const double logAd = ad > 0.0 ? std::log(ad) + (double)dc.e * kLn2 : -1e300;
+    int lo = 1, hi = R.len - 2;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (R.dcthLog[(size_t)mid] >= logAd) lo = mid; else hi = mid - 1;
+    }
+    sk = lo;
+  }
+
+  SC d;
+  int ridx;
+  if (sk > 0) {
+    /* Perpendicular's series variable is conj(dc), same as the double path. */
+    d = seriesDeviationScaled(R, sk, g.kind == 4 ? cc : dc);
+    ridx = sk;
+  } else {
+    /* z_0 is a constant, so d_0 = 0; the first update adds dc. */
+    d = SC{0.0, 0.0, 0};
+    ridx = 0;
+  }
+  SC dPrev{0.0, 0.0, 0};
+
+  auto toD = [](const SC& a, double& r, double& i) {
+    r = a.e > -900 ? std::ldexp(a.r, a.e) : 0.0;
+    i = a.e > -900 ? std::ldexp(a.i, a.e) : 0.0;
+  };
+
+  for (int n = ridx; n < g.maxIter; ++n) {
+    if (ridx >= R.len) {
+      m2Out = 0.0; relOut = 0.0; der2Out = 0.0;
+      return kGlitch;
+    }
+    const double Zr = R.re[(size_t)ridx], Zi = R.im[(size_t)ridx];
+    double dr, di;
+    toD(d, dr, di);
+    const double Z2 = Zr * Zr + Zi * Zi;
+    double cross = 2.0 * (Zr * dr + Zi * di);
+    double d2 = dr * dr + di * di;
+    double m2 = Z2 + cross + d2;
+    if (d2 > m2) {
+      const SC zR{Zr, Zi, 0}, z0{-R.z0r, -R.z0i, 0};
+      d = scAdd(scAdd(zR, d), z0);
+      ridx = 0;
+      dPrev = SC{0.0, 0.0, 0};
+      continue;
+    }
+    if (m2 > kBail2) {
+      m2Out = m2;
+      relOut = Z2 > 0.0 ? (cross + d2) / Z2 : 0.0;
+      der2Out = 0.0;
+      return n;
+    }
+    if (g.wantTrap) {
+      const double zrT = Zr + dr, ziT = Zi + di;
+      if (g.trapMode == 2) {
+        const double dd = ziT * ziT;
+        if (dd < trapAcc()) trapAcc() = dd;
+      } else if (g.trapMode == 4) {
+        trapAcc() += 0.5 * std::log(zrT * zrT + ziT * ziT + 1e-300);
+      } else {
+        const double r2T = zrT * zrT + ziT * ziT;
+        double dd = r2T;
+        if (g.trapMode == 3) {
+          const double r = std::sqrt(r2T);
+          dd = (r - 1.0) * (r - 1.0);
+        }
+        if (dd < trapAcc()) trapAcc() = dd;
+      }
+    }
+
+    double jr, ji, hr, hi, kr, ki;
+    if (g.power == 2) {
+      jr = 2.0 * Zr; ji = 2.0 * Zi;
+      hr = 1.0; hi = 0.0;
+      kr = 0.0; ki = 0.0;
+    } else {
+      jr = R.jr[(size_t)ridx]; ji = R.ji[(size_t)ridx];
+      hr = R.hr[(size_t)ridx]; hi = R.hi[(size_t)ridx];
+      kr = R.kr[(size_t)ridx]; ki = R.ki[(size_t)ridx];
+    }
+    /* d' = J d + H d^2 + K d^3 + (Phoenix memory) + dc, all in the scaled
+     * complex type.  |d| can be 1e-600, so no term is dropped. */
+    SC w = scMulC(d, jr, ji);
+    SC q2 = scMul(d, d);
+    w = scAdd(w, scMulC(q2, hr, hi));
+    if (g.power != 2) {
+      SC q3 = scMul(q2, d);
+      w = scAdd(w, scMulC(q3, kr, ki));
+    }
+    if (g.kind == 5) w = scAdd(w, scMulC(dPrev, g.phoenixP, 0.0));
+
+    const double qr = dr * dr - di * di;
+    switch (g.kind) {
+      case 1:
+        w.i = -w.i;
+        break;
+      case 2:
+        if ((Zr + dr) * (Zi + di) < 0.0) w.i = -w.i;
+        break;
+      case 3:
+        if ((Zr * Zr - Zi * Zi) + cross + qr < 0.0) w.r = -w.r;
+        break;
+      default:
+        break;
+    }
+    if (g.kind == 5) dPrev = d;
+    d = scAdd(w, cc);
+    ++ridx;
+  }
+  m2Out = 0.0;
+  relOut = 0.0;
+  der2Out = 0.0;
+  return -1;
+}
+
 int perturbPixel(const Ctx& g, double fx, double fy, int refIdx,
                         double& m2Out, double& relOut, double& der2Out,
                         ValueProbe* probe) {
   const Ref& R = (*g.refs)[(size_t)refIdx];
+  /* A pixel pitch below the double range: the plain-double kernel cannot see
+   * its own offset from the anchor, so the normalised one takes over.  Julia
+   * keeps the old path (its deviation starts at the pixel offset itself and
+   * the seed is a double by construction, so nothing is lost that this path
+   * could recover). */
+  if (g.deepScale && !g.julia)
+    return perturbPixelDeep(g, R, fx, fy, m2Out, relOut, der2Out, probe);
   /* dc is measured from the *anchor* the orbit belongs to.  Using the frame
    * centre instead puts every pixel on the orbit of (anchor + dc), which
    * shifts the whole picture by the anchor offset and was the reason the
@@ -270,8 +594,20 @@ int perturbPixel(const Ctx& g, double fx, double fy, int refIdx,
 int perturbFam(const Ctx& g, double fx, double fy, int refIdx,
                       double& m2Out, double& relOut, double& der2Out) {
   const Ref& R = (*g.refs)[(size_t)refIdx];
+  /* Below the double range the plain-double offset is exactly zero for every
+   * pixel; the scaled kernel keeps the per-pixel dc and the family recurrence.
+   * Julia's seed is the pixel itself, so that mode stays on the double path. */
+  if (g.deepScale && !g.julia)
+    return perturbFamDeep(g, R, fx, fy, m2Out, relOut, der2Out);
   const double dcr = (fx + 0.5 - g.halfW) * g.ps - R.dRe;
   const double dci = (g.halfH - fy - 0.5) * g.ps - R.dIm;
+  static const bool dbgFam = std::getenv("MB_DEBUGFAM") != nullptr;
+  if (dbgFam) {
+    std::fprintf(stderr,
+                 "[fam] kind=%d p=%d f=(%.3f,%.3f) dc=(%.3g,%.3g) len=%d skip=%d "
+                 "maxIter=%d\n",
+                 g.kind, g.power, fx, fy, dcr, dci, R.len, R.skip, g.maxIter);
+  }
 
   /* Same dynamic start as the z^2 kernel: the series of this family was built
    * through the reference's own fold pattern, so a pixel near the anchor can
@@ -297,8 +633,13 @@ int perturbFam(const Ctx& g, double fx, double fy, int refIdx,
     di = dci;
   } else if (sk > 0) {
     /* Includes the third-order term: a p > 2 frame that started here with
-     * only two of its terms used to drift from the first pixel onwards. */
-    seriesDeviation(R, sk, dcr, dci, dr, di);
+     * only two of its terms used to drift from the first pixel onwards.
+     * Perpendicular's constant is conj(c), so the series variable is the
+     * conjugate of the pixel offset. */
+    if (g.kind == 4)
+      seriesDeviation(R, sk, dcr, -dci, dr, di);
+    else
+      seriesDeviation(R, sk, dcr, dci, dr, di);
     ridx = sk;
   } else {
     dr = 0.0;
@@ -307,10 +648,16 @@ int perturbFam(const Ctx& g, double fx, double fy, int refIdx,
   const double cSign = (g.kind == 2) ? -1.0 : 1.0;
   const double dcrC = g.julia ? 0.0 : cSign * dcr;
   const double dciC = g.julia ? 0.0 : (g.kind == 4 ? -dci : dci);
+  /* Phoenix's deviation at n-1; rebasing resets it, which is the only place
+   * the one-step memory is genuinely lost and is accepted (rebases happen at
+   * |d| ~ |Z|, long after the structure of the frame is decided). */
+  double dPrevR = 0.0, dPrevI = 0.0;
   double derR = g.julia ? 1.0 : 0.0, derI = 0.0;
   double chkR = 0.0, chkI = 0.0;
+  double chkDR = 0.0, chkDI = 0.0;
   bool chkOn = false;
   double rollR = 0.0, rollI = 0.0;      // last periodic snapshot (moves on)
+  double rollDR = 0.0, rollDI = 0.0;
   const int chkStart = ridx > kCycleChk ? ridx : kCycleChk;
   const bool doFixed = ridx <= kCycleChk;
 
@@ -329,6 +676,8 @@ int perturbFam(const Ctx& g, double fx, double fy, int refIdx,
       dr = Zr + dr - R.z0r;
       di = Zi + di - R.z0i;
       ridx = 0;
+      dPrevR = 0.0;
+      dPrevI = 0.0;
       Zr = R.re[0]; Zi = R.im[0];
       Z2 = Zr * Zr + Zi * Zi;
       cross = 2.0 * (Zr * dr + Zi * di);
@@ -443,36 +792,54 @@ int perturbFam(const Ctx& g, double fx, double fy, int refIdx,
       case 3:                                  // celtic
         if ((Zr * Zr - Zi * Zi) + w0 + qr < 0.0) wr = -wr;
         break;
+      case 5:                                  // phoenix: one-step memory
+        wr += g.phoenixP * dPrevR;
+        wi += g.phoenixP * dPrevI;
+        break;
       default:
         break;
     }
+    const double oldDr = dr, oldDi = di;
     dr = wr + dcrC;
     di = wi + dciC;
+    dPrevR = oldDr;
+    dPrevI = oldDi;
     ++ridx;
-    /* Same fixed + rolling interior check as the standard kernel. */
+    /* Same fixed + rolling interior check as the standard kernel, but scaled by
+     * the deviation.  The old absolute 1e-24 test compared z at n and n+32; at
+     * depth the deviation is still 1e-23 there, so a *repelling* anchor whose
+     * orbit grows by 4x per step was pronounced stationary and the whole frame
+     * came back "interior".  A cycle now has to be stationary relative to the
+     * deviation it is measured against, which is scale-free. */
     if (n == chkStart || (chkOn && (n & 31) == 0)) {
       if (ridx < R.len) {
         const double zrNow = R.re[(size_t)ridx] + dr;
         const double ziNow = R.im[(size_t)ridx] + di;
+        const double dScale = dr * dr + di * di + 1e-300;
+        const double tol = 1e-24 * dScale;
         if (n == chkStart) {
-          chkR = zrNow; chkI = ziNow; chkOn = true;
+          chkR = zrNow; chkI = ziNow;
+          chkDR = dr;   chkDI = di;
+          chkOn = true;
           rollR = zrNow; rollI = ziNow;
+          rollDR = dr;   rollDI = di;
         } else {
           if (doFixed) {
             const double dx = zrNow - chkR, dy = ziNow - chkI;
-            const double zz = zrNow * zrNow + ziNow * ziNow;
-            if (dx * dx + dy * dy < 1e-24 * (zz + 1.0)) {
+            const double ddx = dr - chkDR, ddy = di - chkDI;
+            if (dx * dx + dy * dy < tol && ddx * ddx + ddy * ddy < tol) {
               m2Out = 0.0; relOut = 0.0; der2Out = 0.0;
               return -1 - (n - kCycleChk);
             }
           }
           const double rx = zrNow - rollR, ry = ziNow - rollI;
-          const double z2 = zrNow * zrNow + ziNow * ziNow;
-          if (rx * rx + ry * ry < 1e-24 * (z2 + 1.0)) {
+          const double rdx = dr - rollDR, rdy = di - rollDI;
+          if (rx * rx + ry * ry < tol && rdx * rdx + rdy * rdy < tol) {
             m2Out = 0.0; relOut = 0.0; der2Out = 0.0;
             return -1;
           }
           rollR = zrNow; rollI = ziNow;
+          rollDR = dr;   rollDI = di;
         }
       }
     }
@@ -978,6 +1345,8 @@ int directPixel(const Ctx& g, double fx, double fy, double& m2Out,
     zr = 0.0;
     zi = 0.0;
   }
+  /* Phoenix keeps z_{n-1}; z_{-1} = 0 in both modes. */
+  double prevR = 0.0, prevI = 0.0;
   /* dz/dc exists only for the holomorphic forms (kind 0); the conjugate and
    * absolute-value variants have no complex derivative, so distance-based
    * schemes draw no rim there rather than a wrong one. */
@@ -1082,6 +1451,15 @@ int directPixel(const Ctx& g, double fx, double fy, double& m2Out,
         zi = ti - ci;
         break;
       }
+      case 5: {                       // phoenix: z^2 + P*z_prev + c
+        const double tr = zr * zr - zi * zi + g.phoenixP * prevR + cr;
+        const double ti = 2.0 * zr * zi + g.phoenixP * prevI + ci;
+        prevR = zr;
+        prevI = zi;
+        zr = tr;
+        zi = ti;
+        break;
+      }
       default: {                      // z^p + c  (Mandelbrot / Julia)
         double tr = zr, ti = zi;
         cpow(tr, ti, g.power);
@@ -1119,17 +1497,35 @@ int directPixel(const Ctx& g, double fx, double fy, double& m2Out,
 
 int bigPixel(const Ctx& g, const BigSeed& B, int bits, double fx,
                     double fy, double& m2Out, double& relOut) {
-  double dcr, dci;
-  screenDelta(g, fx, fy, dcr, dci);
   Big zr(bits), zi(bits);
   Big cr = B.cRe, ci = B.cIm;
-  if (B.julia) {
-    zr = B.zRe.add(Big::fromDouble(dcr, bits));
-    zi = B.zIm.add(Big::fromDouble(dci, bits));
+  /* The pixel's offset from the frame centre.  Below the double range the
+   * double form is exactly zero and every pixel would iterate the centre's
+   * own orbit; the scaled form builds the same value in the Big domain,
+   * where `bits` fractional bits is exactly what this path exists for. */
+  Big offR(bits), offI(bits);
+  if (g.deepScale) {
+    SC s;
+    screenDeltaScaled(g, fx, fy, s);
+    offR = Big::fromDouble(s.r, bits);
+    offI = Big::fromDouble(s.i, bits);
+    if (s.e != 0) { offR = offR.shifted(s.e); offI = offI.shifted(s.e); }
   } else {
-    if (dcr != 0.0) cr = cr.add(Big::fromDouble(dcr, bits));
-    if (dci != 0.0) ci = ci.add(Big::fromDouble(dci, bits));
+    double dcr = 0.0, dci = 0.0;
+    screenDelta(g, fx, fy, dcr, dci);
+    offR = Big::fromDouble(dcr, bits);
+    offI = Big::fromDouble(dci, bits);
   }
+  if (B.julia) {
+    zr = B.zRe.add(offR);
+    zi = B.zIm.add(offI);
+  } else {
+    cr = cr.add(offR);
+    ci = ci.add(offI);
+  }
+  Big prevR(bits), prevI(bits);
+  Big* const prevP = g.kind == 5 ? &prevR : nullptr;
+  Big* const prevQ = g.kind == 5 ? &prevI : nullptr;
   for (int n = 0; n < g.maxIter; ++n) {
     if (expOf(zr) > kEscapeExp || expOf(zi) > kEscapeExp) {
       const double ar = zr.toDouble(), ai = zi.toDouble();
@@ -1137,12 +1533,16 @@ int bigPixel(const Ctx& g, const BigSeed& B, int bits, double fx,
       relOut = 0.0;
       return n;
     }
-    const Big zr2 = zr.mul(zr);
-    const Big zi2 = zi.mul(zi);
-    const Big nr = zr2.sub(zi2).add(cr);
-    const Big ni = zr.mul(zi).shifted(1).add(ci);
-    zr = nr;
-    zi = ni;
+    if (g.kind == 0 && g.power == 2) {
+      const Big zr2 = zr.mul(zr);
+      const Big zi2 = zi.mul(zi);
+      const Big nr = zr2.sub(zi2).add(cr);
+      const Big ni = zr.mul(zi).shifted(1).add(ci);
+      zr = nr;
+      zi = ni;
+    } else {
+      famStepBig(g.kind, g.power, zr, zi, cr, ci, g.phoenixP, prevP, prevQ);
+    }
   }
   m2Out = 0.0;
   relOut = 0.0;

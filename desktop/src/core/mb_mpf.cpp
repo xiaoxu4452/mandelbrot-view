@@ -34,7 +34,7 @@ std::vector<uint32_t> addMagVec(const std::vector<uint32_t>& a,
   return r;
 }
 
-/* 要求 a >= b（按 magnitude） */
+/* Requires a >= b (by magnitude). */
 std::vector<uint32_t> subMagVec(const std::vector<uint32_t>& a,
                                 const std::vector<uint32_t>& b) {
   std::vector<uint32_t> r(a.size(), 0);
@@ -82,7 +82,7 @@ void addInto(std::vector<uint32_t>& acc, const std::vector<uint32_t>& v, size_t 
   }
 }
 
-/* acc -= v * 2^(32*off)，要求 acc >= v*2^(32*off) */
+/* acc -= v * 2^(32*off), requires acc >= v*2^(32*off). */
 void subFrom(std::vector<uint32_t>& acc, const std::vector<uint32_t>& v, size_t off) {
   if (v.empty()) return;
   if (acc.size() < off + v.size()) acc.resize(off + v.size(), 0);
@@ -127,7 +127,8 @@ void mulSchool(std::vector<uint32_t>& z, const std::vector<uint32_t>& x,
   trimVec(z);
 }
 
-/* Karatsuba：z = x*y。长度差超过 3 倍时退回 schoolbook（避免空段）。 */
+/* Karatsuba: z = x*y.  Falls back to schoolbook when the lengths differ by
+ * more than 3x, which avoids empty splits. */
 void mulMag(std::vector<uint32_t>& z, const std::vector<uint32_t>& x,
             const std::vector<uint32_t>& y) {
   const size_t nx = x.size(), ny = y.size();
@@ -205,8 +206,10 @@ void Mpf::setPrec(int bits) {
 }
 
 void Mpf::setPrecRaw(int bits) {
-  /* GMP mpf_set_prec_raw：不重新分配，也不立即改值，只改后续运算的舍入位数。
-   * 原版靠它在轨道推进时原地降精度（004fca50）。 */
+  /* GMP mpf_set_prec_raw: no reallocation and no immediate change to the
+   * value, only the rounding precision of later operations.  The original
+   * relies on this to step precision down in place as the orbit advances
+   * (004fca50). */
   if (bits > alloc_) bits = alloc_;
   prec_ = std::max(32, bits);
 }
@@ -217,7 +220,7 @@ void Mpf::roundToPrec(int bits) {
   int bl = 32 * (size_ - 1) + topBit(d_[(size_t)size_ - 1]) + 1;
   if (bl <= bits) return;
   const int sh = bl - bits;
-  /* 就近舍入（half up）：在 bit sh-1 处加 1，再右移 sh 位。 */
+  /* Round half up: add 1 at bit sh-1, then shift right by sh bits. */
   const int pos = sh - 1;
   const size_t li = (size_t)(pos / 32);
   const int lb = pos % 32;
@@ -231,7 +234,7 @@ void Mpf::roundToPrec(int bits) {
     d_[i] = (uint32_t)s;
     carry = s >> 32;
   }
-  /* 右移 sh 位。 */
+  /* Shift right by sh bits. */
   const size_t drop = (size_t)(sh / 32);
   const int rbits = sh % 32;
   std::vector<uint32_t> out;
@@ -252,7 +255,8 @@ void Mpf::roundToPrec(int bits) {
   d_.swap(out);
   size_ = (int)d_.size();
   trim();
-  /* 舍入进位可能多出 1 位，再削一次（不再舍入）。 */
+  /* The rounding carry may add one extra bit; trim it once more without
+   * rounding again. */
   if (size_ > 0) {
     int bl2 = 32 * (size_ - 1) + topBit(d_[(size_t)size_ - 1]) + 1;
     if (bl2 > bits) {
@@ -489,7 +493,8 @@ void Mpf::add(Mpf& r, const Mpf& a, const Mpf& b) {
     return;
   }
   const long e = std::min(a.e_, b.e_);
-  /* GMP 语义的捷径：量级差超过结果精度时，小项对舍入没有影响。 */
+  /* GMP-semantics shortcut: when the magnitudes differ by more than the
+   * result precision, the small term cannot affect the rounding. */
   const int ga = a.expBits(), gb = b.expBits();
   if (ga > gb + prec + 2 || gb > ga + prec + 2) {
     const Mpf& big = ga > gb ? a : b;
@@ -669,7 +674,8 @@ bool precisionSelfTest(std::string& log) {
     if (!cond) ok = false;
   };
 
-  /* A. 基础算术（256 位，值都是 double 可精确表示的） */
+  /* A. Basic arithmetic (256 bits; every value is exactly representable as a
+   * double). */
   {
     Mpf a(256), b(256), r(256);
     a.setD(3.5);
@@ -684,8 +690,9 @@ bool precisionSelfTest(std::string& log) {
     check(std::fabs(r.toDouble() - 0.4375) < 1e-15, "mpf_mul2exp", "3.5*2^-3=%.17g", r.toDouble());
   }
 
-  /* A2. 十进制字符串：小数部分必须做定点除。朴素的整数除会把 0.332 变成 0，
-   *     setStr() 曾经就是这样，参考轨道因此全为零而无人察觉。 */
+  /* A2. Decimal strings: the fractional part needs a fixed-point divide.  A
+   *     naive integer divide turns 0.332 into 0 — that is what setStr() used
+   *     to do, which silently zeroed entire reference orbits. */
   {
     Mpf x(256);
     x.setStr("0.332");
@@ -697,14 +704,16 @@ bool precisionSelfTest(std::string& log) {
     x.setStr("1e-20");
     check(std::fabs(x.toDouble() - 1e-20) < 1e-35, "mpf_setstr_exp",
           "1e-20 -> %.17g", x.toDouble());
-    /* 30 位有效数字必须全部保留，否则深视点坐标会在拼接处断掉。 */
+    /* All 30 significant digits must survive, or a deep-view coordinate breaks
+     * at the splice point. */
     x.setStr("0.123456789012345678901234567890");
     const double want = 0.123456789012345678901234567890;
     check(std::fabs(x.toDouble() - want) < 1e-17, "mpf_setstr_30digits",
           "%.17g", x.toDouble());
   }
 
-  /* B. set_prec / set_prec_raw 语义：raw 不重分配，只改后续舍入位数 */
+  /* B. set_prec / set_prec_raw semantics: raw does not reallocate, it only
+   * changes the rounding precision of later operations. */
   {
     Mpf x(512);
     x.setD(1.0 / 3.0);
@@ -720,7 +729,8 @@ bool precisionSelfTest(std::string& log) {
           "raw(128)->alloc=%g", (double)x.allocPrec());
   }
 
-  /* C. mpf_hi / mpf_lo：两段拼回去等于原值（600 位下精确） */
+  /* C. mpf_hi / mpf_lo: the two pieces splice back to the original value
+   * (exact at 600 bits). */
   {
     Mpf one(512), tiny(512), x(512), hi(600), lo(600), sum(600);
     one.setUi(1);
@@ -735,7 +745,8 @@ bool precisionSelfTest(std::string& log) {
           sum.toDouble() - x.toDouble());
   }
 
-  /* D. COMPUTERGROUP（iter 链）：与 Big 定点轨道逐步对比 */
+  /* D. COMPUTERGROUP (the `iter` chain): stepped comparison against the Big
+   * fixed-point orbit. */
   {
     const int bits = 320;
     const double cx = -0.75, cy = 0.0;
@@ -744,8 +755,9 @@ bool precisionSelfTest(std::string& log) {
     g.slot(4).setD(cx);
     g.slot(5).setD(cy);
     g.setConstantSlots(4, 5);
-    /* 顺序照抄 004f8d20 的链：先 sx=x²、sy=y²，再 ny=2xy+cy（读旧 x,y），
-     * 最后 nx=sx-sy+cx。写成这样就不需要额外的交班槽。 */
+    /* The order copies the chain at 004f8d20: sx=x², sy=y² first, then
+     * ny=2xy+cy (reading the old x,y), and finally nx=sx-sy+cx.  Written this
+     * way it needs no extra hand-off slots. */
     g.add(COp::Sqr, 2, 0, 0);
     g.add(COp::Sqr, 3, 1, 1);
     g.add(COp::ImagIter2, 1, 0, 1);
@@ -775,7 +787,7 @@ bool precisionSelfTest(std::string& log) {
     std::fflush(stdout);
   }
 
-  /* E. HF 原语：62 位尾数往返、复数平方、饱和 */
+  /* E. HF primitives: 62-bit mantissa round-trip, complex square, saturation. */
   {
     const HFloat a = hfFromDouble(0.1);
     const HFloat sq = hfMul(a, a);
@@ -794,7 +806,7 @@ bool precisionSelfTest(std::string& log) {
     check(s.e == kHfExpMax, "hf_saturate", "exp=%.0f", (double)s.e);
   }
 
-  /* F. 16384 位档：一次乘法的位数与耗时 */
+  /* F. The 16384-bit tier: digit count and cost of one multiply. */
   {
     Mpf p(16384), q(16384), r(16384), one(16384), tiny(16384);
     one.setUi(1);
@@ -809,7 +821,8 @@ bool precisionSelfTest(std::string& log) {
     const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
     Mpf diff(16384);
     Mpf::sub(diff, p, one);
-    /* 1 + 2^-16000 在 16384 位下不能被吞掉，才说明尾数真的到位。 */
+    /* 1 + 2^-16000 must not be swallowed at 16384 bits; only then is the
+     * mantissa really wide enough. */
     const bool bitsOk = !diff.isZero() && diff.expBits() < -15000;
     check(bitsOk, "mpf_16384", "diffExpBits=%g", (double)diff.expBits());
     std::snprintf(buf, sizeof(buf), "[prec] info mpf_mul@16384 = %.1f us/op\n", us);
@@ -818,7 +831,8 @@ bool precisionSelfTest(std::string& log) {
     std::fflush(stdout);
   }
 
-  /* G. Karatsuba 正确性：精确整数乘法（无舍入，可逐位比对） */
+  /* G. Karatsuba correctness: exact integer multiply (no rounding, so the
+   * result can be compared bit for bit). */
   {
     Mpf X(4200), Y(4200), Z(4200), E(4200), t(4200), t2(4200), t3(4200);
     X.setUi(3);
@@ -841,7 +855,7 @@ bool precisionSelfTest(std::string& log) {
           Z.toDouble() - E.toDouble());
   }
 
-  /* H. 1K 位档的乘法耗时，便于看曲线 */
+  /* H. Multiply cost at 1024 bits, for the scaling curve. */
   {
     Mpf one(1024), tiny(1024), p(1024), q(1024), r(1024);
     one.setUi(1);

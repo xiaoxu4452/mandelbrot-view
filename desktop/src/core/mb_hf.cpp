@@ -9,14 +9,16 @@ namespace {
 
 int64_t abs64(int64_t v) { return v < 0 ? -v : v; }
 
-/* (a*b) >> 62，MSVC 没有 __int128，用 64x64->128 的 hi/lo 拼。 */
+/* (a*b) >> 62.  MSVC has no __int128, so the 64x64->128 result is assembled
+ * from its hi/lo halves. */
 int64_t mulShift62(int64_t a, int64_t b) {
   const int64_t hi = __mulh(a, b);
   const uint64_t lo = (uint64_t)a * (uint64_t)b;
   return (hi << 2) | (int64_t)(lo >> 62);
 }
 
-/* 饱和：指数越界时按原版取极值（00446560 的 clamp 分支）。 */
+/* Saturation: when the exponent leaves the range, pin it the way the original
+ * does (the clamp branch at 00446560). */
 void saturate(HFloat& a) {
   if (a.e > kHfExpMax) {
     a.e = kHfExpMax;
@@ -27,7 +29,8 @@ void saturate(HFloat& a) {
   }
 }
 
-/* 共享指数的尾数对按同一方向规格化：|mx|,|my| 的最大者进 [2^61, 2^62)。 */
+/* Normalise a shared-exponent pair in one direction at a time: the larger of
+ * |mx| and |my| lands in [2^61, 2^62). */
 void normPair(int64_t& mx, int64_t& my, int32_t& e) {
   int64_t ax = abs64(mx), ay = abs64(my);
   int64_t a = ax > ay ? ax : ay;
@@ -180,9 +183,10 @@ HFComplex hfcFromDoubles(double re, double im) {
   HFComplex r;
   HFloat hr = hfFromDouble(re);
   HFloat hi = hfFromDouble(im);
-  const int32_t e = hr.e > hi.e ? hr.e : hi.e;  // 共享指数取较大者
+  const int32_t e = hr.e > hi.e ? hr.e : hi.e;  // shared exponent: take the larger
   r.e = e;
-  /* 指数较小的分量右移到公共指数（共享指数格式的固有截断）。 */
+  /* The component with the smaller exponent shifts right onto the common
+   * exponent (the inherent truncation of the shared-exponent format). */
   const int32_t dr = e - hr.e;
   const int32_t di = e - hi.e;
   r.mx = (hr.m == 0 || dr >= 63) ? 0 : (hr.m >> dr);

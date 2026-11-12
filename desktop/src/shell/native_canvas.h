@@ -49,6 +49,10 @@ bool CommitPassWithPreview(double sx, double ox, double sy, double oy);
  *  cx,cy).  Coordinates are normalised by the canvas size. */
 void Preview(double scale, double dx, double dy, double cx, double cy);
 
+/** Replace the preview transform (src = sx*dst + ox) and present.  A pan knows
+ *  its total offset and must not have it composed again per event. */
+void SetPreview(double sx, double ox, double sy, double oy);
+
 /** Drop the preview transform (new frame took over). */
 void ResetPreview();
 

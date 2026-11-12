@@ -17,6 +17,12 @@
 // ------------------------------------------------------------------
 #include "mb_internal.h"
 
+/* The vendored libm is the project's math library.  The CRT's pow() measured
+ * as garbage in the shipping binary (see pixelScale() in mb_core.h), and it is
+ * only ever reached by a palette with a non-neutral gamma, so the defect
+ * stayed invisible until a gamma-bearing preset was opened. */
+extern "C" double mbm_pow(double, double);
+
 namespace mbc {
 namespace detail {
 
@@ -137,9 +143,9 @@ inline void tonePrep(const Palette& P, double& r, double& g, double& b) {
   }
   if (P.gamma != 1.0f) {
     const double ig = 1.0 / (double)P.gamma;
-    r = std::pow(std::max(r, 0.0), ig);
-    g = std::pow(std::max(g, 0.0), ig);
-    b = std::pow(std::max(b, 0.0), ig);
+    r = mbm_pow(std::max(r, 0.0), ig);
+    g = mbm_pow(std::max(g, 0.0), ig);
+    b = mbm_pow(std::max(b, 0.0), ig);
   }
   r *= (double)P.gainR;
   g *= (double)P.gainG;

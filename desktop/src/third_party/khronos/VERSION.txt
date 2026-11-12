@@ -1,0 +1,4 @@
+KhronosGroup/OpenCL-Headers @ 82f60316cc142e7b21dc1d8983b26de18858fbd9
+KhronosGroup/OpenGL-Registry @ 6af574a14089ccfee87efe230ebcdd8742859813
+KhronosGroup/OpenCL-ICD-Loader @ 007c8e892f52e9b9f288830cbce30ab2f97760d0
+KhronosGroup/EGL-Registry @ 01646449caedc958effc3b450360aefd260671ab (KHR/khrplatform.h only)

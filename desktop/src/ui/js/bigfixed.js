@@ -236,25 +236,29 @@ export function requiredBits(pixelSize) {
   return PRECISION_TIERS[PRECISION_TIERS.length - 1];
 }
 
-/** Derive the width from the log2 of the pixel scale (supports scales such as 1e-1000 that a double cannot represent) */
-export function requiredBitsFromLog2(log2ps) {
+/** Derive the width from the log2 of the pixel scale (supports scales such as
+ *  1e-1000 that a double cannot represent).
+ *
+ *  This is the SAME function as `mbc::requiredBits` in the desktop core -- same
+ *  terms, same rounding, same floor.  It used to be `-log2ps + 64` only, while
+ *  the core also adds `log2(maxIter)` for the orbit's accumulated error, so the
+ *  HUD, the coordinate arithmetic and the renderer were three different widths
+ *  that drifted apart as the iteration budget grew.  One formula, one answer. */
+export function requiredBitsFromLog2(log2ps, maxIter = 0) {
   /* `depth + 0x40`: initcanvas_hfloat (0044e970.c:97-149) sizes the number
-   * type from the zoom depth plus a 64-bit guard.  The old `+ 8` here was the
-   * ghost: it returned 64 bits for every scale down to 2^-45, so the "auto"
-   * entry in the precision menu never changed anything and the HUD reported a
-   * width the renderer was not using. */
-  const need = -log2ps + 64;
-  if (need <= 53) return 64;
-  for (let i = 0; i < PRECISION_TIERS.length; i++) {
-    if (PRECISION_TIERS[i] >= need) return PRECISION_TIERS[i];
-  }
-  return PRECISION_TIERS[PRECISION_TIERS.length - 1];
+   * type from the zoom depth plus a 64-bit guard. */
+  let need = -log2ps + 64;
+  if (maxIter > 1) need += Math.log2(maxIter);
+  if (!(need > 64)) need = 64;
+  if (need > 16384) need = 16384;
+  const b = Math.ceil(need / 64) * 64;
+  return b < 96 ? 96 : b;
 }
 
-export function resolveBitsFromLog2(pref, log2ps) {
-  if (pref === 'auto' || pref == null) return requiredBitsFromLog2(log2ps);
+export function resolveBitsFromLog2(pref, log2ps, maxIter = 0) {
+  if (pref === 'auto' || pref == null) return requiredBitsFromLog2(log2ps, maxIter);
   const v = Number(pref);
-  return Number.isFinite(v) ? v : requiredBitsFromLog2(log2ps);
+  return Number.isFinite(v) ? v : requiredBitsFromLog2(log2ps, maxIter);
 }
 
 /** User choice ('auto' or a concrete tier) -> actual width in bits */

@@ -16,6 +16,13 @@ const bridge = (typeof window !== 'undefined' && window.chrome && window.chrome.
 export const NATIVE = !!(bridge && bridge.addEventListener && bridge.postMessage);
 let usable = NATIVE;
 let canvasMode = false;      // route 1: pixels live in the native swapchain
+/* The shell renders and presents the picture itself (OpenGL canvas).  The page
+ * then owns only its chrome: it must never paint over the frame, and it must
+ * not try to shade a field it will not be showing. */
+let glNative = false;
+/* True only after the shell has actually committed a frame to the GL canvas.
+ * Until then the page keeps painting its own picture. */
+let glPresented = false;
 
 let seqCounter = 0;
 const inflight = new Map();          // seq -> { onDone, id, viewId }
@@ -33,12 +40,51 @@ function post(obj) {
 export function nativeUsable() { return usable; }
 
 /** True once the shell reported a working native child-window canvas. */
-export function nativeCanvasMode() { return usable && canvasMode; }
+/* A native surface exists if either half is presenting: the D3D swapchain or
+ * the shell's own GL canvas.  Keeping this D3D-only meant the page never sent
+ * gesture previews once the GL canvas took over, so the wheel froze the picture
+ * and snapped at the end. */
+export function nativeCanvasMode() { return usable && (canvasMode || glNative); }
+
+/** True when the shell's own GL canvas is the visible surface. */
+export function nativeGLOwned() { return usable && glNative; }
+
+/** True when a gesture transform sent to the shell will actually be seen.
+ *  The GL canvas exists before its first committed frame, and until then the
+ *  page canvas is what the user is looking at — sending a preview there moved
+ *  nothing and skipped the page's own blit. */
+export function nativePreviewTarget() {
+  return usable && (canvasMode || (glNative && glPresented));
+}
+
+/** True once the GL canvas has a committed frame to show. */
+export function nativeGLPresented() { return usable && glNative && glPresented; }
 
 /** Gesture feedback: one blit of the displayed frame, applied on the GPU. */
-export function nativeCanvasPreview(dx, dy, scale, cx, cy) {
-  if (!canvasMode) return;
-  post({ type: 'preview', dx, dy, scale, cx, cy });
+export function nativeCanvasPreview(dx, dy, scale, cx, cy, view) {
+  if (!nativeCanvasMode()) return;
+  /* `view` lets the shell drop a preview that arrives after the frame it was
+   * meant to move: applying it then would transform the *new* picture by a
+   * gesture that is already stale, which reads as a jump. */
+  post({ type: 'preview', dx, dy, scale, cx, cy, view: view | 0 });
+}
+
+/**
+ * Set the shell canvas' gesture transform outright.
+ *
+ * `nativeCanvasPreview` *composes* — which is what a sequence of wheel deltas
+ * wants.  A pan, on the other hand, knows its total offset from the frame that
+ * is on screen; sending it through the composing entry point added it again on
+ * every pointer event, so the image accelerated away from the cursor.  This
+ * form replaces the transform, so an event that is duplicated, coalesced or
+ * dropped can never move the picture anywhere but the place the hand asked for.
+ */
+export function nativeCanvasSetPreview(xf, view) {
+  if (!nativeCanvasMode()) return;
+  post({
+    type: 'preview', abs: 1, view: view | 0,
+    sx: xf.sx, ox: xf.ox, sy: xf.sy, oy: xf.oy
+  });
 }
 
 /** PNG export is performed by the shell (WIC + system Save As). */
@@ -425,6 +471,12 @@ if (NATIVE) {
       if (m.shm === false) usable = false;
       frameCap = m.shm !== false && m.frame !== false;
       canvasMode = m.native === true;
+      glNative = m.glnative === true;
+      /* Do NOT switch the page transparent here.  The GL canvas exists but has
+       * not drawn anything yet, and a transparent page over an empty child
+       * window is a blank product.  nativeflush (post-commit) is the only
+       * signal that justifies hiding the page's own canvas. */
+      glPresented = false;
       /* The shell read appdata\mandelbrot.json (winparameters.html) and already
        * validated/defaulted every field; hand the effective values to the page. */
       if (m.cfg) { lastCfg = m.cfg; window.dispatchEvent(new CustomEvent('mbConfig', { detail: m.cfg })); }
@@ -434,9 +486,16 @@ if (NATIVE) {
       for (const cb of readyWaiters) cb(readyThreads);
       readyWaiters.length = 0;
     } else if (m.type === 'nativeflush') {
-      // Whole pass committed to the swapchain: no pixels travel to JS.
+      // Whole pass committed to the native surface: no pixels travel to JS.
       const rec = frameWaiters.get(m.viewId);
-      if (!rec) return;
+      if (!rec) {
+        /* No pass was declared through nativeFrameFlush (the shell owns the
+         * frame), so this is the "first frame is on screen" signal.  Only now
+         * may the page become transparent. */
+        if (glNative) glPresented = true;
+        window.dispatchEvent(new CustomEvent('mbNativeCommit', { detail: m }));
+        return;
+      }
       clearTimeout(rec.timer);
       frameWaiters.delete(m.viewId);
       rec.cb({ viewId: m.viewId, w: m.w, h: m.h, data: null, ok: m.ok !== 0 });

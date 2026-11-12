@@ -1,15 +1,18 @@
 // ------------------------------------------------------------------
-// mb_hf.h — 原版的 HFLOAT 原语族（伪代码 00446560 起）。
+// mb_hf.h — the HFLOAT primitive family from the original binary (pseudocode
+// 00446560 onwards).
 //
-// 布局与反汇编一致：
-//   HFLOAT        { int64 mantissa; int32 exponent; }   值 = m * 2^e
-//   HFLOATCOMPLEX { int64 mx, my;  int32 exponent; }   值 = (mx + i·my) * 2^e
-// 两个分量**共享一个指数**，尾数为 62 位有符号整数，规格化到
-// |m| ∈ [2^61, 2^62)；指数夹在 ±0x2000000，溢出时取 0x3fffffffffffffff
-// （饱和而不是 inf，原版 00446560 的规范化分支就是这个判据）。
+// The layout matches the disassembly:
+//   HFLOAT        { int64 mantissa; int32 exponent; }   value = m * 2^e
+//   HFLOATCOMPLEX { int64 mx, my;  int32 exponent; }   value = (mx + i·my) * 2^e
+// Both components **share one exponent**; the mantissas are signed 62-bit
+// integers normalised to |m| in [2^61, 2^62).  The exponent is clamped to
+// ±0x2000000 and saturates to 0x3fffffffffffffff on overflow (saturation
+// rather than inf; that is the normalisation branch at 00446560).
 //
-// 这是原版做级数外推/饱和（accurateprec 的输入）用的定点浮点，
-// 和 mpf 链是两套东西：mpf 管参考轨道，HF 管局部 Taylor 级数。
+// This is the fixed-point float the original uses for series extrapolation and
+// saturation (the input to accurateprec).  It is a separate path from the mpf
+// chain: mpf carries the reference orbit, HF carries the local Taylor series.
 // ------------------------------------------------------------------
 #pragma once
 
@@ -39,8 +42,8 @@ void hfNormC(HFComplex& a);
 HFloat hfAdd(const HFloat& a, const HFloat& b);
 HFloat hfSub(const HFloat& a, const HFloat& b);
 HFloat hfMul(const HFloat& a, const HFloat& b);
-HFloat hfMul2(HFloat a);            // a * 2（改指数，不丢位）
-HFloat hfAbs2(const HFloat& a);     // |a|^2，仍按 62 位尾数
+HFloat hfMul2(HFloat a);            // a * 2 (exponent bump, no bits lost)
+HFloat hfAbs2(const HFloat& a);     // |a|^2, still on the 62-bit mantissa
 HFloat hfFromDouble(double v);
 double hfToDouble(const HFloat& a);
 

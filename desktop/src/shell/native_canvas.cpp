@@ -526,6 +526,17 @@ void Preview(double scale, double dx, double dy, double cx, double cy) {
   g.sc->Present(1, 0);
 }
 
+void SetPreview(double sx, double ox, double sy, double oy) {
+  if (!g.ready || g.display < 0) return;
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_sx = sx; g_ox = ox;
+  g_sy = sy; g_oy = oy;
+  SetupDraw();
+  DrawQuad(g.slots[g.display], (float)g_sx, (float)g_sy, (float)g_ox, (float)g_oy,
+           (float)g.displaySS);
+  g.sc->Present(1, 0);
+}
+
 void Present() {
   if (!g.ready || !g.rtv) return;
   std::lock_guard<std::mutex> lk(g_mu);

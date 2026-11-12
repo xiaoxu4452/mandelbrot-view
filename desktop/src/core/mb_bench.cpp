@@ -10,6 +10,7 @@
 // output) without running the window: the engine is the same code the shell
 // calls, so what comes out here is what the screen shows.
 // ------------------------------------------------------------------
+#include "mb_boost.h"
 #include "mb_core.h"
 #include "mb_mpf.h"
 
@@ -63,6 +64,12 @@ int main(int argc, char** argv) {
     std::string log;
     const bool ok = mbc::precisionSelfTest(log);
     std::printf("[prec] %s\n", ok ? "ALL PASS" : "FAILURES");
+    return ok ? 0 : 1;
+  }
+  if (std::getenv("MB_BOOSTCHECK")) {
+    std::string log;
+    const bool ok = mbc::boostSelfTest(log);
+    std::printf("%s", log.c_str());
     return ok ? 0 : 1;
   }
   if (argc < 9) {

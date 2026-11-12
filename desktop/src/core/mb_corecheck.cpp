@@ -27,7 +27,7 @@ static int seriesTest() {
   R.im.assign(N, 0.0);
   R.dRe = R.dIm = 0.0;
   buildFolds(R, 0);
-  buildSeries(R, 1e-300, true, 2, 0);
+  buildSeries(R, -996.6, true, 2, 0);   // log2(1e-300)
 
   int maxA = 0, maxB = 0, maxC = 0;
   for (int e : R.aExp) if (e > maxA) maxA = e;

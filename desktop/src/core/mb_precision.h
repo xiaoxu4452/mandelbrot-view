@@ -40,6 +40,10 @@ public:
 
   int bitLength() const;               // index of the most significant bit + 1
 
+  // Raw magnitude, little-endian 32-bit limbs.  Used by the Boost.Math
+  // bridge to convert without a lossy double round-trip.
+  const std::vector<uint32_t>& limbs() const { return limbs_; }
+
 private:
   std::vector<uint32_t> limbs_;        // little-endian magnitude
   bool neg_ = false;

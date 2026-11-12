@@ -80,3 +80,13 @@ tools/bench*/
 wasm/t/
 tools/*.sh
 tools/*.html
+
+# Generated shell payload and local build output
+desktop/src/shell/ui_resources.cpp
+desktop/src/build/
+desktop/Mandelbrot View.exe
+
+# Vendored third-party source trees (Boost / MPIR / MPFR) are committed on
+# purpose so a clone can build offline; tools/fetch-third-party.py remains the
+# reference for versions and provenance.
+!tools/fetch-third-party.py

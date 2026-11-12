@@ -83,6 +83,65 @@ struct Prof {
 };
 }  // namespace
 
+/* ---- normalised complex arithmetic ----------------------------------
+ *
+ * A_n = prod(2 Z_k) grows exponentially, B_n ~ A_n^2 and C_n ~ A_n^3.  On a
+ * long reference orbit they leave the double range after ~1000 steps, which
+ * is exactly where the old buildSeries had to stop and where a deep frame
+ * most needs the series to keep going.  RFF-2.0 solves this with `dex` /
+ * `try_normalized_value()`: a mantissa plus a binary exponent, renormalised
+ * after every operation.  We do the same, but only renormalise once the
+ * mantissa leaves [1e-120, 1e120] — while the numbers are ordinary doubles
+ * the arithmetic below is the original one, bit for bit.
+ *
+ * The same pair carries the pixel's own offset (dc) once its value is below
+ * the double range, which is what makes a 1e6000 view expressible at all:
+ * the exponent travels with the value instead of being multiplied into it.
+ */
+struct SC {
+  double r = 0.0, i = 0.0;
+  int e = 0;
+};
+constexpr double kScHi = 1e120, kScLo = 1e-120;
+
+inline void scNorm(SC& a) {
+  const double m = std::max(std::fabs(a.r), std::fabs(a.i));
+  if (!(m > 0.0)) { a.e = 0; return; }
+  if (m >= kScLo && m <= kScHi) return;
+  int k = 0;
+  std::frexp(m, &k);
+  const double s = std::ldexp(1.0, -k);   // a power of two: exact
+  a.r *= s;
+  a.i *= s;
+  a.e += k;
+}
+inline SC scMulC(const SC& a, double jr, double ji) {
+  SC c{a.r * jr - a.i * ji, a.r * ji + a.i * jr, a.e};
+  scNorm(c);
+  return c;
+}
+inline SC scMul(const SC& a, const SC& b) {
+  SC c{a.r * b.r - a.i * b.i, a.r * b.i + a.i * b.r, a.e + b.e};
+  scNorm(c);
+  return c;
+}
+inline void scFold(SC& a, double fr, double fi) { a.r *= fr; a.i *= fi; }
+inline SC scReal(double v) { SC a{v, 0.0, 0}; scNorm(a); return a; }
+inline SC scAdd(const SC& a, const SC& b) {
+  if (a.r == 0.0 && a.i == 0.0) return b;
+  if (b.r == 0.0 && b.i == 0.0) return a;
+  const int e = std::max(a.e, b.e);
+  SC c{std::ldexp(a.r, a.e - e) + std::ldexp(b.r, b.e - e),
+       std::ldexp(a.i, a.e - e) + std::ldexp(b.i, b.e - e), e};
+  scNorm(c);
+  return c;
+}
+/** log |a|, or a very negative sentinel for an exactly-zero coefficient. */
+inline double scLogAbs(const SC& a) {
+  const double m = std::hypot(a.r, a.i);
+  return m > 0.0 ? std::log(m) + (double)a.e * kLn2 : -1e300;
+}
+
 /* One reference orbit plus the Taylor coefficients of the deviation.
  *
  * `ar/ai`, `br/bi` are the linear and quadratic terms of
@@ -123,6 +182,10 @@ struct Ref {
    * Stored as double because a threshold of 1e300 used to overflow float
    * (max 3.4e38) into +inf; float also quantised every threshold to 1e-7. */
   std::vector<double> dcth;
+  /* The same thresholds in the log domain.  At extreme depth |dc| itself is
+   * below the double range, so the comparison that picks a pixel's start has
+   * to be made on log|dc|; keeping the log here avoids a log() per pixel. */
+  std::vector<double> dcthLog;
   int len = 0;
   int skip = 0;
   /* Last index at which |A_n| itself still fits in a double.  A distance-
@@ -174,6 +237,27 @@ inline void seriesDeviation(const Ref& R, int sk, double dcr, double dci,
   di = std::ldexp(lai + std::ldexp(lbi, dB) + std::ldexp(lci, dC), ae);
 }
 
+/* Same series, evaluated with the pixel offset in scaled form.  Each term
+ * carries its own exponent (coefficient exponent + dc exponent, doubled or
+ * tripled for the higher orders) and scAdd aligns them, so the result stays
+ * meaningful when dc is 1e-6000 and A_n is 1e6000 at the same time.  The
+ * returned deviation has whatever exponent the geometry implies; a start
+ * that lands near the frame scale comes back as an ordinary double. */
+inline SC seriesDeviationScaled(const Ref& R, int sk, const SC& dc) {
+  const size_t i = (size_t)sk;
+  const double qr = dc.r * dc.r - dc.i * dc.i;
+  const double qi = 2.0 * dc.r * dc.i;
+  SC l1{R.ar[i] * dc.r - R.ai[i] * dc.i,
+        R.ar[i] * dc.i + R.ai[i] * dc.r, R.aExp[i] + dc.e};
+  SC l2{R.br[i] * qr - R.bi[i] * qi,
+        R.br[i] * qi + R.bi[i] * qr, R.bExp[i] + 2 * dc.e};
+  const SC c2{R.cr[i] * qr - R.ci[i] * qi,
+              R.cr[i] * qi + R.ci[i] * qr, R.cExp[i] + 2 * dc.e};
+  const SC l3{c2.r * dc.r - c2.i * dc.i, c2.r * dc.i + c2.i * dc.r,
+              c2.e + dc.e};
+  return scAdd(scAdd(l1, l2), l3);
+}
+
 /* Mip chain of a palette table.  Level 0 is the exact table; level k is the
  * box average of 2^k neighbouring entries.  Sampling level k is how the
  * renderer asks for "the mean colour of the phase interval this pixel covers"
@@ -191,12 +275,24 @@ struct Mip {
 struct Ctx {
   const Request* q = nullptr;
   double ps = 1.0;                        // plane units per pixel
+  /* The same value in exact (mantissa, exponent) form, mant * 2^exp.  `ps`
+   * is zero once the exponent leaves the double range (a 1e6000 view has
+   * ps ~= 2^-19940); every consumer that has to keep working there reads the
+   * pair instead. */
+  double psMant = 1.0;
+  int psExp = 0;
+  double psLog2 = 0.0;                    // log2 of the pixel scale
+  /* True when ps is below the range a double can hold: the per-pixel offset
+   * is then built as a scaled complex (SC) and the scalar kernel runs its
+   * normalised path instead of the plain-double one. */
+  bool deepScale = false;
   double halfW = 0.0, halfH = 0.0;        // frame centre, in pixels
   double cre = 0.0, cim = 0.0;            // centre as double (direct path)
   double jr = 0.0, ji = 0.0;              // Julia seed (direct path)
   bool julia = false;
   int kind = 0;
   int power = 2;
+  double phoenixP = -0.5;                 // kind 5: z' = z^2 + P*z_prev + c
   int maxIter = 1;
   const Palette* pal = nullptr;
   int colorMode = 0;
@@ -272,6 +368,26 @@ inline void screenDelta(const Ctx& g, double fx, double fy, double& dr,
   const double y = (g.halfH - fy - 0.5) * g.ps;
   dr = x * g.rotC - y * g.rotS;
   di = x * g.rotS + y * g.rotC;
+}
+
+/* The same offset as a scaled complex: the integer pixel index is exact and
+ * the pixel pitch contributes only its exponent, so the value survives a
+ * pitch of 2^-19940 where the double form above would be exactly zero. */
+inline void screenDeltaScaled(const Ctx& g, double fx, double fy, SC& dc) {
+  const double x = (fx + 0.5 - g.halfW) * g.psMant;
+  const double y = (g.halfH - fy - 0.5) * g.psMant;
+  dc.r = x * g.rotC - y * g.rotS;
+  dc.i = x * g.rotS + y * g.rotC;
+  dc.e = g.psExp;
+  scNorm(dc);
+}
+
+/* Value of a scaled complex as a plain double, saturating to zero when it is
+ * below the double range.  Used where a consumer genuinely wants a double and
+ * only the shallow case can carry the information anyway. */
+inline void scToDouble(const SC& a, double& r, double& i) {
+  r = std::ldexp(a.r, a.e);
+  i = std::ldexp(a.i, a.e);
 }
 
 /* Analytic interior of z^2+c: the main cardioid and the period-2 disc.
@@ -371,9 +487,26 @@ inline void cpowBig(const Big& zr, const Big& zi, int p, Big& orr, Big& oii) {
   oii = ri;
 }
 
-/* One step of the family map in arbitrary precision. */
+/* One step of the family map in arbitrary precision.  `phoenixP` and the
+ * prev pair are only read/written by kind 5; every other family ignores them,
+ * so the call sites that never see a Phoenix pass nullptr. */
 inline void famStepBig(int kind, int power, Big& zr, Big& zi, const Big& cr,
-                       const Big& ci) {
+                       const Big& ci, double phoenixP = 0.0,
+                       Big* prevR = nullptr, Big* prevI = nullptr) {
+  if (kind == 5) {
+    const Big phv = Big::fromDouble(phoenixP, zr.fracBits());
+    const Big nr = zr.mul(zr).sub(zi.mul(zi))
+                       .add(prevR ? prevR->mul(phv) : Big(zr.fracBits()))
+                       .add(cr);
+    const Big ni = zr.mul(zi).shifted(1)
+                       .add(prevI ? prevI->mul(phv) : Big(zr.fracBits()))
+                       .add(ci);
+    if (prevR) *prevR = zr;
+    if (prevI) *prevI = zi;
+    zr = nr;
+    zi = ni;
+    return;
+  }
   Big xr = zr, xi = zi;
   if (kind == 1) {
     xi = xi.negated();
@@ -398,7 +531,19 @@ inline void famStepBig(int kind, int power, Big& zr, Big& zi, const Big& cr,
 
 /* The same step in double, used by the anchor probe and the direct kernel. */
 inline void famStepD(int kind, int power, double& zr, double& zi, double cr,
-                     double ci) {
+                     double ci, double phoenixP = 0.0, double* prevR = nullptr,
+                     double* prevI = nullptr) {
+  if (kind == 5) {
+    const double nr = zr * zr - zi * zi +
+                      (prevR ? phoenixP * *prevR : 0.0) + cr;
+    const double ni = 2.0 * zr * zi +
+                      (prevI ? phoenixP * *prevI : 0.0) + ci;
+    if (prevR) *prevR = zr;
+    if (prevI) *prevI = zi;
+    zr = nr;
+    zi = ni;
+    return;
+  }
   double xr = zr, xi = zi;
   if (kind == 1) {
     xi = -xi;
@@ -533,7 +678,7 @@ int buildReference(const Request& q, int bits, int maxIter, double dRe,
                    const std::atomic<uint64_t>* gen = nullptr,
                    uint64_t myGen = 0);
 void buildFolds(Ref& R, int kind);
-void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind);
+void buildSeries(Ref& R, double dcMaxLog2, bool mandelbrot, int power, int kind);
 void buildDevTable(Ref& R, int power);
 Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g,
                    const std::atomic<uint64_t>* gen = nullptr,

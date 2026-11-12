@@ -46,6 +46,8 @@
 #include "WebView2.h"
 #include "mb_core.h"
 #include "native_canvas.h"
+#include "gpu_render.h"
+#include "cl_field.h"
 #include "ui_resources.h"
 
 #pragma comment(lib, "WebView2LoaderStatic.lib")
@@ -55,9 +57,83 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 
-// Native swapchain canvas (route 1).  When initialisation fails the whole
-// product falls back to the previous JS-canvas path without any visual gap.
-static bool g_nativeCanvas = false;
+// Native child-window canvas.  Two backends present the same picture:
+//
+//   gpur::   OpenGL 3.3 core + OpenCL field   (the architecture)
+//   nc::     D3D11 bitblt swapchain           (fallback)
+//
+// The shell only ever calls the `canvas::` shims below, so a machine without a
+// GL 3.3 context keeps the exact behaviour it had before.
+static bool g_nativeCanvas = false;   // any native canvas is presenting
+static bool g_glCanvas = false;       // it is the OpenGL one
+static bool g_gpuField = false;       // OpenCL computes the iteration field
+/* Size / view of the pass currently resident in the GL canvas's field texture.
+ * A field request is a whole frame, so the texture is reallocated only when the
+ * frame really changes. */
+static int g_glFieldW = 0, g_glFieldH = 0, g_glFieldView = -1;
+/* Iteration budget above which the OpenCL field beats the CPU (see the gate at
+ * the render site). */
+static constexpr int kGpuMinIter = 2000;
+static int g_glFieldPosts = 0;
+/* Gesture previews applied / dropped because a newer frame had landed.  A
+ * preview that arrives late must not move the new picture. */
+static int g_prevApplied = 0, g_prevStale = 0;
+
+namespace canvas {
+
+inline void BeginPass(int w, int h, int ss, int cw, int ch) {
+  if (g_glCanvas) gpur::beginPass(w, h, ss, cw, ch);
+  else if (g_nativeCanvas) nc::BeginPass(w, h, ss, cw, ch);
+}
+
+inline bool UploadField(const void* p, int w, int h) {
+  return g_glCanvas ? gpur::uploadField(static_cast<const float*>(p), w, h)
+                    : false;
+}
+
+inline bool Upload(const uint8_t* p, int w, int h, int x, int y, int tw, int th) {
+  if (g_glCanvas) {
+    // `p` is the base of the whole pass surface; the canvas wants the tile.
+    return gpur::uploadRGBA(p + ((size_t)y * (size_t)w + (size_t)x) * 4, tw, th,
+                            x, y);
+  }
+  if (g_nativeCanvas) { nc::UploadTile(p, w, h, x, y, tw, th); return true; }
+  return false;
+}
+
+inline bool Commit(bool keep, double sx, double ox, double sy, double oy) {
+  if (g_glCanvas) return gpur::commit(keep, sx, ox, sy, oy);
+  if (g_nativeCanvas)
+    return keep ? nc::CommitPassWithPreview(sx, ox, sy, oy) : nc::CommitPass();
+  return false;
+}
+
+inline void SetBounds(int x, int y, int w, int h) {
+  if (g_glCanvas) gpur::setBounds(x, y, w, h);
+  else if (g_nativeCanvas) nc::SetBounds(x, y, w, h);
+}
+
+inline void Preview(double scale, double dx, double dy, double cx, double cy) {
+  if (g_glCanvas) gpur::preview(scale, dx, dy, cx, cy);
+  else if (g_nativeCanvas) nc::Preview(scale, dx, dy, cx, cy);
+}
+
+/** Replace the gesture transform instead of composing onto it (see glc::SetPreview). */
+inline void SetPreview(double sx, double ox, double sy, double oy) {
+  if (g_glCanvas) gpur::setPreview(sx, ox, sy, oy);
+  else if (g_nativeCanvas) nc::SetPreview(sx, ox, sy, oy);
+}
+
+inline HWND Hwnd() { return g_glCanvas ? gpur::hwnd() : nc::Hwnd(); }
+inline int Frames() { return g_glCanvas ? gpur::frames() : nc::FrameCount(); }
+inline double UploadMs() {
+  return g_glCanvas ? 0.0 : nc::LastUploadMs();
+}
+inline double PresentMs() {
+  return g_glCanvas ? gpur::lastPresentMs() : nc::LastPresentMs();
+}
+
+}  // namespace canvas
 
 // ---------------------------------------------------------------- utilities
 
@@ -373,6 +449,33 @@ static int EnsureField(int w, int h, uint64_t seq, int channels) {
   return pick;
 }
 
+/* The OpenGL canvas owns the picture, so the page's per-pass shared buffers are
+ * bypassed entirely: the shell keeps one CPU surface for the pass, and that
+ * surface is the thing uploaded to the canvas.  The page still drives *which*
+ * tiles to render and in what order, which is its real job. */
+static bool EnsureHostPass(int viewW, int viewH, int viewId) {
+  if (viewW <= 0 || viewH <= 0) return false;
+  std::lock_guard<std::mutex> lk(g_frameMu);
+  if (g_frame.ptr && g_frame.cpu && g_frame.viewId == viewId &&
+      g_frame.w == viewW && g_frame.h == viewH)
+    return true;
+  if (g_frame.buf) { g_frame.buf->Release(); g_frame.buf = nullptr; }
+  g_frame.cpu = std::make_shared<std::vector<uint8_t>>(
+      (size_t)viewW * (size_t)viewH * 4, 0);
+  g_frame.ptr = g_frame.cpu->data();
+  g_frame.w = viewW;
+  g_frame.h = viewH;
+  g_frame.viewId = viewId;
+  g_frame.ss = 1;
+  g_frame.cw = viewW;
+  g_frame.ch = viewH;
+  g_frame.finalPass = true;
+  canvas::BeginPass(viewW, viewH, 1, viewW, viewH);
+  LogMsg("[frame] gl pass " + std::to_string(viewW) + "x" + std::to_string(viewH) +
+         " view=" + std::to_string(viewId));
+  return true;
+}
+
 static bool EnsureFrame(int w, int h, int viewId, int ss, int cw, int ch) {
   if (!g_env12 || w <= 0 || h <= 0) return false;
   std::lock_guard<std::mutex> lk(g_frameMu);
@@ -394,7 +497,7 @@ static bool EnsureFrame(int w, int h, int viewId, int ss, int cw, int ch) {
     g_frame.cw = cw;
     g_frame.ch = ch;
     g_frame.finalPass = cw > 0 && ch > 0 && w == cw * ss && h == ch * ss;
-    nc::BeginPass(w, h, ss, cw, ch);
+    canvas::BeginPass(w, h, ss, cw, ch);
     LogMsg("[frame] native " + std::to_string(w) + "x" + std::to_string(h) + " ss=" +
            std::to_string(ss) + " canvas=" + std::to_string(cw) + "x" + std::to_string(ch));
     return true;
@@ -439,16 +542,27 @@ static void PostFrame(int viewId, bool keepPreview = false,
     /* A live pass may arrive while a wheel/drag gesture is still running.
      * Keep the accumulated preview transform so the new frame is already at
      * the current view instead of snapping back (see nc::CommitPassWithPreview). */
-    const bool committed = keepPreview
-        ? nc::CommitPassWithPreview(sx, ox, sy, oy)
-        : nc::CommitPass();
+    const bool committed = canvas::Commit(keepPreview, sx, ox, sy, oy);
     int w = g_frame.w, h = g_frame.h, ss = g_frame.ss;
     if (g_frame.finalPass) {
       std::lock_guard<std::mutex> lk2(g_lastMu);
-      g_lastFinal = std::move(*g_frame.cpu);
-      g_lastW = w;
-      g_lastH = h;
-      g_lastSS = ss;
+      if (g_glCanvas) {
+        /* The pixels never came back to the CPU: they are in the GL_RGB10_A2
+         * scene texture.  Read that back once, at canvas resolution, so PNG
+         * export matches what the window shows. */
+        const int ew = g_frame.cw > 0 ? g_frame.cw : w;
+        const int eh = g_frame.ch > 0 ? g_frame.ch : h;
+        g_lastFinal.assign((size_t)ew * (size_t)eh * 4, 0);
+        if (!gpur::readback(g_lastFinal.data(), ew, eh)) g_lastFinal.clear();
+        g_lastW = ew;
+        g_lastH = eh;
+        g_lastSS = 1;
+      } else {
+        g_lastFinal = std::move(*g_frame.cpu);
+        g_lastW = w;
+        g_lastH = h;
+        g_lastSS = ss;
+      }
     }
     g_frame.cpu.reset();
     g_frame.ptr = nullptr;
@@ -462,8 +576,8 @@ static void PostFrame(int viewId, bool keepPreview = false,
     PostJson(meta);
     if (g_framePosted < 6) {
       LogMsg("[native] commit " + std::to_string(w) + "x" + std::to_string(h) + " ss=" +
-             std::to_string(ss) + " present=" + std::to_string(nc::LastPresentMs()) +
-             "ms frames=" + std::to_string(nc::FrameCount()) + " ok=" + (committed ? "1" : "0"));
+             std::to_string(ss) + " present=" + std::to_string(canvas::PresentMs()) +
+             "ms frames=" + std::to_string(canvas::Frames()) + " ok=" + (committed ? "1" : "0"));
       g_framePosted++;
     }
     return;
@@ -554,12 +668,18 @@ struct Done {
   int x = 0, y = 0, w = 1, h = 1;
   std::string id;
   int bits = 0, refLen = 0, glitches = 0, maxIter = 0, threads = 1;
+  /* The budget this pass was ASKED for (not the one the core ended up using).
+   * A frame that escapes at `cap` did not "run out of detail", it ran out of
+   * iterations; the page must not print "no structure" for it. */
+  int cap = 0;
   int escMin = 0, escMax = 0, bounded = 0, directFixed = 0;
   long long iterPixels = 0;
   int canvasVerts = 0, canvasFilled = 0, canvasCacheHit = 0;
   double iterPerCycle = 0;
   bool dd = false, perturb = false, unsupported = false;
   bool field = false;
+  bool gpuField = false;      // the tile's field was produced by OpenCL and
+                              // already lives in the OpenGL pass texture
   int fieldSlot = -1;
   int fieldChannels = 4;      // 4 = colour plane, 6 = colour + value plane
   bool orbitReused = false;   // the environment (reference orbit) came from the cache
@@ -1176,6 +1296,7 @@ class MsgHandler : public Cb<ICoreWebView2WebMessageReceivedEventHandler> {
                       ",\"shm\":" + (g_slotsReady ? "true" : "false") +
                       ",\"frame\":" + (g_env12 ? "true" : "false") +
                       ",\"native\":" + (g_nativeCanvas ? "true" : "false") +
+                      ",\"glnative\":" + (g_glCanvas ? "true" : "false") +
                       ",\"cfg\":" + ConfigJson() + "}";
       PostJson(r);
       /* The preset library ships inside the page bundle (presets-data.js).
@@ -1235,9 +1356,55 @@ class MsgHandler : public Cb<ICoreWebView2WebMessageReceivedEventHandler> {
       return S_OK;
     }
     if (ty == "preview") {
-      if (g_nativeCanvas)
-        nc::Preview(JsonNum(s, "scale", 1.0), JsonNum(s, "dx", 0.0), JsonNum(s, "dy", 0.0),
-                    JsonNum(s, "cx", 0.5), JsonNum(s, "cy", 0.5));
+      /* Any native surface takes the gesture.  Gating this on the D3D canvas
+       * alone silently dropped every wheel preview once the OpenGL canvas
+       * owned the picture, so the image froze for the whole gesture and then
+       * snapped to the new frame -- the "jitter" the wheel reported.
+       *
+       * A preview is only meaningful while the frame it belongs to is what is
+       * on screen.  Once a newer view has been committed, replaying an old
+       * gesture would move the *new* picture by a stale offset, so it is
+       * dropped instead. */
+      const int pv = JsonInt(s, "view", -1);
+      /* A gesture mutates the view but does not advance the page's view id --
+       * that happens when the next render starts.  So a preview normally
+       * carries the SAME id as the frame it is moving, and only a strictly
+       * older id is stale (a frame from a previous view already landed). */
+      const bool fresh = (pv < 0) || (pv >= g_glFieldView);
+      if (g_glCanvas) {
+        if (fresh) {
+          ++g_prevApplied;
+          /* `abs` carries the whole gesture transform rather than one step of
+           * it.  A pan computes its offset from the frame on screen, so the
+           * composing form turned every pointer event into another copy of the
+           * same translation (the image accelerating away from the cursor). */
+          if (JsonInt(s, "abs", 0)) {
+            canvas::SetPreview(JsonNum(s, "sx", 1.0), JsonNum(s, "ox", 0.0),
+                               JsonNum(s, "sy", 1.0), JsonNum(s, "oy", 0.0));
+          } else {
+            canvas::Preview(JsonNum(s, "scale", 1.0), JsonNum(s, "dx", 0.0),
+                            JsonNum(s, "dy", 0.0), JsonNum(s, "cx", 0.5),
+                            JsonNum(s, "cy", 0.5));
+          }
+          if ((g_prevApplied % 60) == 1)
+            LogMsg("[preview] applied=" + std::to_string(g_prevApplied) +
+                   " stale=" + std::to_string(g_prevStale));
+        } else {
+          if ((++g_prevStale % 30) == 1)
+            LogMsg("[preview] stale=" + std::to_string(g_prevStale) +
+                   " pv=" + std::to_string(pv) +
+                   " committed=" + std::to_string(g_glFieldView));
+        }
+      } else if (g_nativeCanvas) {
+        if (JsonInt(s, "abs", 0)) {
+          canvas::SetPreview(JsonNum(s, "sx", 1.0), JsonNum(s, "ox", 0.0),
+                             JsonNum(s, "sy", 1.0), JsonNum(s, "oy", 0.0));
+        } else {
+          canvas::Preview(JsonNum(s, "scale", 1.0), JsonNum(s, "dx", 0.0),
+                          JsonNum(s, "dy", 0.0), JsonNum(s, "cx", 0.5),
+                          JsonNum(s, "cy", 0.5));
+        }
+      }
       return S_OK;
     }
     if (ty == "exportPng") {
@@ -1539,6 +1706,15 @@ static void RenderThread() {
         keepCpu = g_frame.cpu;
       }
     }
+    if (!useFrame && !j.field && g_glCanvas &&
+        EnsureHostPass(j.viewW > 0 ? j.viewW : j.w, j.viewH > 0 ? j.viewH : j.h,
+                       j.viewId)) {
+      std::lock_guard<std::mutex> lk(g_frameMu);
+      useFrame = true;
+      outPtr = g_frame.ptr + ((size_t)j.y * g_frame.w + j.x) * 4;
+      outPitch = g_frame.w;
+      keepCpu = g_frame.cpu;
+    }
     if (!useFrame && !j.field) {
       slot = AcquireSlot();
       if (slot < 0) return;
@@ -1632,6 +1808,7 @@ static void RenderThread() {
     mbc::Stats st;
     auto t0 = std::chrono::steady_clock::now();
     bool fieldOk = true;
+    bool gpuField = false;
     if (j.field) {
       /* The kernel computes the iteration field only; the page's shader turns
        * it into pixels.  This is the reference program's own split, and it is
@@ -1661,19 +1838,109 @@ static void RenderThread() {
                 need * sizeof(float));
         fieldOk = false;
       } else {
-        mbc::Field f;
-        if (std::getenv("MB_FIELD_COPY")) {
-          f.resize(req.width, req.height, fch);
-          g_engine->renderField(req, f, st);
-          std::memcpy(fs.ptr, f.base(), need * sizeof(float));
-        } else {
-          f.adopt(req.width, req.height, fs.ptr, fs.bytes / sizeof(float), fch);
-          g_engine->renderField(req, f, st);
+        /* Where the field comes from: OpenCL when the frame is heavy enough to
+         * pay for an fp64 kernel, the CPU core otherwise.  Either way the same
+         * 4-channel field lands in the slot and in the GL canvas's field
+         * texture, and the canvas colours it. */
+        bool onGpu = false;
+        const bool wantGlField = g_glCanvas;
+        if (wantGlField) {
+          const int fw = req.width, fh = req.height;
+          if (g_glFieldW != fw || g_glFieldH != fh) {
+            gpur::beginPass(fw, fh, 1, fw, fh);
+            g_glFieldW = fw;
+            g_glFieldH = fh;
+          }
+          g_glFieldView = j.viewId;
+          /* Every landed frame is the real picture, so the gesture preview
+           * that stood in for it must be dropped.  Leaving it in place made
+           * the wheel transform compose pass after pass — the frame kept
+           * shrinking until the fractal sat in the middle as a bright ring. */
+          gpur::resetPreview();
+          const double ipc = req.cycle > 0.0
+                                 ? req.cycle
+                                 : (pal.cycleRef > 0.0f ? (double)pal.cycleRef : 1.0);
+          gpur::setPalette(pal, req.offset, ipc, req.colorMode,
+                           req.aa > 1 ? req.aa : 1);
         }
-        HostLog("field view=%d slot=%d %dx%d ch=%d copy=%d iter=%d bounded=%d esc=[%d,%d]",
-                j.viewId, j.fieldSlot, f.w, f.h, f.channels,
-                f.external ? 0 : 1, st.maxIterUsed, f.bounded,
-                f.escapeMin, f.escapeMax);
+        /* Measured on this machine (Radeon 780M, fp64 at 1/16 rate, 6 CUs vs
+         * 15 AVX2 threads): the kernel is ~2x slower while a frame averages a
+         * few iterations per pixel, and ~1.3x faster once the escape budget is
+         * in the thousands.  So the GPU takes the field only for heavy frames;
+         * shallow ones stay on the CPU, which is both faster and the definition
+         * of the picture.  MB_GPU=1 forces it, MB_GPU=0 disables it. */
+        if (g_gpuField && wantGlField && req.maxIter >= kGpuMinIter &&
+            fch == 4) {
+          mbc::Stats gst;
+          if (gpur::renderFieldTile(req, 0.0, gst)) {
+            st = gst;
+            onGpu = true;
+            /* The kernel always writes four channels.  Copy only what it
+             * actually produced: a value-plane request asks for six, and
+             * copying `need` floats out of a four-channel buffer reads past
+             * the end of the heap block. */
+            const float* gd = gpur::fieldData();
+            const size_t have = gpur::fieldFloats();
+            if (gd) std::memcpy(fs.ptr, gd, std::min(need, have) * sizeof(float));
+          }
+        }
+        if (!onGpu) {
+          mbc::Field f;
+          if (std::getenv("MB_FIELD_COPY")) {
+            f.resize(req.width, req.height, fch);
+            g_engine->renderField(req, f, st);
+            std::memcpy(fs.ptr, f.base(), need * sizeof(float));
+          } else {
+            f.adopt(req.width, req.height, fs.ptr, fs.bytes / sizeof(float), fch);
+            g_engine->renderField(req, f, st);
+          }
+        } else {
+          gpuField = true;
+        }
+        if (wantGlField) {
+          /* Band fit.  A frame's visible iteration range can be a handful of
+           * steps while the palette's natural cycle is hundreds, which paints
+           * the whole thing one flat colour.  The core measures the frame's own
+           * range and reports the fitted cycle in `iterPerCycle`; the shader
+           * has to use that same number or the picture is a black card with a
+           * bright rim (the fit only ever raises the density, so a shallow view
+           * keeps its authored look). */
+          if (st.iterPerCycle > 0.0)
+            gpur::setPalette(pal, req.offset, st.iterPerCycle, req.colorMode,
+                             req.aa > 1 ? req.aa : 1);
+          /* One shade per pass, from the field the shell just computed.  The
+           * window shows the OpenGL canvas, so this is the picture; the page's
+           * own WebGL copy is only kept so a machine that cannot present
+           * natively still has one. */
+          if (canvas::UploadField(fs.ptr, req.width, req.height)) {
+            canvas::Commit(false, 1.0, 0.0, 1.0, 0.0);
+            if (j.quality >= 2) {
+              /* Keep the last final pass for PNG export.  The pixels live in
+               * the GL canvas, so the export reads them back once here rather
+               * than paying for it on every preview pass. */
+              std::lock_guard<std::mutex> lk2(g_lastMu);
+              g_lastFinal.assign((size_t)req.width * req.height * 4, 0);
+              if (!gpur::readback(g_lastFinal.data(), req.width, req.height))
+                g_lastFinal.clear();
+              g_lastW = req.width;
+              g_lastH = req.height;
+              g_lastSS = 1;
+            }
+            if (g_glFieldPosts++ == 0) {
+              char flush[160];
+              std::snprintf(flush, sizeof(flush),
+                            "{\"type\":\"nativeflush\",\"viewId\":%d,\"w\":%d,"
+                            "\"h\":%d,\"ss\":1,\"ok\":1}",
+                            j.viewId, req.width, req.height);
+              PostJson(flush);
+            }
+          }
+        }
+        HostLog("field view=%d slot=%d %dx%d ch=%d engine=%s iter=%d bounded=%d esc=[%d,%d] ipc=%.3f off=%.3f cref=%.2f pal=%d/%d",
+                j.viewId, j.fieldSlot, req.width, req.height, fch,
+                onGpu ? "opencl" : "cpu", st.maxIterUsed, st.bounded,
+                st.escapeMin, st.escapeMax, st.iterPerCycle, req.offset,
+                (double)pal.cycleRef, pal.mode, pal.ns);
         /* MB_FIELD_DUMP=prefix writes the exact bytes the page will read, one
          * file per pass.  It is the deterministic A/B for MB_FIELD_COPY: a
          * screenshot can be occluded by another window, a field dump cannot. */
@@ -1688,7 +1955,31 @@ static void RenderThread() {
         }
       }
     } else {
-      g_engine->render(req, outPtr, st);
+      /* OpenCL path.  The kernel writes the same field the CPU would, the
+       * GL canvas shades it, and `outPtr` is never touched — the dispatcher
+       * skips its RGBA upload when `d.gpuField` is set.  Any tile the kernel
+       * declines (deep zoom, another formula, an orbit trap) falls through to
+       * the CPU engine, so a frame is never left half-painted. */
+      bool onGpu = false;
+      if (g_gpuField) {
+        // The engine owns the pixel scale; recomputing it here is what puts a
+        // frame one pixel off at depth.
+        const double ps = mbc::pixelScale(req);
+        if (req.pal) {
+          const double ipc = req.cycle > 0.0
+                                 ? req.cycle
+                                 : (req.pal->cycleRef > 0.0f ? (double)req.pal->cycleRef : 1.0);
+          gpur::setPalette(*req.pal, req.offset, ipc, req.colorMode,
+                           req.aa > 1 ? req.aa : 1);
+        }
+        onGpu = gpur::renderFieldTile(req, ps, st);
+        if (onGpu)
+          HostLog("gpu view=%d rect=%d,%d %dx%d kernel=%.1fms iter=%d bounded=%d esc=[%d,%d]",
+                  j.viewId, j.x, j.y, j.w, j.h, st.renderMs, st.maxIterUsed,
+                  st.bounded, st.escapeMin, st.escapeMax);
+      }
+      if (!onGpu) g_engine->render(req, outPtr, st);
+      gpuField = onGpu;
     }
     /* `st.renderMs` is measured inside the kernel; it cannot see the host's
      * field publication.  The wall time does, and is what an A/B of
@@ -1717,8 +2008,10 @@ static void RenderThread() {
     Done d;
     d.seq = j.seq; d.slot = slot; d.frame = useFrame; d.viewId = j.viewId;
     d.x = j.x; d.y = j.y; d.w = j.w; d.h = j.h;
+    d.gpuField = gpuField;
     d.bits = st.bits; d.refLen = st.refLen; d.glitches = st.glitches;
     d.maxIter = st.maxIterUsed;
+    d.cap = req.maxIter;
     d.escMin = st.escapeMin; d.escMax = st.escapeMax;
     d.bounded = st.bounded; d.directFixed = st.directFixed;
     d.iterPerCycle = st.iterPerCycle;
@@ -1799,12 +2092,12 @@ static void PublishDone() {
                "\"meta\":{\"engine\":\"NATIVE\",\"mode\":\"%s\","
                "\"ms\":%.2f,\"orbitMs\":%.2f,\"refLen\":%d,\"glitches\":%d,"
                "\"orbitReused\":%s,"
-               "\"iter\":%d,\"bits\":%d,\"perturb\":%s,\"threads\":%d,"
+               "\"iter\":%d,\"cap\":%d,\"bits\":%d,\"perturb\":%s,\"threads\":%d,"
                "\"escMin\":%d,\"escMax\":%d,\"bounded\":%d,\"directFixed\":%d}}",
                (unsigned long long)d.seq, d.viewId, d.w, d.h, d.fieldChannels,
                mode,
                d.renderMs, d.orbitMs, d.refLen, d.glitches, d.orbitReused ? "true" : "false",
-               d.maxIter, d.bits, d.perturb ? "true" : "false", d.threads,
+               d.maxIter, d.cap, d.bits, d.perturb ? "true" : "false", d.threads,
                d.escMin, d.escMax, d.bounded, d.directFixed);
       std::wstring wmeta(meta, meta + strlen(meta));
       HRESULT hr = E_FAIL;
@@ -1831,14 +2124,22 @@ static void PublishDone() {
       continue;
     }
     if (d.frame) {
-      if (g_nativeCanvas) {
+      if (g_nativeCanvas && !d.gpuField) {
         // Feed the finished tile straight into the staging texture; the
         // visible image only flips when the whole pass has landed.
+        // A GPU tile already wrote its own rectangle of the field texture,
+        // so uploading the (never written) CPU buffer would erase it.
         std::lock_guard<std::mutex> lk(g_frameMu);
         if (g_frame.ptr && g_frame.viewId == d.viewId && g_frame.w >= d.x + d.w &&
             g_frame.h >= d.y + d.h) {
-          nc::UploadTile(g_frame.ptr, g_frame.w, g_frame.h, d.x, d.y, d.w, d.h);
+          canvas::Upload(g_frame.ptr, g_frame.w, g_frame.h, d.x, d.y, d.w, d.h);
         }
+      }
+      if (g_glCanvas && d.frame) {
+        /* One present per landed tile: the field accumulates in the canvas
+         * texture, so the picture fills in progressively instead of waiting for
+         * the whole pass. */
+        canvas::Commit(false, 1.0, 0.0, 1.0, 0.0);
       }
       // Pixels already landed in the frame buffer; this is only the progress
       // notification, so it travels as a plain WebView2 message.
@@ -1848,12 +2149,12 @@ static void PublishDone() {
                "\"bw\":%d,\"bh\":%d,\"meta\":{\"engine\":\"NATIVE\",\"mode\":\"%s\","
                "\"ms\":%.2f,\"orbitMs\":%.2f,\"refLen\":%d,\"glitches\":%d,"
                "\"orbitReused\":%s,"
-               "\"iter\":%d,\"bits\":%d,\"dd\":%s,\"perturb\":%s,\"threads\":%d,"
+               "\"iter\":%d,\"cap\":%d,\"bits\":%d,\"dd\":%s,\"perturb\":%s,\"threads\":%d,"
                "\"escMin\":%d,\"escMax\":%d,\"bounded\":%d,\"directFixed\":%d,\"cyc\":%.3f,"
                "\"iterPx\":%lld,\"cvVerts\":%d,\"cvPx\":%d,\"cvHit\":%d}}",
                (unsigned long long)d.seq, d.viewId, d.x, d.y, d.w, d.h, mode,
                d.renderMs, d.orbitMs, d.refLen, d.glitches, d.orbitReused ? "true" : "false",
-               d.maxIter, d.bits, d.dd ? "true" : "false", d.perturb ? "true" : "false", d.threads,
+               d.maxIter, d.cap, d.bits, d.dd ? "true" : "false", d.perturb ? "true" : "false", d.threads,
                d.escMin, d.escMax, d.bounded, d.directFixed, d.iterPerCycle,
                d.iterPixels, d.canvasVerts, d.canvasFilled, d.canvasCacheHit);
       PostJson(meta);
@@ -1865,12 +2166,12 @@ static void PublishDone() {
              "\"bw\":%d,\"bh\":%d,\"meta\":{\"engine\":\"NATIVE\",\"mode\":\"%s\","
              "\"ms\":%.2f,\"orbitMs\":%.2f,\"refLen\":%d,\"glitches\":%d,"
                "\"orbitReused\":%s,"
-             "\"iter\":%d,\"bits\":%d,\"dd\":%s,\"perturb\":%s,\"threads\":%d,"
+             "\"iter\":%d,\"cap\":%d,\"bits\":%d,\"dd\":%s,\"perturb\":%s,\"threads\":%d,"
              "\"escMin\":%d,\"escMax\":%d,\"bounded\":%d,\"directFixed\":%d,\"cyc\":%.3f,"
              "\"iterPx\":%lld,\"cvVerts\":%d,\"cvPx\":%d,\"cvHit\":%d}}",
              (unsigned long long)d.seq, d.viewId, d.x, d.y, d.w, d.h, mode,
              d.renderMs, d.orbitMs, d.refLen, d.glitches, d.orbitReused ? "true" : "false",
-             d.maxIter, d.bits, d.dd ? "true" : "false", d.perturb ? "true" : "false", d.threads,
+             d.maxIter, d.cap, d.bits, d.dd ? "true" : "false", d.perturb ? "true" : "false", d.threads,
              d.escMin, d.escMax, d.bounded, d.directFixed, d.iterPerCycle,
              d.iterPixels, d.canvasVerts, d.canvasFilled, d.canvasCacheHit);
     std::wstring wmeta(meta, meta + strlen(meta));
@@ -2057,7 +2358,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ResizeWebView();
         // Canvas follows the frame exactly.  The swapchain is resized and the
         // last pass is stretched into it: no re-render is triggered here.
-        if (g_nativeCanvas) nc::SetBounds(0, 0, w, h);
+        if (g_nativeCanvas) canvas::SetBounds(0, 0, w, h);
       }
       if (w == 0 || h == 0) { if (g_engine) g_engine->setPaused(true); }
       else if (g_engine) g_engine->setPaused(false);
@@ -2071,7 +2372,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       {
         RECT rc;
         GetClientRect(hwnd, &rc);
-        if (g_nativeCanvas) nc::SetBounds(0, 0, rc.right, rc.bottom);
+        if (g_nativeCanvas) canvas::SetBounds(0, 0, rc.right, rc.bottom);
         LogMsg("[dpi] " + std::to_string((int)LOWORD(wp)) + " client=" +
                std::to_string(rc.right) + "x" + std::to_string(rc.bottom));
       }
@@ -2081,9 +2382,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (wp >= 0x61 && wp <= 0x67) {
         KillTimer(hwnd, wp);
         if (wp == 0x61) {
-          LogMsg("[selftest] native frames=" + std::to_string(nc::FrameCount()) +
-                 " upload=" + std::to_string(nc::LastUploadMs()) +
-                 "ms present=" + std::to_string(nc::LastPresentMs()) + "ms");
+          LogMsg("[selftest] native frames=" + std::to_string(canvas::Frames()) +
+                 " upload=" + std::to_string(canvas::UploadMs()) +
+                 "ms present=" + std::to_string(canvas::PresentMs()) + "ms");
           PostJson("{\"type\":\"selftest\"}");
           if (std::getenv("MB_SELFTEST_EXPORT")) ExportPngNative();
           SetTimer(hwnd, 0x62, 2600, nullptr);
@@ -2098,27 +2399,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           RECT rc{};
           GetWindowRect(hwnd, &rc);
           g_selftestRect = rc;
-          LogMsg("[selftest] resize-start frames=" + std::to_string(nc::FrameCount()));
+          LogMsg("[selftest] resize-start frames=" + std::to_string(canvas::Frames()));
           SetWindowPos(hwnd, nullptr, 0, 0, rc.right - rc.left + 160, rc.bottom - rc.top + 100,
                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
           SetTimer(hwnd, 0x63, 600, nullptr);
         } else if (wp == 0x63) {
-          LogMsg("[selftest] resize-done frames=" + std::to_string(nc::FrameCount()) +
+          LogMsg("[selftest] resize-done frames=" + std::to_string(canvas::Frames()) +
                  " (must equal resize-start: no re-render)");
           SetWindowPos(hwnd, nullptr, 0, 0, g_selftestRect.right - g_selftestRect.left,
                        g_selftestRect.bottom - g_selftestRect.top,
                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
           SetTimer(hwnd, 0x64, 1600, nullptr);
         } else if (wp == 0x64) {
-          LogMsg("[selftest] maximize frames=" + std::to_string(nc::FrameCount()));
+          LogMsg("[selftest] maximize frames=" + std::to_string(canvas::Frames()));
           ShowWindow(hwnd, SW_MAXIMIZE);
           SetTimer(hwnd, 0x65, 1600, nullptr);
         } else if (wp == 0x65) {
-          LogMsg("[selftest] restore frames=" + std::to_string(nc::FrameCount()));
+          LogMsg("[selftest] restore frames=" + std::to_string(canvas::Frames()));
           ShowWindow(hwnd, SW_RESTORE);
           SetTimer(hwnd, 0x66, 1400, nullptr);
         } else {
-          LogMsg("[selftest] final frames=" + std::to_string(nc::FrameCount()));
+          LogMsg("[selftest] final frames=" + std::to_string(canvas::Frames()));
           if (std::getenv("MB_SELFTEST_EXIT")) PostMessageW(hwnd, WM_CLOSE, 0, 0);
         }
         return 0;
@@ -2163,7 +2464,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY:
-      nc::Shutdown();
+      if (g_glCanvas) gpur::shutdown(); else nc::Shutdown();
       PostQuitMessage(0);
       return 0;
   }
@@ -2278,8 +2579,8 @@ class CtlHandler : public Cb<ICoreWebView2CreateCoreWebView2ControllerCompletedH
     ResizeWebView();
     // Newly created children appear above the canvas; keep the D3D surface
     // at the bottom of the z-order so the transparent web layer sits on top.
-    if (g_nativeCanvas && nc::Hwnd())
-      SetWindowPos(nc::Hwnd(), HWND_BOTTOM, 0, 0, 0, 0,
+    if (g_nativeCanvas && canvas::Hwnd())
+      SetWindowPos(canvas::Hwnd(), HWND_BOTTOM, 0, 0, 0, 0,
                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     g_ctl->put_IsVisible(TRUE);
     {
@@ -2410,25 +2711,46 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
   ShowWindow(g_hwnd, maxed ? SW_SHOWMAXIMIZED : SW_SHOW);
   UpdateWindow(g_hwnd);
 
-  // Route 1: native child window + swapchain under the transparent WebView2.
-  // Set MB_NATIVE_DISABLE=1 (or any D3D failure) to exercise the old JS path.
-  /* The D3D under-canvas is opt-in (MB_NATIVE=1) for now: it depends on the
-   * page being transparent, and any present failure shows as a black frame.
-   * The page canvas is the dependable surface — it is what the web build uses
-   * and it always receives the composed frame. */
-  if (std::getenv("MB_NATIVE") && std::atoi(std::getenv("MB_NATIVE")) != 0) {
+  // Route 1: a native child window under the transparent WebView2 carries the
+  // picture.  The OpenGL canvas is the product path; the D3D11 bitblt canvas
+  // remains as a fallback, and MB_GL=0 / MB_CL=0 pin either half off for A/B.
+  {
     RECT rc{};
     GetClientRect(g_hwnd, &rc);
-    g_nativeCanvas = nc::Init(g_hwnd);
-    if (g_nativeCanvas) {
-      nc::SetBounds(0, 0, rc.right, rc.bottom);
-      LogMsg("[native] canvas ready " + std::to_string(rc.right) + "x" +
-             std::to_string(rc.bottom));
+    /* Opt-in until the colour stage is signed off.  The canvas, the OpenCL
+     * field and the present path are all working (86 frames, 0.17 ms present,
+     * resize-stable), but the shaded result is not yet the picture the CPU
+     * paints — see .workbuddy/memory for the exact state.  MB_GL=1 turns it on
+     * so it can be A/B'd without rebuilding; the shipping default stays on the
+     * page's own surface. */
+    const char* glEnv = std::getenv("MB_GL");
+    const bool wantGL = glEnv && std::atoi(glEnv) != 0;
+    if (wantGL && gpur::init(g_hwnd)) {
+      g_glCanvas = true;
+      g_nativeCanvas = true;
+      canvas::SetBounds(0, 0, rc.right, rc.bottom);
+      const gpur::Info& gi = gpur::info();
+      LogMsg("[gl] canvas ready GL=" + gi.glRenderer + " (" + gi.glVersion + ")");
+      if (gi.cl) {
+        const char* clEnv = std::getenv("MB_CL");
+        g_gpuField = !clEnv || std::atoi(clEnv) != 0;
+        LogMsg("[cl] device " + gi.clDevice + " " + gi.clVersion +
+               (g_gpuField ? " -> field on GPU" : " -> field disabled"));
+      } else {
+        LogMsg("[cl] unavailable: " + gi.why + " -> field on CPU");
+      }
+    } else if (std::getenv("MB_NATIVE") && std::atoi(std::getenv("MB_NATIVE")) != 0) {
+      g_nativeCanvas = nc::Init(g_hwnd);
+      if (g_nativeCanvas) {
+        canvas::SetBounds(0, 0, rc.right, rc.bottom);
+        LogMsg("[native] D3D canvas ready " + std::to_string(rc.right) + "x" +
+               std::to_string(rc.bottom));
+      } else {
+        LogMsg("[native] init failed -> JS canvas fallback");
+      }
     } else {
-      LogMsg("[native] init failed -> JS canvas fallback");
+      LogMsg("[gl] unavailable: " + gpur::info().why + " -> JS canvas");
     }
-  } else {
-    LogMsg("[native] disabled by MB_NATIVE_DISABLE -> JS canvas");
   }
 
   // Regression hook: MB_FS_SELFTEST=1 toggles fullscreen twice 1.2 s after

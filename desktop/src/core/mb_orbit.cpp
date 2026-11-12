@@ -18,9 +18,11 @@ namespace detail {
 
 /* --- reference orbit ------------------------------------------------ */
 
-/* GMP mpf 链版本的参考轨道（原版 computergroup + iter 链，004f8d20）。
- * 只覆盖经典曼德博（kind 0 / power 2 / 非 Julia）；其它族返回 -1 让调用方
- * 回退到 Big 定点路径。返回 -1 表示"没接管"，>=0 是轨道长度。 */
+/* The GMP mpf-chain reference orbit (the original's computergroup + iter
+ * chain, 004f8d20).  Covers classic Mandelbrot only (kind 0 / power 2 /
+ * non-Julia); other families return -1 so the caller falls back to the Big
+ * fixed-point path.  Returns -1 when it does not take over, otherwise the
+ * orbit length (>= 0). */
 static int buildReferenceMpf(const Request& q, int bits, int maxIter,
                              double dRe, double dIm, Ref* out,
                              const std::atomic<uint64_t>* gen,
@@ -39,7 +41,8 @@ static int buildReferenceMpf(const Request& q, int bits, int maxIter,
     Mpf::add(g.slot(5), g.slot(5), d);
   }
   g.setConstantSlots(4, 5);
-  /* 顺序同伪代码：先平方，再用**旧** x,y 算 ny，最后写 nx。 */
+  /* Same order as the pseudocode: square first, then compute ny from the
+   * **old** x,y, and write nx last. */
   g.add(COp::Sqr, 2, 0, 0);
   g.add(COp::Sqr, 3, 1, 1);
   g.add(COp::ImagIter2, 1, 0, 1);
@@ -77,7 +80,7 @@ static int buildReferenceMpf(const Request& q, int bits, int maxIter,
   return n;
 }
 
-/* MB_ORBITMPF=0 关掉新路径；默认接管经典曼德博。 */
+/* MB_ORBITMPF=0 disables the new path; classic Mandelbrot uses it by default. */
 bool orbitMpfEnabled() {
   static const bool on = [] {
     const char* s = std::getenv("MB_ORBITMPF");
@@ -99,6 +102,11 @@ int buildReference(const Request& q, int bits, int maxIter,
   if (orbitCancelled(gen, myGen)) return kOrbitCancelled;
   const bool julia = q.spec.mode == 1;
   Big cr(bits), ci(bits), zr(bits), zi(bits);
+  /* Phoenix keeps one step of memory.  z_{-1} = 0, so the first step is the
+   * ordinary z^2 + c; after that prev follows the orbit. */
+  Big prevR(bits), prevI(bits);
+  Big* const prevP = q.spec.kind == 5 ? &prevR : nullptr;
+  Big* const prevQ = q.spec.kind == 5 ? &prevI : nullptr;
 
   if (julia) {
     const std::string js = q.spec.juliaReS.empty()
@@ -134,6 +142,12 @@ int buildReference(const Request& q, int bits, int maxIter,
     out->z0i = zi.toDouble();
   }
   int n = 0;
+  static const bool dbgRef = std::getenv("MB_DEBUGREF") != nullptr;
+  if (dbgRef) {
+    std::fprintf(stderr, "[ref] kind=%d p=%d c=(%s,%s) d=(%.3g,%.3g) bits=%d\n",
+                 q.spec.kind, q.spec.power, q.centerRe.c_str(),
+                 q.centerIm.c_str(), dRe, dIm, bits);
+  }
   for (; n < maxIter; ++n) {
     if ((n & (kOrbitCancelCheckInterval - 1)) == 0 &&
         orbitCancelled(gen, myGen)) {
@@ -144,15 +158,21 @@ int buildReference(const Request& q, int bits, int maxIter,
       out->re[(size_t)n] = zr.toDouble();
       out->im[(size_t)n] = zi.toDouble();
     }
+    if (dbgRef && (n % 16 == 0 || n < 4)) {
+      std::fprintf(stderr, "[ref] n=%d z=(%.17g,%.17g) exp=(%d,%d)\n", n,
+                   zr.toDouble(), zi.toDouble(), expOf(zr), expOf(zi));
+    }
     /* |z| > 2^16 is decided on the exponents alone, so the test is free and
      * never rounds.  Past this point the orbit carries no information a
      * perturbation pixel can use. */
     if (expOf(zr) > kEscapeExp || expOf(zi) > kEscapeExp) {
       if (out) out->escaped = true;
+      if (dbgRef) std::fprintf(stderr, "[ref] escaped at n=%d\n", n);
       ++n;
       break;
     }
-    famStepBig(q.spec.kind, q.spec.power, zr, zi, cr, ci);
+    famStepBig(q.spec.kind, q.spec.power, zr, zi, cr, ci,
+               q.spec.phoenixP, prevP, prevQ);
   }
   if (out) out->len = n;
   return n;
@@ -182,72 +202,22 @@ void buildFolds(Ref& R, int kind) {
   }
 }
 
-/* ---- normalised complex arithmetic ----------------------------------
- *
- * A_n = prod(2 Z_k) grows exponentially, B_n ~ A_n^2 and C_n ~ A_n^3.  On a
- * long reference orbit they leave the double range after ~1000 steps, which
- * is exactly where the old buildSeries had to stop and where a deep frame
- * most needs the series to keep going.  RFF-2.0 solves this with `dex` /
- * `try_normalized_value()`: a mantissa plus a binary exponent, renormalised
- * after every operation.  We do the same, but only renormalise once the
- * mantissa leaves [1e-120, 1e120] — while the numbers are ordinary doubles
- * the arithmetic below is the original one, bit for bit.
- */
-struct SC {
-  double r = 0.0, i = 0.0;
-  int e = 0;
-};
-constexpr double kScHi = 1e120, kScLo = 1e-120;
+/* The normalised complex pair (SC, scNorm, scMulC, ...) lives in
+ * mb_internal.h now: the pixel kernels need the same primitive for the scaled
+ * pixel offset, and one definition keeps the two uses identical. */
 
-inline void scNorm(SC& a) {
-  const double m = std::max(std::fabs(a.r), std::fabs(a.i));
-  if (!(m > 0.0)) { a.e = 0; return; }
-  if (m >= kScLo && m <= kScHi) return;
-  int k = 0;
-  std::frexp(m, &k);
-  const double s = std::ldexp(1.0, -k);   // a power of two: exact
-  a.r *= s;
-  a.i *= s;
-  a.e += k;
-}
-inline SC scMulC(const SC& a, double jr, double ji) {
-  SC c{a.r * jr - a.i * ji, a.r * ji + a.i * jr, a.e};
-  scNorm(c);
-  return c;
-}
-inline SC scMul(const SC& a, const SC& b) {
-  SC c{a.r * b.r - a.i * b.i, a.r * b.i + a.i * b.r, a.e + b.e};
-  scNorm(c);
-  return c;
-}
-inline void scFold(SC& a, double fr, double fi) { a.r *= fr; a.i *= fi; }
-inline SC scReal(double v) { SC a{v, 0.0, 0}; scNorm(a); return a; }
-inline SC scAdd(const SC& a, const SC& b) {
-  if (a.r == 0.0 && a.i == 0.0) return b;
-  if (b.r == 0.0 && b.i == 0.0) return a;
-  const int e = std::max(a.e, b.e);
-  SC c{std::ldexp(a.r, a.e - e) + std::ldexp(b.r, b.e - e),
-       std::ldexp(a.i, a.e - e) + std::ldexp(b.i, b.e - e), e};
-  scNorm(c);
-  return c;
-}
-/** log |a|, or a very negative sentinel for an exactly-zero coefficient. */
-inline double scLogAbs(const SC& a) {
-  const double m = std::hypot(a.r, a.i);
-  return m > 0.0 ? std::log(m) + (double)a.e * kLn2 : -1e300;
-}
-
-/* Taylor series of the deviation.  `dcMax` is the largest |dc| in the frame;
- * the skip length is the last n whose quadratic and cubic terms are still
- * negligible there — the same criterion KF uses (relative error 1e-3).
+/* Taylor series of the deviation.  `dcMaxLog2` is log2 of the largest |dc| in
+ * the frame; the skip length is the last n whose quadratic and cubic terms are
+ * still negligible there — the same criterion KF uses (relative error 1e-3).
  *
- * The tolerance test is now done in the log domain.  In the linear domain
+ * The tolerance test is done in the log domain.  In the linear domain
  * `bmag * dcMax` and `cmag * dcMax*dcMax` both underflow at deep zoom (dc^2
  * is 1e-600), so the cubic term was silently declared harmless forever; and
  * amag itself overflowed at 1e308.  Logs keep both comparisons meaningful
- * across the entire orbit. */
+ * across the entire orbit.  The caller passes log2 rather than the value for
+ * the same reason: at 1e6000 the value itself is zero in a double. */
 
-void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
+void buildSeries(Ref& R, double dcMaxLog2, bool mandelbrot, int power, int kind) {
   const size_t n = (size_t)std::max(1, R.len);
   R.ar.assign(n, 0.0);
   R.ai.assign(n, 0.0);
@@ -259,15 +229,21 @@ void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
   R.bExp.assign(n, 0);
   R.cExp.assign(n, 0);
   R.dcth.assign(n, 0.0);
+  R.dcthLog.assign(n, 0.0);
   R.skip = 0;
   R.derSkip = 0;
-  /* A folded family is only polynomial inside one sign cell.  Tricorn's flip
-   * is the same at every step (a constant conjugation), so its series is
-   * exact; burning ship and celtic flip somewhere along the orbit and the
-   * series would then describe a different map, so they start at n = 0 and
-   * rely on the native kernel alone. */
+  /* The folded families can use the series too: its coefficients are built
+   * through the *reference's* own fold pattern, and a pixel this close to the
+   * anchor sits in that same sign cell until |d| has grown to the point where
+   * the series stops anyway (the kernel then follows the pixel's own fold).
+   * Perpendicular (kind 4) is holomorphic in z with the constant conjugated,
+   * so its series is exact when evaluated at conj(dc).
+   *
+   * Phoenix has a one-step memory term; its series needs a companion prev
+   * coefficient, which is not implemented, so it starts at n = 0 and lets the
+   * native kernel do the work. */
   if (R.len < 2) return;
-  if (kind != 0 && kind != 1) return;
+  if (kind == 5) return;
   static const bool noSeries = std::getenv("MB_NOSERIES") != nullptr;
 
   /* d z_n / d c is 0 at n = 0 for the Mandelbrot set (z_0 is a constant),
@@ -285,7 +261,7 @@ void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
   store(0);
 
   const double logTol = std::log(kSkipTol());
-  const double logDc = dcMax > 0.0 ? std::log(dcMax) : -745.0;
+  const double logDc = dcMaxLog2 * kLn2;   // dcMax = 2^dcMaxLog2, always finite
   const double logThMax = std::log(1e300);
   int skip = 0, derSkip = 0;
   for (int k = 0; k + 1 < R.len; ++k) {
@@ -346,6 +322,11 @@ void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
     if (!(th > 0.0) || th > 1e300) th = 1e300;
     if (k > 0 && R.dcth[(size_t)k] < th) th = R.dcth[(size_t)k];
     R.dcth[(size_t)k + 1] = th;
+    /* The same threshold in the log domain, clamped monotonically to match:
+     * dcth[] never increases with k, so neither may dcthLog[]. */
+    double thLog = std::min(logTh, logThMax);
+    if (k > 0 && R.dcthLog[(size_t)k] < thLog) thLog = R.dcthLog[(size_t)k];
+    R.dcthLog[(size_t)k + 1] = thLog;
 
     /* The derivative recurrence is seeded with A_sk itself, with no exponent
      * companion; remember where that still fits in a double. */
@@ -428,6 +409,7 @@ Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g,
           if (len == kOrbitCancelled) return Pick{};
         } else {
           double zr, zi, cr, ci;
+          double prevR = 0.0, prevI = 0.0;
           if (g.julia) {                // seed orbit: z_0 is the pixel, c fixed
             zr = cRe + dRe;
             zi = cIm + dIm;
@@ -448,7 +430,8 @@ Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g,
               len = n;
               break;
             }
-            famStepD(g.kind, g.power, zr, zi, cr, ci);
+            famStepD(g.kind, g.power, zr, zi, cr, ci, q.spec.phoenixP,
+                     &prevR, &prevI);
           }
           if (len < 0) len = rc;
         }
