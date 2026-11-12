@@ -1248,9 +1248,13 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
       }
     }
     if (!reused) {
-      const Pick pick = pickReference(q, bits, maxIter, g);
+      const Pick pick = pickReference(q, bits, maxIter, g, &gen, myGen);
+      /* An invalid pick means cancel() landed while the orbit search was
+       * running; the rest of this frame belongs to a view nobody wants. */
+      if (!pick.valid) return;
       Ref primary;
-      buildReference(q, bits, maxIter, pick.dRe, pick.dIm, &primary);
+      if (buildReference(q, bits, maxIter, pick.dRe, pick.dIm, &primary,
+                         &gen, myGen) == kOrbitCancelled) return;
       refs.clear();
       refs.push_back(std::move(primary));
       refOffRe = pick.dRe;
@@ -2098,7 +2102,9 @@ void Engine::Impl::render(const Request& q, uint8_t* out, Stats& st,
       Ref extra;
       double dRe, dIm;
       screenDelta(g, (double)(q.tileX + cx), (double)(q.tileY + cy), dRe, dIm);
-      const int elen = buildReference(q, bits, maxIter, dRe, dIm, &extra);
+      const int elen = buildReference(q, bits, maxIter, dRe, dIm, &extra,
+                                     &gen, myGen);
+      if (elen == kOrbitCancelled) return;
       if (elen <= 0) continue;
       extra.dRe = dRe;
       extra.dIm = dIm;

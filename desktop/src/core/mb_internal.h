@@ -92,8 +92,18 @@ struct Prof {
  * instead of at 0, which is where most of the deep-zoom speed comes from. */
 struct Ref {
   std::vector<double> re, im;             // Z_n
+  /* Series coefficients in *normalised* form: the stored pair is a mantissa
+   * whose largest component lies in [0.5,1); the value is (r,i) * 2^exp.
+   *
+   * A_n = prod(2 Z_k) grows like 2^n, so on a long orbit the bare doubles
+   * overflowed at n ~= 1000 and buildSeries had to stop there — the deep
+   * frames that need the skip most were the ones that could not have it.
+   * This is the same trick RFF-2.0's `dex`/`try_normalized_value` uses; the
+   * scaling is by a power of two, so it is bit-exact and a shallow frame
+   * renders identically. */
   std::vector<double> ar, ai, br, bi;     // series coefficients (order 1, 2)
   std::vector<double> cr, ci;             // order 3
+  std::vector<int> aExp, bExp, cExp;      // binary exponents of the above
   /* Per-iteration Taylor data of the family map,
    *     d_{n+1} = F_n ( J_n d_n + H_n d_n^2 ) + dc
    * F_n is a diagonal sign flip: identity, conjugate, |Re| or |Im| fold.
@@ -109,14 +119,60 @@ struct Ref {
    * the skipped iterations would describe a different formula. */
   std::vector<int8_t> fR, fI;
   /* Skip length that is still valid at a given |dc|: the series may start
-   * later for points near the anchor, so every pixel gets its own start. */
-  std::vector<float> dcth;
+   * later for points near the anchor, so every pixel gets its own start.
+   * Stored as double because a threshold of 1e300 used to overflow float
+   * (max 3.4e38) into +inf; float also quantised every threshold to 1e-7. */
+  std::vector<double> dcth;
   int len = 0;
   int skip = 0;
+  /* Last index at which |A_n| itself still fits in a double.  A distance-
+   * estimate frame seeds its derivative recurrence with A_sk, which has no
+   * exponent companion in the pixel kernel, so those frames clamp the skip
+   * here rather than seed the recurrence with infinity. */
+  int derSkip = 0;
   bool escaped = false;
   double z0r = 0.0, z0i = 0.0;            // Z_0 (0 for Mandelbrot, seed for Julia)
   double dRe = 0.0, dIm = 0.0;            // plane offset from the view centre
 };
+
+/* Evaluate the truncated Taylor series at the start index:
+ *     d_sk = A_sk dc + B_sk dc^2 + C_sk dc^3.
+ *
+ * While every exponent is zero the coefficients are ordinary doubles and the
+ * expression below is written in exactly the old order, so a shallow frame is
+ * bit-identical.  Once A has overflowed (which is the whole point of the
+ * normalised coefficients) the three terms are aligned on A's exponent before
+ * they are added: |B|dc^2 <= tol|A|dc and |C|dc^3 <= tol|A|dc are precisely
+ * the conditions buildSeries enforced, so the aligned terms cannot overflow. */
+inline void seriesDeviation(const Ref& R, int sk, double dcr, double dci,
+                            double& dr, double& di) {
+  const size_t i = (size_t)sk;
+  const int ae = R.aExp[i], be = R.bExp[i], ce = R.cExp[i];
+  const double qr = dcr * dcr - dci * dci;
+  const double qi = 2.0 * dcr * dci;
+  if (ae == 0 && be == 0 && ce == 0) {
+    const double lr = R.ar[i] * dcr - R.ai[i] * dci;
+    const double li = R.ar[i] * dci + R.ai[i] * dcr;
+    dr = lr + R.br[i] * qr - R.bi[i] * qi;
+    di = li + R.br[i] * qi + R.bi[i] * qr;
+    const double kr = R.cr[i] * qr - R.ci[i] * qi;
+    const double ki = R.cr[i] * qi + R.ci[i] * qr;
+    dr += kr * dcr - ki * dci;
+    di += kr * dci + ki * dcr;
+    return;
+  }
+  const double lar = R.ar[i] * dcr - R.ai[i] * dci;
+  const double lai = R.ar[i] * dci + R.ai[i] * dcr;
+  const double lbr = R.br[i] * qr - R.bi[i] * qi;
+  const double lbi = R.br[i] * qi + R.bi[i] * qr;
+  const double m3r = R.cr[i] * qr - R.ci[i] * qi;
+  const double m3i = R.cr[i] * qi + R.ci[i] * qr;
+  const double lcr = m3r * dcr - m3i * dci;
+  const double lci = m3r * dci + m3i * dcr;
+  const int dB = be - ae, dC = ce - ae;
+  dr = std::ldexp(lar + std::ldexp(lbr, dB) + std::ldexp(lcr, dC), ae);
+  di = std::ldexp(lai + std::ldexp(lbi, dB) + std::ldexp(lci, dC), ae);
+}
 
 /* Mip chain of a palette table.  Level 0 is the exact table; level k is the
  * box average of 2^k neighbouring entries.  Sampling level k is how the
@@ -461,12 +517,27 @@ struct BigSeed {
 
 
 /* ---- orbit (mb_orbit.cpp) ------------------------------------------- */
+/* RFF-2.0 checks `state.interruptRequested()` every 1024 reference steps
+ * (HOTPATH_INTERRUPT_CHECK_INTERVAL).  We do the same with the engine's
+ * generation counter: cancel() used to interrupt only the pixel passes, so
+ * a zoom during a long high-precision orbit stayed frozen until that orbit
+ * finished — minutes at 4096 bits.  A cancelled build returns -2. */
+inline bool orbitCancelled(const std::atomic<uint64_t>* gen, uint64_t myGen) {
+  return gen && gen->load(std::memory_order_relaxed) != myGen;
+}
+constexpr int kOrbitCancelCheckInterval = 1024;
+constexpr int kOrbitCancelled = -2;
+
 int buildReference(const Request& q, int bits, int maxIter, double dRe,
-                   double dIm, Ref* out);
+                   double dIm, Ref* out,
+                   const std::atomic<uint64_t>* gen = nullptr,
+                   uint64_t myGen = 0);
 void buildFolds(Ref& R, int kind);
 void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind);
 void buildDevTable(Ref& R, int power);
-Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g);
+Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g,
+                   const std::atomic<uint64_t>* gen = nullptr,
+                   uint64_t myGen = 0);
 
 /* ---- kernels (mb_kernels.cpp) --------------------------------------- */
 /* Optional escape-point probe.

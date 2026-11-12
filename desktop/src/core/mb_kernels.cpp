@@ -57,6 +57,13 @@ int perturbPixel(const Ctx& g, double fx, double fy, int refIdx,
     sk = lo;
   }
 
+  const bool walkDer =
+      (g.wantDist && !g.skipDeriv) || (probe != nullptr && !g.zOnly);
+  /* The derivative recurrence is seeded with A_sk as a plain double.  Past
+   * derSkip the coefficient only exists as (mantissa, exponent), so a frame
+   * that needs |z'| starts earlier instead of seeding with infinity. */
+  if (walkDer && sk > R.derSkip) sk = R.derSkip;
+
   double dr, di;
   int ridx;
   if (g.julia) {
@@ -64,17 +71,7 @@ int perturbPixel(const Ctx& g, double fx, double fy, int refIdx,
     di = dci;
     ridx = 0;
   } else if (sk > 0) {
-    const double qr = dcr * dcr - dci * dci;
-    const double qi = 2.0 * dcr * dci;
-    const double lr = R.ar[(size_t)sk] * dcr - R.ai[(size_t)sk] * dci;
-    const double li = R.ar[(size_t)sk] * dci + R.ai[(size_t)sk] * dcr;
-    dr = lr + R.br[(size_t)sk] * qr - R.bi[(size_t)sk] * qi;
-    di = li + R.br[(size_t)sk] * qi + R.bi[(size_t)sk] * qr;
-    /* + C dc^3 */
-    const double kr = R.cr[(size_t)sk] * qr - R.ci[(size_t)sk] * qi;
-    const double ki = R.cr[(size_t)sk] * qi + R.ci[(size_t)sk] * qr;
-    dr += kr * dcr - ki * dci;
-    di += kr * dci + ki * dcr;
+    seriesDeviation(R, sk, dcr, dci, dr, di);
     ridx = sk;
   } else {
     dr = 0.0;
@@ -104,8 +101,6 @@ int perturbPixel(const Ctx& g, double fx, double fy, int refIdx,
    * After the series approximation the deviation already carries its linear
    * term A_sk, and A_n is identically dZ_n/dc, so D starts there. */
   double derR = 0.0, derI = 0.0;
-  const bool walkDer =
-      (g.wantDist && !g.skipDeriv) || (probe != nullptr && !g.zOnly);
   if (walkDer) {
     if (g.julia) derR = 1.0;
     else if (sk > 0) { derR = R.ar[(size_t)sk]; derI = R.ai[(size_t)sk]; }
@@ -301,19 +296,9 @@ int perturbFam(const Ctx& g, double fx, double fy, int refIdx,
     dr = dcr;
     di = dci;
   } else if (sk > 0) {
-    const double qr = dcr * dcr - dci * dci;
-    const double qi = 2.0 * dcr * dci;
-    const double lr = R.ar[(size_t)sk] * dcr - R.ai[(size_t)sk] * dci;
-    const double li = R.ar[(size_t)sk] * dci + R.ai[(size_t)sk] * dcr;
-    dr = lr + R.br[(size_t)sk] * qr - R.bi[(size_t)sk] * qi;
-    di = li + R.br[(size_t)sk] * qi + R.bi[(size_t)sk] * qr;
-    /* Third-order term of the series, C_s dc^3.  It used to be missing here,
-     * which is why a p > 2 frame could start at the skip index carrying only
-     * two of its three terms and drift from the first pixel onwards. */
-    const double kr = R.cr[(size_t)sk] * qr - R.ci[(size_t)sk] * qi;
-    const double ki = R.cr[(size_t)sk] * qi + R.ci[(size_t)sk] * qr;
-    dr += kr * dcr - ki * dci;
-    di += kr * dci + ki * dcr;
+    /* Includes the third-order term: a p > 2 frame that started here with
+     * only two of its terms used to drift from the first pixel onwards. */
+    seriesDeviation(R, sk, dcr, dci, dr, di);
     ridx = sk;
   } else {
     dr = 0.0;
@@ -616,19 +601,7 @@ long long perturbQuad(const Ctx& g, const Ref& R, const double* fxs, double fy,
       diA[k] = dci;
       ridxA[k] = 0;
     } else if (sk > 0) {
-      const double ar = R.ar[(size_t)sk], ai = R.ai[(size_t)sk];
-      const double br = R.br[(size_t)sk], bi = R.bi[(size_t)sk];
-      const double cr = R.cr[(size_t)sk], ci = R.ci[(size_t)sk];
-      const double qr = dcr * dcr - dci * dci;
-      const double qi = 2.0 * dcr * dci;
-      const double lr = ar * dcr - ai * dci;
-      const double li = ar * dci + ai * dcr;
-      drA[k] = lr + br * qr - bi * qi;
-      diA[k] = li + br * qi + bi * qr;
-      const double kr = cr * qr - ci * qi;
-      const double ki = cr * qi + ci * qr;
-      drA[k] += kr * dcr - ki * dci;
-      diA[k] += kr * dci + ki * dcr;
+      seriesDeviation(R, sk, dcr, dci, drA[k], diA[k]);
       ridxA[k] = sk;
     } else {
       drA[k] = 0.0;

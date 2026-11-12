@@ -2,6 +2,7 @@
 node_modules/
 .workbuddy/
 *.log
+desktop/src/bin/
 
 # Dev-only captures produced by the tools/ harness
 tools/*.png

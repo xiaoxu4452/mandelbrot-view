@@ -252,6 +252,14 @@ let sceneDrawAt = 0;
 /** True when the current view is one the fragment shader can draw exactly. */
 function sceneView() {
   if (!scene.ok || !state.gpu) return null;
+  /* The desktop host has its own C++ field renderer and a native D3D/GL
+   * surface.  The page's fragment shader is a web-only shortcut: it iterates
+   * in 24-bit float, so on the desktop it would replace a 192-bit core frame
+   * with a coarse one; worse, when it declines a deep view it toggles the
+   * `gl-surface` layer and hides the field that the host just uploaded.
+   * `state.gpu` stays on here because the desktop field shader (gpuPass) uses
+   * it — only the "iterate in the fragment shader" path is web-only. */
+  if (NATIVE) return null;
   if (nativeCanvasMode()) return null;
   const spec = state.spec;
   /* Only the polynomial families live in the shader; formulas, Newton sets

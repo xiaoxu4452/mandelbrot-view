@@ -21,8 +21,10 @@ namespace detail {
 /* GMP mpf 链版本的参考轨道（原版 computergroup + iter 链，004f8d20）。
  * 只覆盖经典曼德博（kind 0 / power 2 / 非 Julia）；其它族返回 -1 让调用方
  * 回退到 Big 定点路径。返回 -1 表示"没接管"，>=0 是轨道长度。 */
-int buildReferenceMpf(const Request& q, int bits, int maxIter, double dRe,
-                      double dIm, Ref* out) {
+static int buildReferenceMpf(const Request& q, int bits, int maxIter,
+                             double dRe, double dIm, Ref* out,
+                             const std::atomic<uint64_t>* gen,
+                             uint64_t myGen) {
   if (q.spec.mode == 1 || q.spec.kind != 0 || q.spec.power != 2) return -1;
   const int prec = bits + 32;
   ComputerGroup g;
@@ -52,6 +54,14 @@ int buildReferenceMpf(const Request& q, int bits, int maxIter, double dRe,
   }
   int n = 0;
   for (; n < maxIter; ++n) {
+    /* RFF-2.0's HOTPATH_INTERRUPT_CHECK_INTERVAL.  A 16384-bit orbit can
+     * take minutes; without this the render thread ignores cancel() until
+     * the whole orbit is done, which is the freeze at deep zoom. */
+    if ((n & (kOrbitCancelCheckInterval - 1)) == 0 &&
+        orbitCancelled(gen, myGen)) {
+      if (out) out->len = n;
+      return kOrbitCancelled;
+    }
     if (out) {
       out->re[(size_t)n] = g.slot(0).toDouble();
       out->im[(size_t)n] = g.slot(1).toDouble();
@@ -80,11 +90,13 @@ bool orbitMpfEnabled() {
  * `out` = nullptr only asks for the length, which is what the reference
  * search uses.  Returns the orbit length. */
 int buildReference(const Request& q, int bits, int maxIter,
-                   double dRe, double dIm, Ref* out) {
+                   double dRe, double dIm, Ref* out,
+                   const std::atomic<uint64_t>* gen, uint64_t myGen) {
   if (orbitMpfEnabled()) {
-    const int n = buildReferenceMpf(q, bits, maxIter, dRe, dIm, out);
-    if (n >= 0) return n;
+    const int n = buildReferenceMpf(q, bits, maxIter, dRe, dIm, out, gen, myGen);
+    if (n >= 0 || n == kOrbitCancelled) return n;
   }
+  if (orbitCancelled(gen, myGen)) return kOrbitCancelled;
   const bool julia = q.spec.mode == 1;
   Big cr(bits), ci(bits), zr(bits), zi(bits);
 
@@ -123,6 +135,11 @@ int buildReference(const Request& q, int bits, int maxIter,
   }
   int n = 0;
   for (; n < maxIter; ++n) {
+    if ((n & (kOrbitCancelCheckInterval - 1)) == 0 &&
+        orbitCancelled(gen, myGen)) {
+      if (out) out->len = n;
+      return kOrbitCancelled;
+    }
     if (out) {
       out->re[(size_t)n] = zr.toDouble();
       out->im[(size_t)n] = zi.toDouble();
@@ -165,9 +182,70 @@ void buildFolds(Ref& R, int kind) {
   }
 }
 
+/* ---- normalised complex arithmetic ----------------------------------
+ *
+ * A_n = prod(2 Z_k) grows exponentially, B_n ~ A_n^2 and C_n ~ A_n^3.  On a
+ * long reference orbit they leave the double range after ~1000 steps, which
+ * is exactly where the old buildSeries had to stop and where a deep frame
+ * most needs the series to keep going.  RFF-2.0 solves this with `dex` /
+ * `try_normalized_value()`: a mantissa plus a binary exponent, renormalised
+ * after every operation.  We do the same, but only renormalise once the
+ * mantissa leaves [1e-120, 1e120] — while the numbers are ordinary doubles
+ * the arithmetic below is the original one, bit for bit.
+ */
+struct SC {
+  double r = 0.0, i = 0.0;
+  int e = 0;
+};
+constexpr double kScHi = 1e120, kScLo = 1e-120;
+
+inline void scNorm(SC& a) {
+  const double m = std::max(std::fabs(a.r), std::fabs(a.i));
+  if (!(m > 0.0)) { a.e = 0; return; }
+  if (m >= kScLo && m <= kScHi) return;
+  int k = 0;
+  std::frexp(m, &k);
+  const double s = std::ldexp(1.0, -k);   // a power of two: exact
+  a.r *= s;
+  a.i *= s;
+  a.e += k;
+}
+inline SC scMulC(const SC& a, double jr, double ji) {
+  SC c{a.r * jr - a.i * ji, a.r * ji + a.i * jr, a.e};
+  scNorm(c);
+  return c;
+}
+inline SC scMul(const SC& a, const SC& b) {
+  SC c{a.r * b.r - a.i * b.i, a.r * b.i + a.i * b.r, a.e + b.e};
+  scNorm(c);
+  return c;
+}
+inline void scFold(SC& a, double fr, double fi) { a.r *= fr; a.i *= fi; }
+inline SC scReal(double v) { SC a{v, 0.0, 0}; scNorm(a); return a; }
+inline SC scAdd(const SC& a, const SC& b) {
+  if (a.r == 0.0 && a.i == 0.0) return b;
+  if (b.r == 0.0 && b.i == 0.0) return a;
+  const int e = std::max(a.e, b.e);
+  SC c{std::ldexp(a.r, a.e - e) + std::ldexp(b.r, b.e - e),
+       std::ldexp(a.i, a.e - e) + std::ldexp(b.i, b.e - e), e};
+  scNorm(c);
+  return c;
+}
+/** log |a|, or a very negative sentinel for an exactly-zero coefficient. */
+inline double scLogAbs(const SC& a) {
+  const double m = std::hypot(a.r, a.i);
+  return m > 0.0 ? std::log(m) + (double)a.e * kLn2 : -1e300;
+}
+
 /* Taylor series of the deviation.  `dcMax` is the largest |dc| in the frame;
  * the skip length is the last n whose quadratic and cubic terms are still
- * negligible there — the same criterion KF uses (relative error 1e-3). */
+ * negligible there — the same criterion KF uses (relative error 1e-3).
+ *
+ * The tolerance test is now done in the log domain.  In the linear domain
+ * `bmag * dcMax` and `cmag * dcMax*dcMax` both underflow at deep zoom (dc^2
+ * is 1e-600), so the cubic term was silently declared harmless forever; and
+ * amag itself overflowed at 1e308.  Logs keep both comparisons meaningful
+ * across the entire orbit. */
 
 void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
   const size_t n = (size_t)std::max(1, R.len);
@@ -177,104 +255,104 @@ void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
   R.bi.assign(n, 0.0);
   R.cr.assign(n, 0.0);
   R.ci.assign(n, 0.0);
-  R.dcth.assign(n, 0.0f);
+  R.aExp.assign(n, 0);
+  R.bExp.assign(n, 0);
+  R.cExp.assign(n, 0);
+  R.dcth.assign(n, 0.0);
   R.skip = 0;
+  R.derSkip = 0;
   /* A folded family is only polynomial inside one sign cell.  Tricorn's flip
    * is the same at every step (a constant conjugation), so its series is
    * exact; burning ship and celtic flip somewhere along the orbit and the
    * series would then describe a different map, so they start at n = 0 and
-   * rely on the native kernel alone.
-   *
-   * Any power p >= 2 is allowed now: the step coefficients J, H, K come from
-   * buildDevTable, so the series is the same three recurrences for every
-   * multibrot instead of only for z^2. */
+   * rely on the native kernel alone. */
   if (R.len < 2) return;
   if (kind != 0 && kind != 1) return;
   static const bool noSeries = std::getenv("MB_NOSERIES") != nullptr;
 
   /* d z_n / d c is 0 at n = 0 for the Mandelbrot set (z_0 is a constant),
-   * and 1 for Julia (z_0 is the pixel).  The +1 in the recurrence is the
-   * derivative of the additive constant: dropping it makes A identically
-   * zero and silently disables the whole skip. */
+   * and 1 for Julia (z_0 is the pixel). */
   const double add = mandelbrot ? ((kind == 2) ? -1.0 : 1.0) : 0.0;
-  double ar = mandelbrot ? 0.0 : 1.0, ai = 0.0, br = 0.0, bi = 0.0;
-  double crc = 0.0, cci = 0.0;
-  R.ar[0] = ar;
-  int skip = 0;
+  SC A{mandelbrot ? 0.0 : 1.0, 0.0, 0};
+  SC B{0.0, 0.0, 0}, C{0.0, 0.0, 0};
+  scNorm(A);
+
+  auto store = [&](size_t idx) {
+    R.ar[idx] = A.r;   R.ai[idx] = A.i;   R.aExp[idx] = A.e;
+    R.br[idx] = B.r;   R.bi[idx] = B.i;   R.bExp[idx] = B.e;
+    R.cr[idx] = C.r;   R.ci[idx] = C.i;   R.cExp[idx] = C.e;
+  };
+  store(0);
+
+  const double logTol = std::log(kSkipTol());
+  const double logDc = dcMax > 0.0 ? std::log(dcMax) : -745.0;
+  const double logThMax = std::log(1e300);
+  int skip = 0, derSkip = 0;
   for (int k = 0; k + 1 < R.len; ++k) {
     const double zr = R.re[(size_t)k], zi = R.im[(size_t)k];
-    /* Step coefficients of d' = F ( J d + H d^2 + K d^3 ) + dc.  For p = 2 the
-     * table is not built, because J = 2Z, H = 1, K = 0 in closed form. */
+    /* Step coefficients of d' = F ( J d + H d^2 + K d^3 ) + dc.  For p = 2
+     * the table is not built, because J = 2Z, H = 1, K = 0 in closed form. */
     double jr, ji, hr, hi, kr, ki;
     if (power == 2) {
       jr = 2.0 * zr; ji = 2.0 * zi;
-      hr = 1.0; hi = 0.0;
-      kr = 0.0; ki = 0.0;
+      hr = 1.0;      hi = 0.0;
+      kr = 0.0;      ki = 0.0;
     } else {
       jr = R.jr[(size_t)k]; ji = R.ji[(size_t)k];
       hr = R.hr[(size_t)k]; hi = R.hi[(size_t)k];
       kr = R.kr[(size_t)k]; ki = R.ki[(size_t)k];
     }
-    /* d' = F ( 2Z d + d^2 ) + dc, composed through the fold of step k. */
     const double fr = R.fR.empty() ? 1.0 : (double)R.fR[(size_t)k];
     const double fi = R.fI.empty() ? 1.0 : (double)R.fI[(size_t)k];
-    const double a2r = ar * ar - ai * ai;
-    const double a2i = 2.0 * ar * ai;
-    const double nar = (jr * ar - ji * ai) * fr + add;
-    const double nai = (jr * ai + ji * ar) * fi;
-    const double nbr = (jr * br - ji * bi + hr * a2r - hi * a2i) * fr;
-    const double nbi = (jr * bi + ji * br + hr * a2i + hi * a2r) * fi;
-    /* Cubic term: J C + 2 H A B + K A^3, with A^3 = A^2 * A. */
-    const double a3r = a2r * ar - a2i * ai;
-    const double a3i = a2r * ai + a2i * ar;
-    const double abr = ar * br - ai * bi;
-    const double abi = ar * bi + ai * br;
-    const double ncr = (jr * crc - ji * cci + 2.0 * (hr * abr - hi * abi) +
-                        kr * a3r - ki * a3i) * fr;
-    const double nci = (jr * cci + ji * crc + 2.0 * (hr * abi + hi * abr) +
-                        kr * a3i + ki * a3r) * fi;
-    ar = nar; ai = nai;
-    br = nbr; bi = nbi;
-    crc = ncr; cci = nci;
-    if (!std::isfinite(ar) || !std::isfinite(ai) || !std::isfinite(br) ||
-        !std::isfinite(bi) || !std::isfinite(crc) || !std::isfinite(cci))
-      break;
-    R.ar[(size_t)k + 1] = ar;
-    R.ai[(size_t)k + 1] = ai;
-    R.br[(size_t)k + 1] = br;
-    R.bi[(size_t)k + 1] = bi;
-    R.cr[(size_t)k + 1] = crc;
-    R.ci[(size_t)k + 1] = cci;
-    const double amag = std::hypot(ar, ai);
-    const double bmag = std::hypot(br, bi);
-    const double cmag = std::hypot(crc, cci);
+
+    /* Every recurrence below reads the *old* A, B, C, exactly like the
+     * scalar-kernel's series did before the exponents were added. */
+    const SC Ap = A, Bp = B, Cp = C;
+    const SC A2 = scMul(Ap, Ap);
+    const SC AB = scMul(Ap, Bp);
+    const SC A3 = scMul(A2, Ap);
+
+    SC JA = scMulC(Ap, jr, ji);   scFold(JA, fr, fi);
+    A = scAdd(JA, scReal(add));
+
+    SC JB = scMulC(Bp, jr, ji);   scFold(JB, fr, fi);
+    SC HA2 = scMulC(A2, hr, hi);  scFold(HA2, fr, fi);
+    B = scAdd(JB, HA2);
+
+    SC JC = scMulC(Cp, jr, ji);   scFold(JC, fr, fi);
+    SC T2 = scMulC(AB, 2.0 * hr, 2.0 * hi); scFold(T2, fr, fi);
+    SC T3 = scMulC(A3, kr, ki);   scFold(T3, fr, fi);
+    C = scAdd(scAdd(JC, T2), T3);
+    store((size_t)k + 1);
+
+    const double logA = scLogAbs(A);
+    const double logB = scLogAbs(B);
+    const double logC = scLogAbs(C);
     /* Scale-invariant test: the quadratic and cubic terms must be negligible
-     * *relative* to the linear one everywhere in the frame.  There is
-     * deliberately no cap on |A| — a large A only means the linear image of the
-     * frame is large, which the pixel kernel scales out again; capping it here
-     * was what kept the skip at ~1000 iterations on deep views. */
-    if (amag < 1e300 && bmag < 1e300 && cmag < 1e300 &&
-        bmag * dcMax <= kSkipTol() * amag &&
-        cmag * dcMax * dcMax <= kSkipTol() * amag)
+     * *relative* to the linear one everywhere in the frame.  No cap on |A|:
+     * a large A only means the linear image of the frame is large, which the
+     * pixel kernel scales out again. */
+    if (logB + logDc <= logTol + logA &&
+        logC + 2.0 * logDc <= logTol + logA)
       skip = k + 1;
-    /* Largest |dc| for which a start at this index is still within tolerance:
-     * the quadratic term allows dc <= tol|A|/|B|, the cubic one
-     * dc <= sqrt(tol|A|/|C|).  Kept monotone (running minimum) so a pixel can
-     * binary-search it: the tolerance is a *prefix* property — every earlier
-     * step has to hold too. */
-    double th = bmag > 0.0 ? kSkipTol() * amag / bmag : 1e300;
-    if (cmag > 0.0) {
-      const double tc = std::sqrt(kSkipTol() * amag / cmag);
-      if (tc < th) th = tc;
-    }
+    /* Largest |dc| for which a start at this index is still inside tolerance.
+     * exp() is guarded: a coefficient ratio of 1e500 is perfectly legal in
+     * the log domain and must not turn the threshold into +inf. */
+    double logTh = logThMax;
+    if (logB > -1e299) logTh = std::min(logTh, logTol + logA - logB);
+    if (logC > -1e299)
+      logTh = std::min(logTh, 0.5 * (logTol + logA - logC));
+    double th = logTh <= -745.0 ? 0.0 : std::exp(std::min(logTh, logThMax));
     if (!(th > 0.0) || th > 1e300) th = 1e300;
-    if (k > 0) {
-      const double prev = (double)R.dcth[(size_t)k];
-      if (prev < th) th = prev;
-    }
-    R.dcth[(size_t)k + 1] = (float)th;
+    if (k > 0 && R.dcth[(size_t)k] < th) th = R.dcth[(size_t)k];
+    R.dcth[(size_t)k + 1] = th;
+
+    /* The derivative recurrence is seeded with A_sk itself, with no exponent
+     * companion; remember where that still fits in a double. */
+    if (A.e == 0) derSkip = k + 1;
   }
   R.skip = noSeries ? 0 : std::min(skip, R.len - 1);
+  R.derSkip = std::min(derSkip, R.len - 1);
 }
 
 /* Where to anchor the frame.
@@ -291,8 +369,17 @@ void buildSeries(Ref& R, double dcMax, bool mandelbrot, int power, int kind) {
  * that it has to go through Big, which is slower but is also only paid when
  * the cached orbit cannot be reused. */
 
-Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g) {
-  const bool bigProbe = g.ps < 1e-17;
+Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g,
+                   const std::atomic<uint64_t>* gen, uint64_t myGen) {
+  /* A double's ulp near |c| ~ 0.74 is 1.1e-16.  The old fixed 1e-17 switch
+   * meant that between 1e-14 and 1e-17 every probe grid point rounded to the
+   * *same* double: the search could not see the frame at all.  Require ~64
+   * ulps of headroom for a 3x3/5x5 grid, then switch to the exact centre. */
+  const double cRe = std::strtod(q.centerRe.c_str(), nullptr);
+  const double cIm = std::strtod(q.centerIm.c_str(), nullptr);
+  const double cAbs = std::max(1.0, std::max(std::fabs(cRe), std::fabs(cIm)));
+  const double ulp = std::ldexp(1.0, -52) * cAbs;
+  const bool bigProbe = g.ps < 64.0 * ulp;
   const int G = bigProbe ? 3 : 5;
   /* The probe cap has to grow with the view.
    *
@@ -308,8 +395,6 @@ Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g) {
    * and probe again.  Four doublings reach 32k with nine 200-bit orbits, which
    * costs a fraction of a second — small next to the frame that follows. */
   int cap = std::min(maxIter, 2048);
-  const double cRe = std::strtod(q.centerRe.c_str(), nullptr);
-  const double cIm = std::strtod(q.centerIm.c_str(), nullptr);
   const double w = (double)std::max(1, q.width);
   const double h = (double)std::max(1, q.height);
 
@@ -339,7 +424,8 @@ Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g) {
         screenDelta(g, fx, fy, dRe, dIm);
         int len;
         if (bigProbe) {
-          len = buildReference(q, bits, rc, dRe, dIm, nullptr);
+          len = buildReference(q, bits, rc, dRe, dIm, nullptr, gen, myGen);
+          if (len == kOrbitCancelled) return Pick{};
         } else {
           double zr, zi, cr, ci;
           if (g.julia) {                // seed orbit: z_0 is the pixel, c fixed
@@ -355,6 +441,8 @@ Pick pickReference(const Request& q, int bits, int maxIter, const Ctx& g) {
           }
           len = -1;
           for (int n = 0; n < rc; ++n) {
+            if ((n & (kOrbitCancelCheckInterval - 1)) == 0 &&
+                orbitCancelled(gen, myGen)) return Pick{};
             const double m2 = zr * zr + zi * zi;
             if (m2 > kBail2) {
               len = n;
