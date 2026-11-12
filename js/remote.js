@@ -78,18 +78,24 @@ export async function remoteRender(job, signal) {
   if (!r.ok) throw new Error('render server: ' + (await r.text()).slice(0, 120));
   const raw = r.headers.get('x-meta');
   const meta = raw ? JSON.parse(atob(raw)) : {};
-  const buf = new Uint8Array(await r.arrayBuffer());
-  const data = new Uint8ClampedArray(buf.length);
-  data.set(buf);
+  /* Field mode returns one 32-bit colour position per pixel instead of RGBA.
+   * The server flags it in x-meta (worker.js: meta.field); reading those bytes
+   * back as RGBA would turn a re-shadeable frame into random colour noise. */
+  const ab = await r.arrayBuffer();
+  const data = meta.field ? new Float32Array(ab) : new Uint8ClampedArray(ab);
   return {
     type: 'tile',
     viewId: meta.viewId,
     x: meta.x, y: meta.y, w: meta.w, h: meta.h,
+    width: meta.width, height: meta.height,
     data,
     meta: {
       mode: meta.mode, bits: meta.bits, ms: meta.ms != null ? meta.ms : meta.total,
       glitches: meta.glitches || 0, refLen: meta.refLen || 0,
-      engine: 'remote', limited: !!meta.limited
+      engine: 'remote', limited: !!meta.limited,
+      field: !!meta.field,
+      stats: meta.stats, tailKept: meta.tailKept,
+      tileH: meta.tileH, tileW: meta.tileW
     }
   };
 }

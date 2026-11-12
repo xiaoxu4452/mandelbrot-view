@@ -201,7 +201,14 @@ export class Fixed {
 /* Mirrors mbc::hp tiers in the C++ core (mb_hp.h): 16384 bits is the desktop
  * ceiling, ~4930 decimal decades, so every preset can be zoomed past 1e300
  * without the reference orbit losing the pixel scale. */
-export const PRECISION_TIERS = [256, 512, 1024, 2048, 4096, 8192, 16384];
+/* Widths the renderer can actually use.  The list used to start at 256 *and*
+ * the search below started at index 1, so the two together meant every request
+ * landed on 512 or wider: a 800x home view needs 74 bits and was being iterated
+ * in 512-bit BigInt arithmetic through the perturbation path, which is both
+ * four times slower than necessary and the source of the glitch storm (10k
+ * unrepaired pixels per tile) that made the CPU image look mushy.  64 and 128
+ * are back, and 64 means "double is enough" to the workers. */
+export const PRECISION_TIERS = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 const ctxCache = new Map();
 
@@ -223,7 +230,7 @@ export function requiredBits(pixelSize) {
   if (!(pixelSize > 0)) return 64;
   const need = -Math.log2(pixelSize) + 8;
   if (need <= 53) return 64;
-  for (let i = 1; i < PRECISION_TIERS.length; i++) {
+  for (let i = 0; i < PRECISION_TIERS.length; i++) {
     if (PRECISION_TIERS[i] >= need) return PRECISION_TIERS[i];
   }
   return PRECISION_TIERS[PRECISION_TIERS.length - 1];
@@ -238,7 +245,7 @@ export function requiredBitsFromLog2(log2ps) {
    * width the renderer was not using. */
   const need = -log2ps + 64;
   if (need <= 53) return 64;
-  for (let i = 1; i < PRECISION_TIERS.length; i++) {
+  for (let i = 0; i < PRECISION_TIERS.length; i++) {
     if (PRECISION_TIERS[i] >= need) return PRECISION_TIERS[i];
   }
   return PRECISION_TIERS[PRECISION_TIERS.length - 1];

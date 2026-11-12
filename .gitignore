@@ -67,6 +67,13 @@ tools/bench*/
 !tools/grabcanvas.mjs
 !tools/jsonschema-check.mjs
 !tools/jsonimport-check.mjs
+!tools/layercheck.mjs
+!tools/ddcheck.mjs
+!tools/ddbrowser.mjs
+!tools/rebasecheck.mjs
+!tools/servercheck.mjs
+!tools/_desktopshot.mjs
+!tools/sync-desktop-ui.mjs
 wasm/t/
 tools/*.sh
 tools/*.html

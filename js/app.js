@@ -339,7 +339,15 @@ function sceneDraw(v, opts = {}) {
 /** Committed frame through the shader, or false to let the CPU pass run. */
 function scenePass() {
   const v = sceneView();
-  if (!v || !sceneDraw(v, { final: true })) return false;
+  if (!v || !sceneDraw(v, { final: true })) {
+    /* The shader declined.  `html.gl-surface` sets #fractal opacity:0, so
+     * leaving the previous GPU frame on top would hide every 2D pass that
+     * follows — and a later class toggle would expose a stale, magnified
+     * low-resolution bitmap instead.  Only a successful shader draw owns the
+     * visible layer. */
+    setGlSurface(false);
+    return false;
+  }
   /* The shader just painted the whole frame in one draw call.  Any CPU pass
    * still in flight — the quick preview a wheel event started, a progressive
    * pass a preset kicked off — will land *on top* of it, tile by tile, and the
@@ -728,6 +736,13 @@ function dispatch(job) {
   // User palettes carry their stop table with the job: workers / the remote
   // renderer never read localStorage, so the definition must travel along.
   const pl = job.payload;
+  /* Folded families past 2^-34 belong to the in-page C++ double-double
+   * kernel.  The out-of-browser core only understands the older direct /
+   * perturb modes; sending these jobs there would render them in f64 again and
+   * silently undo the whole precision path. */
+  const needsDD = !!(pl && pl.psLog2 <= -34 && pl.spec &&
+    pl.spec.mode !== 'x' && pl.spec.mode !== 'n' &&
+    pl.spec.kind !== 'mandelbrot' && pl.spec.kind !== 'multibrot');
   if (pl) {
     const stops = customPaletteStops(pl.palette);
     if (stops) pl.paletteStops = stops;
@@ -751,7 +766,7 @@ function dispatch(job) {
       pl.paletteKey = lutFingerprint(lut);
     }
   }
-  if (!job.thumb && remoteEnabled()) return remoteDispatch(job);
+  if (!job.thumb && remoteEnabled() && !needsDD) return remoteDispatch(job);
   return dispatchLocal(job);
 }
 
@@ -1576,6 +1591,10 @@ function reshadeFromField() {
   if (fieldCache.key !== fieldKeyNow()) return false;
   const t0 = performance.now();
   const rgba = shadeField(fieldCache.data, fieldCache.w, fieldCache.h, currentLut());
+  /* Re-shading paints the 2D canvas.  The shader declined this frame (that is
+   * why recolourOnly() reached here), so the GL layer must not stay on top:
+   * otherwise a palette click visibly does nothing. */
+  setGlSurface(false);
   composeTile(ctx, { canvas: tileCv, ctx: tileCtx },
     { x: 0, y: 0, w: fieldCache.w, h: fieldCache.h, data: rgba },
     fieldCache.w / canvas.width);
@@ -2057,9 +2076,17 @@ function runPass(vId, plan, done, planList) {
    * tile adopts it, so the deep pass tiles like any other. */
   const deepPass = psLog2Now() <= -34;
   const shareEnv = deepPass && envShareable(state.spec, psLog2Now());
+  /* Folded families (tricorn / burning ship / celtic / perpendicular / phoenix)
+   * now use the C++ double-double kernel, which needs NO reference orbit.  They
+   * inherited the "one whole-frame tile" shape from the JS high-precision
+   * renderer; on any canvas wider than 512 px that tile overflows the kernel's
+   * 1 MiB output slot, so the worker fell straight back to JS again — 29 s for
+   * one celtic frame.  Tiling is free for a direct kernel, so split it. */
+  const ddDirect = deepPass && state.spec.mode !== 'x' && state.spec.mode !== 'n' &&
+    !(state.spec.kind === 'mandelbrot' || state.spec.kind === 'multibrot');
   /* One tile must fit the shell's 1 MB shared slot (512x512 RGBA), so the
    * upper bound is a hard 512 even when supersampling asks for more. */
-  const tw = (deepPass && !shareEnv)
+  const tw = (deepPass && !shareEnv && !ddDirect)
     ? Math.max(pw, ph)
     : Math.min(512, Math.max(40, Math.round(Math.min(TILE, state.tilePx || TILE) *
                                             Math.max(s, 0.5) * ss)));
@@ -2111,6 +2138,10 @@ function runPass(vId, plan, done, planList) {
   if (useFrame) nativeFrameBegin(vId, pw, ph, ss, W, H);
   // This pass will paint the page canvas (JS fallback) — make sure it is visible.
   else setNativeSurface(false);
+  /* Either way a CPU pass owns the 2D canvas from here.  The single-buffer
+   * native path used to skip this, leaving `gl-surface` on and hiding the
+   * whole frame after the shader had declined. */
+  setGlSurface(false);
   const passT0 = performance.now();
   startPassClock(passT0);
 
@@ -2130,7 +2161,14 @@ function runPass(vId, plan, done, planList) {
   const passPw = pw, passPh = ph;
   /* The out-of-browser core returns raw RGBA over HTTP (JSON meta + binary
    * body), so the field capture stays on the in-page worker path. */
-  const captureField = final && !useFrame && !state.glsl && !remoteEnabled() && fieldCaptureOn;
+  /* The out-of-browser core advertises colour-position output in /ping
+   * (version 3).  Older servers only ever returned RGBA, so asking them for a
+   * field would be interpreted as random pixels.  dd-direct tiles always stay
+   * on the local worker, so they can capture a field regardless. */
+  const remoteFieldOk = !remoteEnabled() ||
+    !!(remoteStatus().info && remoteStatus().info.field) || ddDirect;
+  const captureField = final && !useFrame && !state.glsl &&
+    remoteFieldOk && fieldCaptureOn;
   fieldBuild = captureField ? { w: pw, h: ph, data: new Float32Array(pw * ph) } : null;
 
   for (const rect of tiles) {
@@ -2395,7 +2433,13 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
   /* A shader gesture is a fresh draw rather than a transform of the previous
    * frame: the picture follows the hand at full resolution. */
   if (sceneLive()) return;
+  /* The shader frame is still the visible picture when it merely throttled
+   * this event (one draw per 6 ms).  Painting the gesture transform into the
+   * hidden 2D canvas is wasted work, and when the class later flips it exposes
+   * a magnified low-resolution bitmap instead of the shader's sharp frame. */
+  if (glSurface && scene.ok && state.gpu && sceneView()) return;
   if (!snap.width) return;
+  setGlSurface(false);
   ctx.save();
   ctx.fillStyle = getComputedStyle(document.body).backgroundColor || '#000';
   ctx.fillRect(0, 0, W, H);
@@ -2411,6 +2455,8 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
 }
 
 function takeSnapshot() {
+  /* A newly committed frame replaces the gesture's bitmap baseline. */
+  if (glide) glide.bitmapScale = 1;
   if (nativeCanvasMode()) {
     // The shell resets its preview transform when a pass is committed, so the
     // page only needs the sentinel that keeps the glide bookkeeping happy.
@@ -2839,7 +2885,9 @@ function wheelGlide(e) {
   const step = Math.exp(clamp(e.deltaY, -240, 240) * 0.0035);
   if (!snap.width) takeSnapshot();
   if (!glide) {
-    glide = { target: 1, cur: 1, px: x, py: y, lastT: 0, raf: 0 };
+    glide = { target: 1, cur: 1, px: x, py: y, lastT: 0, raf: 0,
+              /* Accumulated bitmap transform applied to ONE committed
+               * snapshot, see glideApply(). */ bitmapScale: 1 };
     glideStats = { n: 0, sum: 0, max: 0 };
   }
   // Direction reversal: drop the leftover credit so the image follows the hand.
@@ -2915,10 +2963,14 @@ function glideApply(factor, px, py) {
   state.span = { m: state.span.m * factor, e: state.span.e };
   normalizeSpan();
 
-  blitSnapshot(0, 0, 1 / factor, px, py);
-  // The transformed frame becomes the base for the next eased step, so the
-  // glide stays cumulative even if the pointer moves between events.
-  takeSnapshot();
+  /* One resampling, not one per eased frame.  The old code fed the transformed
+   * bitmap back into `snap` on every step: after a fast wheel burst an original
+   * pixel had been magnified dozens of times through repeated bilinear
+   * filtering, producing the uniform white / navy block field reported at
+   * depth.  Keep the committed snapshot as the single source and apply the
+   * accumulated gesture scale once. */
+  glide.bitmapScale = clamp(glide.bitmapScale / factor, 0.08, 12);
+  blitSnapshot(0, 0, glide.bitmapScale, px, py);
   updateHudSoon();
   return true;
 }
@@ -2982,6 +3034,9 @@ function updateHud(done = false) {
    * in the same iteration has nothing to draw, and saying so is the difference
    * between "the renderer is broken" and "there is no detail here". */
   let colourHint = '';
+  /* The status row is one line and clips this on a narrow window, so the same
+   * fact is also stated in the middle of the picture. */
+  let noDetail = false;
   if (lastMeta) {
     /* Union over the pass, not the last tile: a single uniform tile must not
      * label a frame full of filaments as "no structure".  Only claim it when
@@ -2993,7 +3048,10 @@ function updateHud(done = false) {
     const bounded = stats ? stats.bounded : (lastMeta.bounded | 0);
     const known = Number.isFinite(lo) && Number.isFinite(hi);
     if (known && hi > lo) colourHint = ` · ${t('escRange')} ${lo | 0}–${hi | 0}`;
-    if (known && hi - lo <= 1 && !(bounded > 0)) colourHint += ` · ${t('noDetail')}`;
+    if (known && hi - lo <= 1 && !(bounded > 0)) {
+      colourHint += ` · ${t('noDetail')}`;
+      noDetail = true;
+    }
     if (lastMeta.cyc > 0 && lastMeta.cyc < 1000) {
       colourHint += ` · ${t('cycShort')} ${lastMeta.cyc < 1 ? lastMeta.cyc.toFixed(2) : Math.round(lastMeta.cyc)}`;
     }
@@ -3011,6 +3069,9 @@ function updateHud(done = false) {
 
   $('kv-center').textContent = `${trimNum(state.center.re, 22)} , ${trimNum(state.center.im, 22)}`;
   $('kv-zoom').textContent = fmtZoomFactor(d);
+
+  const nd = $('nodetail');
+  if (nd) nd.hidden = !noDetail;
 }
 
 function updateEngineLabel() {
@@ -6089,6 +6150,16 @@ function resizeCanvas(render = true) {
   }
   canvas.width = nextW;
   canvas.height = nextH;
+  /* The shader's backing store is only sized inside sceneDraw(), so a view the
+   * shader declines leaves it at the *previous* window's dimensions.  CSS then
+   * stretches that stale frame over the new viewport — a second source of
+   * misplaced blocks.  Keep both layers in lockstep; resizing a WebGL canvas
+   * clears its drawing buffer, so the 2D layer has to become visible. */
+  if (glCanvas.width !== nextW || glCanvas.height !== nextH) {
+    glCanvas.width = nextW;
+    glCanvas.height = nextH;
+    setGlSurface(false);
+  }
   ctx.fillStyle = '#05060a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   // One line in shell.log per resize: the only way to see the real viewport,
@@ -6288,6 +6359,15 @@ function boot() {
                   scene: () => ({ ok: scene.ok, fail: sceneFail,
                                   view: !!sceneView(), last: sceneLast,
                                   result: sceneResult }),
+                  /* Layer-ownership probe: the visible surface, both backing
+                   * stores, the gesture bitmap baseline and its accumulated
+                   * scale.  tools/layercheck.mjs asserts these never disagree. */
+                  layer: () => ({ gl: glSurface,
+                                  glBuffer: [glCanvas.width, glCanvas.height],
+                                  c2d: [canvas.width, canvas.height],
+                                  snap: [snap.width, snap.height],
+                                  bitmapScale: glide ? glide.bitmapScale : 1,
+                                  field: fieldCache ? [fieldCache.w, fieldCache.h] : null }),
                   frame: () => frameMs,
                   frames: () => frameSeq,
                   /* Metadata of the last finished pass: orbit time, whether the

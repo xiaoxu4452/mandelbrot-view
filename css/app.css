@@ -105,6 +105,37 @@ html, body {
 #fractal { z-index: 1; }
 html.gl-surface #fractal { opacity: 0; }
 
+/* "No structure in this area".
+ *
+ * The status row is one line and clips this on a narrow window, so the same
+ * fact is also stated in the middle of the picture: a frame whose pixels all
+ * escape at the same iteration has nothing to draw, and a flat field reads as
+ * a broken renderer unless it says what it is. */
+.nodetail {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  padding: 14px 22px;
+  border-radius: 12px;
+  background: rgba(12, 14, 18, 0.72);
+  border: 1px solid var(--line);
+  color: var(--text);
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: min(420px, 80vw);
+}
+.nodetail[hidden] { display: none; }
+.nodetail b { font-weight: 600; }
+.nodetail span { color: var(--text-dim); }
+
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
 .glass {

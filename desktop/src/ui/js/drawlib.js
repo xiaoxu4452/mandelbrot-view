@@ -88,7 +88,7 @@ export function boxDownsample(src, w, h, k) {
  */
 export function composeTile(ctx, scratch, msg, scale) {
   const k = Math.round(scale);
-  if (scale >= 1 && Math.abs(scale - k) < 1e-9) {
+  if (!window.__mbForceBlit && scale >= 1 && Math.abs(scale - k) < 1e-9) {
     const data = k === 1 ? msg.data : boxDownsample(msg.data, msg.w, msg.h, k);
     const iw = msg.w / k, ih = msg.h / k;
     if (k === 1) { ctx.putImageData(new ImageData(new Uint8ClampedArray(data), iw, ih), msg.x, msg.y); return; }

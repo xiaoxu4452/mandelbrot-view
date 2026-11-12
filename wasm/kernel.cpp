@@ -3,7 +3,7 @@
 //
 // Keeps exactly the same ABI as kernel.ts: a single render(paramPtr) entry point,
 // the parameter block is an f64 array, index × 8 gives the byte offset:
-//  0 mode(0 direct /1 perturb /2 newton)
+//  0 mode(0 direct /1 perturb /2 newton /3 direct double-double, all kinds)
 //  1 kind(0 poly 1 tricorn 2 burningship 3 celtic 4 perpendicular 5 phoenix)
 //  2 power  3 julia  4 tileX 5 tileY 6 tileW 7 tileH 8 imgW 9 imgH
 // 10 centerRe 11 centerIm 12 ps 13 juliaRe 14 juliaIm
@@ -12,6 +12,7 @@
 // 26 newtonDegree 27 rootsPtr 28 orbitStride
 // 29..37 series approximation (skip, ar, ai, br, bi, cr, ci, radius, on)
 // 38 glitchPtr 39 glitchCap 40 ddRef (reference orbit carries hi/lo words)
+// 54..57 low words of centreRe / centreIm / juliaRe / juliaIm (mode 3)
 //
 // The hot paths (power-2 direct / power-2 perturbation) advance two pixels at a time with f64x2.
 // Build: zig c++ -target wasm32-freestanding -O3 -msimd128 ...
@@ -82,7 +83,12 @@ static inline void putColor(int outPtr, int o, int lutPtr, double t,
                             int x, int y, int dither) {
   double u = t - __builtin_floor(t);
   if (gField) {
-    /* Same slot, same size: the page reads it back as one float per pixel. */
+    /* Same slot, same size: the page reads it back as one float per pixel.
+     * A single squaring can jump to Inf, and log(Inf)/floor(Inf) leaves NaN;
+     * shadeField() reads any non-finite position as "interior", which painted
+     * ~5% of a shallow frame as flat black.  Clamp exactly as the GLSL colour
+     * stage does, so the re-shade cache never contains a poisoned position. */
+    if (!(u >= 0.0 && u <= 1.0)) u = 0.0;
     *(float *)(outPtr + o) = (float)u;
     return;
   }
@@ -219,6 +225,11 @@ static inline void writeStats(int p, const Stats &s) {
 }
 
 static inline void rimShade(int outPtr, int o, double distPx, double widthPx, double strength) {
+  /* In field mode this slot holds one FLOAT colour position, not RGBA.  The
+   * rim blend used to overwrite its low bytes, turning positions into values
+   * like 1.75; the page's shadeField() then clamped them to the end of the
+   * LUT, so a thin band of every deep frame was painted with one flat colour. */
+  if (gField) return;
   if (!(strength > 0.0) || !(widthPx > 0.0)) return;
   double rr = distPx / widthPx;
   if (!(rr < 1.0)) return;
@@ -519,6 +530,150 @@ static int renderDirectGeneric(int p) {
       if (esc) {
         const double raw = smoothOf(n, m2, invLogPower);
         statAdd(st, raw, tx + px, ty + py, ldi(p, 8), ldi(p, 9), maxIter);
+        putColor(outPtr, o, lutPtr, colorT(sh, raw), tx + px, ty + py, dither);
+      } else putInterior(outPtr, o);
+      o += 4;
+    }
+  }
+  writeStats(p, st);
+  return 0;
+}
+
+/* ================= Direct · double-double, every family (scalar) ==========
+ *
+ * Tricorn / burning ship / celtic / perpendicular / phoenix have no usable
+ * closed-form perturbation: abs() and conjugation make the delta polynomial
+ * piecewise, so a shared reference orbit cannot reconstruct a pixel's orbit.
+ * They used to be handed to the JavaScript BigInt renderer as soon as the view
+ * passed 2^-34, which is one to two orders of magnitude slower than this
+ * kernel and is why "switching the formula stutters" at depth.
+ *
+ * A double-double (two IEEE doubles, ~106 significant bits) carries BOTH the
+ * screen coordinate and the iterated z.  p[54..57] hold the residual halves of
+ * the centre / Julia seed, i.e. the digits parseFloat() dropped, so the orbit
+ * starts at the exact view centre.  With an 18-bit guard this is trustworthy
+ * to ~2^-88; deeper views still go to the arbitrary-precision JS path.
+ *
+ * The compiler must not reassociate the two-sum/two-product expressions: the
+ * build uses plain -O3 (no -ffast-math) precisely so the compensation terms
+ * survive.  This is the same Dekker arithmetic the df64 GLSL program uses.
+ * ------------------------------------------------------------------------ */
+struct DD { double h, l; };
+
+static inline DD ddSet(double a) { DD r = { a, 0.0 }; return r; }
+static inline DD ddQuickSum(double a, double b) {
+  const double s = a + b;
+  DD r = { s, b - (s - a) };
+  return r;
+}
+static inline DD ddTwoSum(double a, double b) {
+  const double s = a + b, bb = s - a;
+  const double e = (a - (s - bb)) + (b - bb);
+  return ddQuickSum(s, e);
+}
+static inline DD ddSplit(double a) {
+  const double t = a * 4097.0;
+  const double hi = t - (t - a);
+  DD r = { hi, a - hi };
+  return r;
+}
+static inline DD ddTwoProd(double a, double b) {
+  const double p = a * b;
+  const DD A = ddSplit(a), B = ddSplit(b);
+  const double e = ((A.h * B.h - p) + A.h * B.l + A.l * B.h) + A.l * B.l;
+  DD r = { p, e };
+  return r;
+}
+static inline DD ddAdd(DD a, DD b) {
+  const DD s = ddTwoSum(a.h, b.h);
+  return ddQuickSum(s.h, s.l + a.l + b.l);
+}
+static inline DD ddNeg(DD a) { DD r = { -a.h, -a.l }; return r; }
+static inline DD ddSub(DD a, DD b) { return ddAdd(a, ddNeg(b)); }
+static inline DD ddMul(DD a, DD b) {
+  const DD p = ddTwoProd(a.h, b.h);
+  return ddQuickSum(p.h, p.l + a.h * b.l + a.l * b.h);
+}
+static inline DD ddMulD(DD a, double b) { return ddMul(a, ddSet(b)); }
+static inline DD ddAbs(DD a) { return a.h < 0.0 ? ddNeg(a) : a; }
+static inline double ddF(DD a) { return a.h + a.l; }
+
+static int renderDirectDD(int p) {
+  const int kind = ldi(p, 1), power = ldi(p, 2);
+  const bool isJulia = ldi(p, 3) != 0;
+  const int tx = ldi(p, 4), ty = ldi(p, 5), tw = ldi(p, 6), th = ldi(p, 7);
+  const double halfW = ldf(p, 8) * 0.5, halfH = ldf(p, 9) * 0.5;
+  const double cre = ldf(p, 10), cim = ldf(p, 11), ps = ldf(p, 12);
+  const double jre = ldf(p, 13), jim = ldf(p, 14);
+  const int maxIter = ldi(p, 15);
+  const int outPtr = ldi(p, 18), lutPtr = ldi(p, 19);
+  const double ph = ldf(p, 24);
+  const double creLo = ldf(p, 54), cimLo = ldf(p, 55);
+  const double jreLo = ldf(p, 56), jimLo = ldf(p, 57);
+  const double invLogPower = power == 2 ? 1.4426950408889634
+                                        : 1.0 / fastlog((double)power);
+  const Shade sh = loadShade(p);
+  const int dither = ldi(p, 50);
+  const int W = ldi(p, 8), H = ldi(p, 9);
+  Stats st{1e300, -1e300, -1e300};
+  int o = 0;
+  const DD dcR = ddAdd(ddSet(cre), ddSet(creLo));
+  const DD dcI = ddAdd(ddSet(cim), ddSet(cimLo));
+  const DD djR = ddAdd(ddSet(jre), ddSet(jreLo));
+  const DD djI = ddAdd(ddSet(jim), ddSet(jimLo));
+
+  for (int py = 0; py < th; py++) {
+    const double gy = (double)(ty + py) + 0.5;
+    for (int px = 0; px < tw; px++) {
+      const double gx = (double)(tx + px) + 0.5;
+      const double ox = (gx - halfW) * ps, oy = -(gy - halfH) * ps;
+      const DD cr = ddAdd(dcR, ddSet(ox));
+      const DD ci = ddAdd(dcI, ddSet(oy));
+      const DD kR = isJulia ? djR : cr;
+      const DD kI = isJulia ? djI : ci;
+      DD zr = isJulia ? cr : ddSet(0.0);
+      DD zi = isJulia ? ci : ddSet(0.0);
+      DD pr = ddSet(0.0), pi = ddSet(0.0);
+      int n = 0;
+      double m2 = 0.0;
+      bool esc = false;
+
+      for (; n < maxIter; n++) {
+        DD nr, ni;
+        if (kind == 0) {
+          DD a = zr, b = zi;
+          for (int k = 2; k <= power; k++) {
+            const DD r2 = ddSub(ddMul(a, zr), ddMul(b, zi));
+            const DD i2 = ddAdd(ddMul(a, zi), ddMul(b, zr));
+            a = r2; b = i2;
+          }
+          nr = a; ni = b;
+        } else if (kind == 1) {                       // tricorn: conj(z)^2
+          nr = ddSub(ddMul(zr, zr), ddMul(zi, zi));
+          ni = ddNeg(ddMulD(ddMul(zr, zi), 2.0));
+        } else if (kind == 2) {                       // burning ship
+          const DD ax = ddAbs(zr), ay = ddAbs(zi);
+          nr = ddSub(ddMul(ax, ax), ddMul(ay, ay));
+          ni = ddMulD(ddMul(ax, ay), 2.0);
+        } else if (kind == 3) {                       // celtic
+          nr = ddAbs(ddSub(ddMul(zr, zr), ddMul(zi, zi)));
+          ni = ddMulD(ddMul(zr, zi), 2.0);
+        } else if (kind == 4) {                       // perpendicular
+          nr = ddSub(ddMul(zr, zr), ddMul(zi, zi));
+          ni = ddMulD(ddMul(ddAbs(zr), ddAbs(zi)), 2.0);
+        } else {                                      // phoenix
+          nr = ddAdd(ddSub(ddMul(zr, zr), ddMul(zi, zi)), ddMulD(pr, ph));
+          ni = ddAdd(ddMulD(ddMul(zr, zi), 2.0), ddMulD(pi, ph));
+          pr = zr; pi = zi;
+        }
+        zr = ddAdd(nr, kR);
+        zi = ddAdd(ni, kI);
+        m2 = ddF(zr) * ddF(zr) + ddF(zi) * ddF(zi);
+        if (m2 > BAIL2) { esc = true; break; }
+      }
+      if (esc) {
+        const double raw = smoothOf(n, m2, invLogPower);
+        statAdd(st, raw, tx + px, ty + py, W, H, maxIter);
         putColor(outPtr, o, lutPtr, colorT(sh, raw), tx + px, ty + py, dither);
       } else putInterior(outPtr, o);
       o += 4;
@@ -1241,6 +1396,7 @@ EXPORT(render) int render(int p) {
   gField = ldi(p, 53);
   const int mode = ldi(p, 0);
   if (mode == 2) { renderNewton(p); return 0; }
+  if (mode == 3) return renderDirectDD(p);
   if (mode == 0) {
     if (ldi(p, 1) == 0 && ldi(p, 2) == 2) return renderDirect2(p);
     return renderDirectGeneric(p);

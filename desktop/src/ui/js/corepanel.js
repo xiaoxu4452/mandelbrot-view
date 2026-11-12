@@ -1,48 +1,27 @@
 /* ------------------------------------------------------------------
  * corepanel.js — "Render core" panel.
  *
- * The browser bundle already ships a WebAssembly kernel, but the optional
- * native core runs the very same kernel inside a Node.js worker pool, out of
- * the page's event loop.  This panel:
- *   1. reports whether a local core answered on 127.0.0.1:8778,
- *   2. offers the packaged core (`core/mandelbrot-core.zip`) for download,
- *   3. caches that archive so a later download works offline / instantly,
- *   4. explains the two-step start-up on every platform.
+ * The browser bundle already ships a WebAssembly kernel, and the main view
+ * iterates entirely in a fragment shader.  What it cannot do is run the
+ * desktop program's own core: multi-threaded, out of the page's event loop,
+ * with no tab-memory ceiling.  That core ships with the desktop build, so the
+ * download entry point is the project's Releases page rather than a copy of
+ * the kernel zip baked into the site.
  *
- * The package is a static artefact rebuilt by `tools/build-core-package.mjs`,
- * therefore it can be served straight from GitHub Pages.
+ * The panel therefore:
+ *   1. reports whether a local core answered on 127.0.0.1:8778,
+ *   2. links to the Releases page (desktop build + core package),
+ *   3. explains the two-step start-up on every platform.
  * ----------------------------------------------------------------*/
 
 import { remoteStatus } from './remote.js';
 
-const PKG_URL = 'core/mandelbrot-core.zip';
-const CACHE_NAME = 'mb-core-v1';
-const PKG_BYTES = 412 * 1024; // approximate, refreshed from Content-Length when known
-
-/** Cache the archive in the background so the download is instant later. */
-async function warmCache() {
-  if (!('caches' in window)) return;
-  try {
-    const cache = await caches.open(CACHE_NAME);
-    const hit = await cache.match(PKG_URL);
-    if (hit) return;
-    const res = await fetch(PKG_URL, { cache: 'no-store' });
-    if (res.ok) await cache.put(PKG_URL, res.clone());
-  } catch {
-    /* private mode, quota, offline — the direct link still works */
-  }
-}
-
-function sizeLabel(bytes) {
-  if (!bytes) return '';
-  return bytes > 1024 * 1024
-    ? (bytes / 1048576).toFixed(1) + ' MB'
-    : Math.round(bytes / 1024) + ' KB';
-}
+/* `latest` rather than a tag: the panel should not need an edit per release. */
+const RELEASES_URL = 'https://github.com/xiaoxu4452/mandelbrot-view/releases/latest';
 
 /**
  * Render the core panel inside the shared modal host.
- * @param {{t:Function, openModal:Function, toast:Function, isSecure:boolean}} ui
+ * @param {{t:Function, openModal:Function, toast:Function, reprobe:Function}} ui
  */
 export function openCorePanel(ui) {
   const { t, openModal, toast } = ui;
@@ -71,9 +50,8 @@ export function openCorePanel(ui) {
         <li>${t('coreStep3')}</li>
       </ol>
       <div class="core-actions">
-        <a class="btn primary" id="core-download" href="${PKG_URL}" download="mandelbrot-core.zip">
-          ${t('coreDownload')}<span style="opacity:.6;font-size:11px">· ${sizeLabel(PKG_BYTES)}</span>
-        </a>
+        <a class="btn primary" id="core-download" href="${RELEASES_URL}"
+           target="_blank" rel="noopener noreferrer">${t('coreDownload')}</a>
         <button class="btn" id="core-copy">${t('coreCopy')}</button>
         <button class="btn ghost" id="core-retry">${t('coreRetry')}</button>
       </div>
@@ -102,19 +80,4 @@ export function openCorePanel(ui) {
       openCorePanel(ui);
     };
   }
-
-  // Reflect the real archive size once the cache is warm.
-  warmCache().then(async () => {
-    const el = document.getElementById('core-download');
-    if (!el) return;
-    try {
-      const cache = await caches.open(CACHE_NAME);
-      const res = await cache.match(PKG_URL);
-      const len = res && res.headers.get('content-length');
-      if (len) {
-        const span = el.querySelector('span');
-        if (span) span.textContent = '· ' + sizeLabel(Number(len));
-      }
-    } catch { /* ignore */ }
-  });
 }

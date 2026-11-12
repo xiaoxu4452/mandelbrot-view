@@ -89,7 +89,24 @@ function pickReference(job, bits) {
    * forces the whole view onto the glitch fallback, which is what produced
    * the black blobs and speckle noise of the previous build.  We therefore
    * probe a 5×5 grid (centre first) and keep the longest-lived candidate,
-   * preferring a point that never escapes inside the iteration budget. */
+   * preferring a point that never escapes inside the iteration budget.
+   *
+   * Two stages, because the probe only needs to *rank* the candidates and the
+   * ranking is settled long before the budget runs out.  A full high-precision
+   * orbit of every candidate cost 25 x maxIter BigInt steps — at 2^-57 with a
+   * 20k budget that alone was the tens of seconds, and it happened again in
+   * every worker.  Stage 1 runs each candidate for `probeCap` iterations
+   * (1k is far past the point where the ordering is fixed) and keeps the top
+   * few; stage 2 builds those at the full budget and keeps the winner.  Three
+   * full orbits instead of twenty-five, same answer: a candidate that escapes
+   * at 1500 and one that never escapes look identical to a 1k probe, so the
+   * probe's "best" is not trusted on its own.
+   *
+   * Stopping the probe at the first non-escaping candidate was worse than it
+   * looks: at 2^-46 the centre survives 1k but escapes at 3089 while a corner
+   * survives the whole budget, and the early break picked the centre — 19k of
+   * 57k pixels came back as perturbation glitches and the frame was a mosaic. */
+  const probeCap = Math.min(maxIter, 1024);
   const cands = [];
   const G = 5;
   for (let j = 0; j < G; j++) {
@@ -98,7 +115,7 @@ function pickReference(job, bits) {
   cands.sort((a, b) =>
     Math.hypot(a[0] - 0.5, a[1] - 0.5) - Math.hypot(b[0] - 0.5, b[1] - 0.5));
 
-  let best = null;
+  const probe = [];
   for (const [fx, fy] of cands) {
     const px = fx * width, py = fy * height;
     const ox = (px + 0.5 - width * 0.5) * ps;
@@ -107,7 +124,7 @@ function pickReference(job, bits) {
       re: offsetCoord(job.center.re, ox, bits),
       im: offsetCoord(job.center.im, oy, bits)
     };
-    const orb = buildReferenceOrbit(spec, centerHP, bits, maxIter, BAIL2);
+    const orb = buildReferenceOrbit(spec, centerHP, bits, probeCap, BAIL2);
     /* refPx/refPy live in coordinate space: pixel (px, py) is sampled at
      * px + 0.5, which is exactly where centerHP was just placed.  Storing px
      * instead shifted the whole perturbation layer half a pixel against the
@@ -116,13 +133,28 @@ function pickReference(job, bits) {
     orb.refPx = px + 0.5;
     orb.refPy = py + 0.5;
     orb.centerHP = centerHP;
-    orb.lifetime = orb.escaped ? orb.len : maxIter;
-    if (!best || orb.lifetime > best.lifetime) best = orb;
-    // An interior point is the ideal reference: stop immediately.
-    if (!orb.escaped) break;
-    // Good enough: within 2% of the iteration budget.
-    if (best.lifetime > maxIter * 0.98) break;
+    orb.lifetime = orb.escaped ? orb.len : probeCap;
+    probe.push(orb);
   }
+  /* Survivors first (they may be interior), then the longest escapes.  The
+   * sort is stable, so among equals the centre-most candidate wins. */
+  probe.sort((a, b) => b.lifetime - a.lifetime);
+  const finals = probe.slice(0, Math.min(3, probe.length));
+
+  let best = null;
+  for (const cand of finals) {
+    if (probeCap >= maxIter) { best = cand; break; }   // nothing more to learn
+    const full = buildReferenceOrbit(spec, cand.centerHP, bits, maxIter, BAIL2);
+    full.refPx = cand.refPx;
+    full.refPy = cand.refPy;
+    full.centerHP = cand.centerHP;
+    full.lifetime = full.escaped ? full.len : maxIter;
+    if (!best || full.lifetime > best.lifetime) best = full;
+    // An interior reference is the ideal one: stop as soon as we have it, or
+    // once a candidate survives the entire budget.
+    if (!full.escaped || best.lifetime >= maxIter) break;
+  }
+  if (!best) best = finals[0];
   return best;
 }
 

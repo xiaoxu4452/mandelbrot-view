@@ -15,20 +15,53 @@ import { buildCustomEnvironment } from './customenv.js';
 import { buildReferenceOrbit } from './formulas.js';
 
 /* ---------- WASM memory layout ---------- */
-const OUT = 65536;
-const OUT_CAP = 256 * 256 * 4;
-const LUT_PTR = OUT + OUT_CAP;
-const PARAMS = LUT_PTR + 2048;
-const ROOTS = PARAMS + 512;
-const STATS = ROOTS + 256;            // 3 doubles written by the kernel: nMin, nMax, nMaxExceptCentre
-const GLITCH = ROOTS + 1024;          // int32 pairs (x, y) reported by the kernel
+/* The module is built by zig as `wasm32-freestanding`, so its shadow stack is
+ * reserved at the TOP of the module's *initial* linear memory and grows down
+ * from there.  That initial size is exactly 1 MiB, which means a 512x512 RGBA
+ * tile (also exactly 1 MiB) written at 64 KiB ran straight into the stack: the
+ * kernel's own spilled locals were replaced by pixel data, and every row after
+ * the collision was computed from a destroyed orbit state.  That is the dark
+ * horizontal band that appeared once per 512 px on the CPU path — the solver
+ * was not wrong, its workspace was being painted over.
+ *
+ * The fix is a layout invariant, not a magic constant: the tile slot starts at
+ * or above the module's initial memory size, so it can never overlap the stack,
+ * whatever the linker picks.  `INIT_BYTES` is read before the first grow. */
+let INIT_BYTES = 0;      // wasm initial memory (stack lives below this)
+let OUT = 65536;         // tile slot base; raised to INIT_BYTES in initWasm
+/* The kernel writes one tile as RGBA into linear memory, so this has to cover
+ * the largest tile the page asks for — and that is TILE = 512 (app.js), i.e.
+ * 1 MiB, not the 256x256 this used to reserve.  With the smaller buffer the
+ * guard below (`job.w * job.h * 4 > OUT_CAP`) was true for *every* tile of a
+ * real canvas, so the CPU path silently ran the JS kernel and never touched
+ * WebAssembly at all: 1.7 s a frame on a 2560x1600 canvas with the HUD
+ * reporting "JS". */
+const OUT_CAP = 512 * 513 * 4;   // one spare row: never let a tile write into the LUT
+let LUT_PTR = 0;
+let PARAMS = 0;
+let ROOTS = 0;
+let STATS = 0;                        // 3 doubles written by the kernel: nMin, nMax, nMaxExceptCentre
+let GLITCH = 0;                       // int32 pairs (x, y) reported by the kernel
 const GLITCH_CAP = 8192;
-const ORBIT = GLITCH + GLITCH_CAP * 8;
+let ORBIT = 0;
+
+/** Lay the buffers out above the module's initial memory (see INIT_BYTES). */
+function layoutMemory() {
+  OUT = Math.max(65536, INIT_BYTES);
+  LUT_PTR = OUT + OUT_CAP;
+  PARAMS = LUT_PTR + 2048;
+  ROOTS = PARAMS + 512;
+  STATS = ROOTS + 256;
+  GLITCH = ROOTS + 1024;
+  ORBIT = GLITCH + GLITCH_CAP * 8;
+}
 
 let wasm = null;         // { render, memory }
 let heap = null;         // Uint8Array view
 let params = null;       // Float64Array view
 let memBytes = 0;
+/* Set by the one-shot workspace self-check in processJob (see there). */
+let layoutVerified = false;
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -43,7 +76,13 @@ async function initWasm() {
     const mod = await WebAssembly.compile(bytes);
     const inst = await WebAssembly.instantiate(mod, { env: { abort() { throw new Error('wasm abort'); } } });
     wasm = inst.exports;
-    growMem(1024 * 1024);
+    /* Must be read before the first grow: the module reserves its shadow stack
+     * at the top of this initial region, and `layoutMemory` keeps every buffer
+     * we own above it. */
+    INIT_BYTES = wasm.memory.buffer.byteLength;
+    layoutMemory();
+    /* Reserve the tile buffer up front; growMem() rounds up to whole pages. */
+    growMem(OUT_CAP + 1024 * 1024);
     return true;
   } catch (e) {
     console.warn('WASM unavailable, falling back to JS rendering', e);
@@ -66,10 +105,22 @@ function growMem(bytes) {
 /* ---------- Reference-orbit cache ---------- */
 let orbitCacheEntry = null;   // { key, ptr, len, stride, refPx, refPy }
 
+/* Identity of a *view*, not of a buffer.
+ *
+ * The reference orbit belongs to the plane region: same centre, same span, same
+ * iteration budget means the same orbit, no matter what resolution the pass is
+ * drawn at.  Width and height used to be part of this key, which made every
+ * pass of a progressive chain build its own orbit (the skeleton pass runs at
+ * 0.16x, the final at 1x) and made a tile dispatched after the next pass had
+ * started fall back to electing its own — visible as a seam exactly at that
+ * tile's edge, because each reference leaves its own glitch pattern.
+ *
+ * The reference *pixel* is therefore stored normalised (refU/refV) and scaled
+ * to the buffer at use time. */
 function viewKey(job, bits) {
   const s = job.spec;
   return [s.mode, s.kind, s.power, s.julia ? s.julia.re + ',' + s.julia.im : '',
-    job.center.re, job.center.im, job.span.m, job.span.e, job.width, job.height,
+    job.center.re, job.center.im, job.span.m, job.span.e,
     job.maxIter, bits, s.phoenixP, s.newtonDegree].join('|');
 }
 
@@ -117,9 +168,57 @@ function pickTileReference(job, bits) {
   return best;
 }
 
+/**
+ * Adopt the frame-wide environment computed by `prepareEnv` (see app.js).
+ *
+ * A deep pass used to be one viewport-sized tile, because every tile elected
+ * its own reference point and built its own high-precision orbit: a 512 px
+ * split multiplied that cost by the tile count and was slower than the single
+ * tile it replaced.  The page now builds the orbit *once* per view and ships
+ * the arrays with the job, so tiling is free again and the pool can split a
+ * deep frame like any other.
+ */
+function adoptEnv(job, env) {
+  const stride = env.stride;
+  const bytes = stride * (env.dd ? 32 : 16) + 64;
+  growMem(bytes + 1024);
+
+  const re = env.re instanceof Float64Array ? env.re : new Float64Array(env.re);
+  const im = env.im instanceof Float64Array ? env.im : new Float64Array(env.im);
+  heap.set(new Uint8Array(re.buffer, re.byteOffset, re.byteLength), ORBIT);
+  heap.set(new Uint8Array(im.buffer, im.byteOffset, im.byteLength), ORBIT + stride * 8);
+  if (env.dd) {
+    const reLo = env.reLo instanceof Float64Array ? env.reLo : new Float64Array(env.reLo);
+    const imLo = env.imLo instanceof Float64Array ? env.imLo : new Float64Array(env.imLo);
+    heap.set(new Uint8Array(reLo.buffer, reLo.byteOffset, reLo.byteLength), ORBIT + stride * 16);
+    heap.set(new Uint8Array(imLo.buffer, imLo.byteOffset, imLo.byteLength), ORBIT + stride * 24);
+  }
+  return {
+    key: env.key, ptr: ORBIT, len: env.len, stride,
+    /* Normalised reference position: the same orbit serves every pass and
+     * every tile, whatever resolution the pass buffer is. */
+    refU: env.refU, refV: env.refV,
+    series: env.series, dd: !!env.dd, fromEnv: true,
+    src: { re, im, reLo: env.reLo, imLo: env.imLo }
+  };
+}
+
 function ensureOrbit(job, bits) {
   const key = viewKey(job, bits);
-  if (orbitCacheEntry && orbitCacheEntry.key === key) return orbitCacheEntry;
+  if (orbitCacheEntry && orbitCacheEntry.key === key) {
+    /* Same view, already built (this worker may even be the one that served
+     * the `prepare`).  If the page shipped its copy, adopt the flag so the
+     * tile reports the same provenance as its neighbours. */
+    if (job.env && job.env.key === key) orbitCacheEntry.fromEnv = true;
+    return orbitCacheEntry;
+  }
+  /* Frame-wide environment handed over by the page: no arithmetic needed, the
+   * orbit was already elected once for the whole view. */
+  if (job.env && job.env.key === key) {
+    orbitCacheEntry = adoptEnv(job, job.env);
+    orbitCacheEntry.fromEnv = true;
+    return orbitCacheEntry;
+  }
 
   self.postMessage({ type: 'stage', stage: 'orbit' });
   const orb = _internals.pickReference(job, bits);
@@ -163,7 +262,11 @@ function ensureOrbit(job, bits) {
 
   orbitCacheEntry = {
     key, ptr: ORBIT, len: orb.len, stride,
-    refPx: orb.refPx, refPy: orb.refPy, series, dd
+    refU: orb.refPx / job.width, refV: orb.refPy / job.height,
+    fromEnv: false, series, dd,
+    /* Kept so a `prepare` request can hand the arrays to the other workers
+     * without a second high-precision pass. */
+    src: { re: orbFull.re, im: orbFull.im, reLo: orbFull.reLo, imLo: orbFull.imLo }
   };
   return orbitCacheEntry;
 }
@@ -282,8 +385,10 @@ function setLut(palette, stops, supplied, key) {
   // A user-defined palette travels with its stops: the worker has no
   // localStorage, so the main thread ships the table definition in the job.
   if (stops) registerCustomPalette(palette, stops);
-  /* Exact LUT from the page wins: a palette registered only on the main
-   * thread does not exist in this module's registry. */
+  /* An exact 512x4 table from the page wins: palettes registered only on the
+   * main thread (imported additive presets) do not exist in this module's
+   * registry, where paletteLUT(id) would silently return Ice.  `key` keeps
+   * the upload to once per palette change, not once per tile. */
   let lut;
   if (supplied && supplied.length === 2048) {
     if (key === lutKey && lutBytes) return lutBytes;
@@ -298,6 +403,32 @@ function setLut(palette, stops, supplied, key) {
   lutBytes = lut;
   lutPalette = palette;
   return lut;
+}
+
+/* Split a high-precision decimal coordinate into (double, residual).
+ *
+ * The page stores the centre as a decimal string with up to 40 digits, but
+ * parseFloat() keeps only 53 bits.  The C++ double-double kernel (mode 3)
+ * needs the dropped digits: without them every deep folded-family view would
+ * start from a rounded centre and collapse onto a staircase.  The residual is
+ * the exact difference between the fixed-point value of the string and the
+ * fixed-point value of its double approximation.  Cached per string because
+ * setupParams() runs once per tile. */
+const splitCache = new Map();
+function splitCoord(str) {
+  const hi = Number(str) || 0;
+  if (!Number.isFinite(hi)) return [0, 0];
+  const cached = splitCache.get(str);
+  if (cached) return cached;
+  let lo = 0;
+  try {
+    const ctx = contextFor(256);
+    lo = ctx.toNumber(ctx.sub(ctx.fromString(str), ctx.fromNumber(hi)));
+  } catch { /* a non-decimal seed simply has no residual */ }
+  const out = [hi, Number.isFinite(lo) ? lo : 0];
+  if (splitCache.size > 256) splitCache.clear();
+  splitCache.set(str, out);
+  return out;
 }
 
 function setupParams(job, mode, extra) {
@@ -348,6 +479,10 @@ function setupParams(job, mode, extra) {
   p[41] = de.on === false ? 0 : 1;
   p[42] = de.width > 0 ? de.width : 1.0;
   p[43] = de.strength != null ? de.strength : 0.85;
+  /* 53 = field mode: emit the colour position instead of RGBA (see kernel.cpp).
+   * The page keeps this to re-shade a finished frame when only the palette
+   * changes. */
+  p[53] = job.asField ? 1 : 0;
   // Colour scheme (0 = palette bands, 1 = reference "Distance": black field,
   // one-pixel white rim).  Mirrors the native kernel's Request::scheme.
   p[44] = job.scheme === 1 ? 1 : 0;
@@ -368,7 +503,25 @@ function setupParams(job, mode, extra) {
      while emitting no glitches for the AddReference path.  KF's default method 0
      (detect glitch, add a reference) is what the worker's repair loop implements,
      so the kernel is left in "stop at orbit end + report glitch" mode. */
-  p[52] = 1;
+  /* KF singleref rebase is the kernel's escape hatch for a reference orbit
+   * that ends before the pixel does (|Z+dz|^2 < |dz|^2 restarts the local
+   * index at the pixel's own z).  It is normally OFF: the JS AddReference
+   * repair loop handles isolated glitches and is faster on healthy views.
+   * But when the elected orbit cannot survive the iteration budget —
+   * example-14 measured 78% glitched pixels and >130 s — that repair loop is
+   * asked to fix most of the frame with secondary orbits that are just as
+   * short.  Enable rebase for exactly those views, so no pixel is capped by
+   * refLen and no glitch storm is generated. */
+  const shortOrbit = mode === 1 && extra && extra.orbitLen > 0 &&
+                     extra.orbitLen < job.maxIter * 0.9;
+  p[52] = shortOrbit ? 0 : 1;
+  /* Double-double low words for the folded-family kernel (mode 3).  The
+   * high words live in p[10..14]; keeping the residuals in the same ABI means
+   * the C++ kernel never has to parse a decimal string. */
+  p[54] = splitCoord(job.center.re)[1];
+  p[55] = splitCoord(job.center.im)[1];
+  p[56] = spec.julia ? splitCoord(spec.julia.re)[1] : 0;
+  p[57] = spec.julia ? splitCoord(spec.julia.im)[1] : 0;
 }
 
 function renderWithWasm(job, mode, extra) {
@@ -421,6 +574,36 @@ function inpaintLeftovers(data, job, list, mask, count) {
   }
 }
 
+/**
+ * The pure-JS tile renderer, used for everything the kernel cannot express and
+ * as the fallback when the kernel faults.
+ *
+ * The fallback is not decoration: the kernel writes its pixels into a fixed
+ * buffer, and a trap inside it used to lose the tile outright — the pass never
+ * completed, the page sat on a half-drawn frame, and nothing said why.  A tile
+ * that cannot be produced in WebAssembly is now produced in JavaScript, once,
+ * and the kernel is retired for the rest of the session.
+ */
+function renderJsJob(job, bits, psLog2, t0, why) {
+  let extraJs = {};
+  if (job.spec.mode === 'x') {
+    const { fn, step, P } = customFnFor(job);
+    extraJs = { customFn: fn, customStep: step, customParams: P };
+  }
+  const r = renderTile({ ...job, resolvedBits: bits, ...extraJs });
+  return {
+    type: 'tile', id: job.id, viewId: job.viewId,
+    x: job.x, y: job.y, w: job.w, h: job.h,
+    data: r.data,
+    meta: {
+      mode: r.mode, bits, ms: performance.now() - t0,
+      glitches: r.glitches || 0, refLen: r.refLen || 0,
+      escMin: r.escMin, escMax: r.escMax, bounded: r.bounded,
+      engine: 'js', why: why || '', limited: bits < requiredBitsFromLog2(psLog2)
+    }
+  };
+}
+
 function processJob(job) {
   const t0 = performance.now();
   const ps = job.pixelSize;
@@ -448,48 +631,104 @@ function processJob(job) {
     };
   }
 
+  /* Folded families (tricorn / burning ship / celtic / perpendicular / phoenix)
+   * cannot share a z^p perturbation orbit — abs() and conjugation make the
+   * delta polynomial piecewise — but they DO have a C++ kernel: mode 3
+   * iterates in double-double.  Only views deeper than its ~106-bit reach
+   * still need the arbitrary-precision JavaScript path.  The old gate sent
+   * every one of them to JS past 2^-34, which is 10-100x slower. */
+  const foldedFamily = spec.mode !== 'x' && spec.mode !== 'n' &&
+    !(spec.kind === 'mandelbrot' || spec.kind === 'multibrot');
+  const DD_MIN_LOG2 = -88;              // 106-bit mantissa minus an 18-bit guard
+
   // JS path: deep zooms without perturbation support / no WASM
   const needJs =
     !wasm ||
     spec.mode === 'x' ||                   // custom formula (shallow: direct double precision)
     psLog2 < -16300 ||                     // beyond the 16384-bit desktop HP tier -> direct high precision
-    (bits > 64 && !(spec.kind === 'mandelbrot' || spec.kind === 'multibrot') && spec.mode !== 'n');
+    /* The kernel writes RGBA into one fixed buffer; a tile larger than its
+     * capacity would run past the end of linear memory (which is exactly how
+     * the old full-frame deep pass used to trap). */
+    job.w * job.h * 4 > OUT_CAP ||
+    (bits > 64 && foldedFamily && psLog2 < DD_MIN_LOG2);
 
-  if (needJs) {
-    let extraJs = {};
-    if (spec.mode === 'x') {
-      const { fn, step, P } = customFnFor(job);
-      extraJs = { customFn: fn, customStep: step, customParams: P };
-    }
-    const r = renderTile({ ...job, resolvedBits: bits, ...extraJs });
-    return {
-      type: 'tile', id: job.id, viewId: job.viewId,
-      x: job.x, y: job.y, w: job.w, h: job.h,
-      data: r.data,
-      meta: {
-        mode: r.mode, bits, ms: performance.now() - t0,
-        glitches: r.glitches || 0, refLen: r.refLen || 0,
-        escMin: r.escMin, escMax: r.escMax, bounded: r.bounded,
-        engine: 'js', limited: bits < requiredBitsFromLog2(psLog2)
-      }
-    };
-  }
+  if (needJs) return renderJsJob(job, bits, psLog2, t0);
 
   let mode = 0, extra = null;
   if (spec.mode === 'n') mode = 2;
-  else if (bits > 64) {
-    mode = 1;
-    const o = ensureOrbit(job, bits);
-    extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refPx, refPy: o.refPy, stride: o.stride, series: o.series, dd: o.dd };
+  /* Perturbation only earns its cost once the centre no longer fits in a
+   * double.  `bits > 64` alone was not that test: the tier list now returns 128
+   * for a shallow view (because 64 bits of *guard* is the reference's rule),
+   * and routing a 800x frame through a 128-bit reference orbit made it both
+   * slower and noisier than the plain double loop it replaced.  The threshold is
+   * where the direct kernel stops being exact, i.e. where the pixel is smaller
+   * than a double's ulp of the centre (~2^-52) — not -45, which was merely
+   * where the page used to split its passes.  Between -34 and -52 the direct
+   * path still ran a 128-bit integer loop per pixel: 1.6 s for a 1248x704 frame
+   * at 2^-42, against 200 ms with one reference orbit and double pixels. */
+  else if (bits > 64 && psLog2 <= -34) {
+    if (foldedFamily) {
+      /* C++ double-double direct: the whole orbit stays in WebAssembly, with
+       * the exact centre from p[54..57].  No glitch repair is needed because
+       * there is no reference orbit to diverge from. */
+      mode = 3;
+    } else {
+      mode = 1;
+      const o = ensureOrbit(job, bits);
+      /* The elected reference is stored normalised (see viewKey); the kernel
+       * wants it in this pass buffer's pixel grid. */
+      extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refU * job.width, refPy: o.refV * job.height,
+                stride: o.stride, series: o.series, dd: o.dd, fromEnv: !!o.fromEnv };
+    }
   }
 
   const lut = setLut(job.palette, job.paletteStops, job.paletteLUT, job.paletteKey);
-  const glitches = renderWithWasm(job, mode, extra);
+  /* Workspace self-check, run once per session (and on demand through
+   * `job.dbg`): paint the tail of this tile's slot before the render and see
+   * how much of the marker survives.  Any surviving byte means the kernel did
+   * not write that part of the slot — i.e. the layout invariant above
+   * (`OUT >= INIT_BYTES`, `OUT_CAP >= 512x512`) has been broken and pixels are
+   * again landing somewhere the solver does not own. */
+  const verify = job.dbg || !layoutVerified;
+  let tailMark = 0;
+  if (verify) {
+    tailMark = Math.min(64 * 1024, job.w * job.h * 4);
+    heap.fill(0xAB, OUT + job.w * job.h * 4 - tailMark, OUT + job.w * job.h * 4);
+  }
+  let glitches = 0;
+  try {
+    glitches = renderWithWasm(job, mode, extra);
+  } catch (e) {
+    /* A trap in the kernel must not cost the frame.  Retire it and render the
+     * tile in JS; the rest of the session keeps the working path. */
+    console.warn('wasm render failed, falling back to JS:', e && e.message);
+    wasm = null;
+    return renderJsJob(job, bits, psLog2, t0, 'wasm-trap');
+  }
+  let tailKept = -1;
+  if (tailMark) {
+    let kept = 0;
+    for (let i = OUT + job.w * job.h * 4 - tailMark; i < OUT + job.w * job.h * 4; i++)
+      if (heap[i] === 0xAB) kept++;
+    tailKept = kept;
+    if (!layoutVerified) {
+      layoutVerified = true;
+      if (kept > 0) {
+        console.error(`[kernel] tile slot not fully written (${kept} bytes of ${tailMark}) — ` +
+                      `OUT=0x${OUT.toString(16)} init=0x${INIT_BYTES.toString(16)} ` +
+                      `tile=${job.w}x${job.h}; the buffers overlap the wasm stack again`);
+      }
+    }
+  }
 
   const pixels = job.w * job.h;
   const bytes = pixels * 4;
-  const out = new Uint8ClampedArray(bytes);
-  out.set(heap.subarray(OUT, OUT + bytes));
+  /* Field mode returns one float per pixel (the colour position), same bytes
+   * as the RGBA it replaces — see kernel.cpp gField and app.js shadeField. */
+  const out = job.asField ? new Float32Array(pixels) : new Uint8ClampedArray(bytes);
+  const src8 = heap.subarray(OUT, OUT + bytes);
+  if (job.asField) new Uint8Array(out.buffer).set(src8);
+  else out.set(src8);
   /* KF frame statistics: nMin/nMax/nMaxExceptCentre of this tile, sampled
      from the escaped pixels.  The host aggregates them per pass and feeds the
      result back as the next pass's Stretched interval. */
@@ -504,7 +743,10 @@ function processJob(job) {
    * whole tiles in JavaScript (which used to cost an order of magnitude
    * and still left speckle noise behind). */
   let glitchFix = 0;
-  if (mode === 1 && glitches > 0) {
+  /* Glitch repair repaints RGBA; in field mode the buffer holds floats, so the
+   * repair pass is skipped and the glitched pixels keep their raw position
+   * (they are re-iterated on the next full render anyway). */
+  if (mode === 1 && glitches > 0 && !job.asField) {
     const n = Math.min(glitches, GLITCH_CAP);
     const list = new Int32Array(wasm.memory.buffer, GLITCH, n * 2);
     const dataView = new Uint8ClampedArray(wasm.memory.buffer, OUT, bytes);
@@ -521,14 +763,25 @@ function processJob(job) {
   return {
     type: 'tile', id: job.id, viewId: job.viewId,
     x: job.x, y: job.y, w: job.w, h: job.h,
+    /* The pass buffer this tile belongs to: the page needs it to place a field
+     * tile inside the frame-wide colour-position buffer. */
+    width: job.width, height: job.height,
     data: out,
     meta: {
-      mode: mode === 0 ? 'direct' : mode === 1 ? 'perturb' : 'newton',
+      mode: mode === 0 ? 'direct' : mode === 1 ? 'perturb'
+            : mode === 2 ? 'newton' : 'dd-direct',
       bits, ms: performance.now() - t0,
       glitches, glitchFix, refLen: extra ? extra.orbitLen : 0,
+      /* 'env' = the frame-wide orbit came from the page; 'own' = this tile
+       * elected its own.  A deep frame must be all 'env', or tiles disagree at
+       * their boundaries (each reference has its own glitch pattern). */
+      refSrc: extra ? (extra.fromEnv ? 'env' : 'own') : '-',
       saSkip: extra && extra.series ? extra.series.skip : 0,
       engine: 'wasm', limited: bits < requiredBitsFromLog2(psLog2),
-      stats
+      /* True when this tile carries colour positions instead of RGBA
+       * (kernel.cpp gField): the page shades them and keeps them for re-shading. */
+      field: !!job.asField,
+      stats, tailKept, tileH: job.h, tileW: job.w
     }
   };
 }
@@ -549,6 +802,36 @@ self.onmessage = async (e) => {
       self.postMessage(res, [res.data.buffer]);
     } catch (err) {
       self.postMessage({ type: 'error', id: msg.job.id, message: String(err && err.stack || err) });
+    }
+  } else if (msg.type === 'prepare') {
+    /* Build the reference orbit for a whole frame and hand it back, so every
+     * worker that renders a tile of that frame can adopt it instead of paying
+     * for its own election.  See adoptEnv(). */
+    await ready;
+    try {
+      const job = msg.job;
+      const psLog2 = job.psLog2 != null ? job.psLog2 : Math.log2(job.pixelSize);
+      const bits = resolveBitsFromLog2(job.bits, psLog2);
+      const o = ensureOrbit(job, bits);
+      const s = o.src || {};
+      /* Copies, not transfers.  These arrays are render.js's own cached
+       * reference orbit; transferring them would detach that cache entry and
+       * the next build would throw "Construct on a detached ArrayBuffer". */
+      const out = {
+        type: 'env', id: msg.id, key: o.key,
+        len: o.len, stride: o.stride, refU: o.refU, refV: o.refV,
+        dd: !!o.dd, series: o.series || null,
+        re: s.re ? s.re.slice() : null,
+        im: s.im ? s.im.slice() : null,
+        reLo: o.dd && s.reLo ? s.reLo.slice() : null,
+        imLo: o.dd && s.imLo ? s.imLo.slice() : null
+      };
+      self.postMessage(out);
+      /* The orbit stays valid in this worker, so the first tile it renders
+       * adopts the page's copy and copies it back over live memory — cheap,
+       * and it keeps the two paths on exactly the same data. */
+    } catch (err) {
+      self.postMessage({ type: 'env', id: msg.id, error: String(err && err.message || err) });
     }
   } else if (msg.type === 'resetOrbit') {
     orbitCacheEntry = null;

@@ -20,7 +20,9 @@
  *   2. the point under the pointer              (mode 1, "follow")
  *   3. the main view's centre                   (nothing picked yet)
  * ----------------------------------------------------------------*/
-import { FieldRenderer } from './gpu.js';
+import { SceneRenderer, lutFor } from './glscene.js';
+import { paletteLUT } from './palettes.js';
+import { putColor, shadeSmooth } from './drawlib.js';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const $ = (id) => document.getElementById(id);
@@ -82,7 +84,7 @@ function juliaField(w, h, o) {
 export function initJuliaView(opts) {
   const {
     mainCanvas, getScheme, screenToPlane, planeToScreen, getCenter, t,
-    getLang, onLog, onOpen, onBack
+    getLang, onLog, onOpen, onBack, getPalette, getCycle, getOffset
   } = opts;
 
   const wrap = $('julia-preview');
@@ -92,7 +94,27 @@ export function initJuliaView(opts) {
   const mark = $('julia-mark');
   if (!wrap || !view) return { redraw() {}, pickAt() { return false; }, isPicking() { return false; }, syncUi() {} };
 
-  const renderer = new FieldRenderer(view);
+  /* The dock renders in a fragment shader, exactly like the main view: one
+   * full-screen triangle, every pixel iterates its own orbit on the GPU.  The
+   * previous version built a Float32 field on the CPU first, and — because it
+   * also required the main view's GLSL scheme source — it drew nothing at all
+   * whenever the palette was one of the built-in ones.  A missing `o.src` was
+   * silently a black window.
+   *
+   * FieldRenderer is kept only as an escape hatch: if WebGL2 is unavailable
+   * the orbit is iterated in JS and the palette is baked into an ImageData. */
+  let sr = null;
+  try {
+    const gl = view.getContext('webgl2', {
+      alpha: false, antialias: false, depth: false, stencil: false,
+      premultipliedAlpha: false,
+      /* PNG export and gesture snapshots draw this canvas through the 2D path. */
+      preserveDrawingBuffer: true,
+      powerPreference: 'high-performance'
+    });
+    if (gl) sr = new SceneRenderer(gl);
+  } catch { sr = null; }
+  const useGl = !!(sr && sr.ok);
   let visible = true;
   let follow = true;                      // pointer hover re-seeds (reference mode 1)
   let picking = false;                    // waiting for a click on the canvas
@@ -190,57 +212,72 @@ export function initJuliaView(opts) {
     updateMark();
   }
 
+  /* CPU escape hatch (no WebGL2 at all): iterate here, bake the palette into
+   * an ImageData.  Not a second rendering path to keep in sync — it only ever
+   * runs on a browser that cannot compile the shader. */
+  function cpuDraw(c, W, H, maxIter, pal, cycle, offset) {
+    const g2 = view.getContext('2d');
+    if (!g2) return false;
+    const field = juliaField(W, H, {
+      seedRe: c.re, seedIm: c.im,
+      centerRe: center.re, centerIm: center.im,
+      span: 2.0 / zoom, rotation, maxIter
+    });
+    if (view.width !== W || view.height !== H) { view.width = W; view.height = H; }
+    const lut = paletteLUT(pal);
+    const img = g2.createImageData(W, H);
+    const d = img.data;
+    for (let i = 0, p = 0; i < W * H; i++, p += 4) {
+      const it = field[p];
+      if (it < 0) { d[p] = 5; d[p + 1] = 6; d[p + 2] = 9; d[p + 3] = 255; continue; }
+      putColor(lut, shadeSmooth(it, cycle, offset), d, p);
+    }
+    g2.putImageData(img, 0, 0);
+    return true;
+  }
+
   function redraw(force = false) {
-    if (!visible || !renderer.ok) { syncUi(); return; }
-    const o = getScheme ? getScheme() : null;
-    if (!o || !o.src) return;             // main GPU pass has not run yet
+    if (!visible) { syncUi(); return; }
     const c = seedValues();
     /* The reference keeps the Julia view's own centre (julia_x/y, normally
      * the origin) and its own zoom, independent of the Mandelbrot view. */
     const W = dim(), H = W;
     /* Deeper Julia zooms need more iterations; 160 covers the default 0.5. */
     const maxIter = Math.round(clamp(160 + 90 * Math.log2(Math.max(1, zoom)), 140, 2400));
+    /* Colour comes from the main view's live palette, so a slider or a preset
+     * changes both windows together.  A preset's own scheme (a codegl program
+     * with its own uniforms) is still honoured when the main view is on one:
+     * that is the only case the dock cannot reproduce from the LUT. */
+    const pal = (getPalette && getPalette()) || 'ice';
+    const cycle = Math.max(2, (getCycle && getCycle()) || 140);
+    const offset = (getOffset && getOffset()) || 0;
     const key = [c.re, c.im, center.re, center.im, zoom, rotation, maxIter,
-                 o.src.length, o.param.join(','), o.colors.length,
-                 o.stops.length, W].join('|');
+                 pal, cycle, offset, W, force ? 1 : 0].join('|');
     if (!force && key === lastKey) { syncUi(); return; }
     lastKey = key;
 
-    const field = juliaField(W, H, {
-      seedRe: c.re, seedIm: c.im,
-      centerRe: center.re, centerIm: center.im,
-      span: 2.0 / zoom,
-      rotation,
-      maxIter
-    });
-    /* The reference ships samples = 2 and so does this window; a 168px field
-     * is cheap enough that supersampling costs nothing noticeable. */
-    const err = renderer.setScheme(o.src, Math.min(2, Math.max(1, o.samples | 0 || 1)));
-    if (err) {
-      if (onLog) onLog('[julia] shader: ' + String(err).slice(0, 240));
+    if (useGl) {
+      if (view.width !== W || view.height !== H) { view.width = W; view.height = H; }
+      sr.setPalette(lutFor(pal), pal);
+      const r = sr.draw({
+        /* uniforms.julia / uniforms.j — z0 is the pixel, c is the seed. */
+        julia: true,
+        seedRe: c.re, seedIm: c.im,
+        centerRe: center.re, centerIm: center.im,
+        pixel: (2.0 / zoom) / W,
+        rot: rotation,
+        width: W, height: H,
+        maxIter,
+        power: 2, kind: 0,
+        cycle, offset,
+        samples: 2,
+        phoenix: 0.5667
+      });
+      if (!r.ok && onLog) onLog('[julia] ' + r.why);
+      syncUi();
       return;
     }
-    renderer.uploadField(field, W, H);
-    renderer.resize(W, H);
-    const ps = (2.0 / zoom) / W;
-    renderer.draw({
-      colors: o.colors,
-      stops: o.stops,
-      briFinite: o.briFinite,
-      briInfinite: o.briInfinite,
-      briFactor: o.briFactor,
-      param: o.param,
-      /* uniforms.julia / uniforms.j — the seed that selected this Julia set. */
-      julia: true,
-      juliaRe: c.re, juliaIm: c.im,
-      centerRe: center.re, centerIm: center.im,
-      scaleX: ps * Math.cos(rotation),
-      scaleY: ps * Math.sin(rotation),
-      /* Same tone stage as the main view: the small window is a second look at
-       * the same picture, so it must not drift away when a slider moves. */
-      tone: o.tone,
-      inverse: false
-    });
+    cpuDraw(c, W, H, maxIter, pal, cycle, offset);
     syncUi();
   }
 

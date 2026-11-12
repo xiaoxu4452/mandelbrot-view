@@ -405,6 +405,32 @@ function setLut(palette, stops, supplied, key) {
   return lut;
 }
 
+/* Split a high-precision decimal coordinate into (double, residual).
+ *
+ * The page stores the centre as a decimal string with up to 40 digits, but
+ * parseFloat() keeps only 53 bits.  The C++ double-double kernel (mode 3)
+ * needs the dropped digits: without them every deep folded-family view would
+ * start from a rounded centre and collapse onto a staircase.  The residual is
+ * the exact difference between the fixed-point value of the string and the
+ * fixed-point value of its double approximation.  Cached per string because
+ * setupParams() runs once per tile. */
+const splitCache = new Map();
+function splitCoord(str) {
+  const hi = Number(str) || 0;
+  if (!Number.isFinite(hi)) return [0, 0];
+  const cached = splitCache.get(str);
+  if (cached) return cached;
+  let lo = 0;
+  try {
+    const ctx = contextFor(256);
+    lo = ctx.toNumber(ctx.sub(ctx.fromString(str), ctx.fromNumber(hi)));
+  } catch { /* a non-decimal seed simply has no residual */ }
+  const out = [hi, Number.isFinite(lo) ? lo : 0];
+  if (splitCache.size > 256) splitCache.clear();
+  splitCache.set(str, out);
+  return out;
+}
+
 function setupParams(job, mode, extra) {
   const spec = job.spec;
   const p = params;
@@ -477,7 +503,25 @@ function setupParams(job, mode, extra) {
      while emitting no glitches for the AddReference path.  KF's default method 0
      (detect glitch, add a reference) is what the worker's repair loop implements,
      so the kernel is left in "stop at orbit end + report glitch" mode. */
-  p[52] = 1;
+  /* KF singleref rebase is the kernel's escape hatch for a reference orbit
+   * that ends before the pixel does (|Z+dz|^2 < |dz|^2 restarts the local
+   * index at the pixel's own z).  It is normally OFF: the JS AddReference
+   * repair loop handles isolated glitches and is faster on healthy views.
+   * But when the elected orbit cannot survive the iteration budget —
+   * example-14 measured 78% glitched pixels and >130 s — that repair loop is
+   * asked to fix most of the frame with secondary orbits that are just as
+   * short.  Enable rebase for exactly those views, so no pixel is capped by
+   * refLen and no glitch storm is generated. */
+  const shortOrbit = mode === 1 && extra && extra.orbitLen > 0 &&
+                     extra.orbitLen < job.maxIter * 0.9;
+  p[52] = shortOrbit ? 0 : 1;
+  /* Double-double low words for the folded-family kernel (mode 3).  The
+   * high words live in p[10..14]; keeping the residuals in the same ABI means
+   * the C++ kernel never has to parse a decimal string. */
+  p[54] = splitCoord(job.center.re)[1];
+  p[55] = splitCoord(job.center.im)[1];
+  p[56] = spec.julia ? splitCoord(spec.julia.re)[1] : 0;
+  p[57] = spec.julia ? splitCoord(spec.julia.im)[1] : 0;
 }
 
 function renderWithWasm(job, mode, extra) {
@@ -587,6 +631,16 @@ function processJob(job) {
     };
   }
 
+  /* Folded families (tricorn / burning ship / celtic / perpendicular / phoenix)
+   * cannot share a z^p perturbation orbit — abs() and conjugation make the
+   * delta polynomial piecewise — but they DO have a C++ kernel: mode 3
+   * iterates in double-double.  Only views deeper than its ~106-bit reach
+   * still need the arbitrary-precision JavaScript path.  The old gate sent
+   * every one of them to JS past 2^-34, which is 10-100x slower. */
+  const foldedFamily = spec.mode !== 'x' && spec.mode !== 'n' &&
+    !(spec.kind === 'mandelbrot' || spec.kind === 'multibrot');
+  const DD_MIN_LOG2 = -88;              // 106-bit mantissa minus an 18-bit guard
+
   // JS path: deep zooms without perturbation support / no WASM
   const needJs =
     !wasm ||
@@ -596,7 +650,7 @@ function processJob(job) {
      * capacity would run past the end of linear memory (which is exactly how
      * the old full-frame deep pass used to trap). */
     job.w * job.h * 4 > OUT_CAP ||
-    (bits > 64 && !(spec.kind === 'mandelbrot' || spec.kind === 'multibrot') && spec.mode !== 'n');
+    (bits > 64 && foldedFamily && psLog2 < DD_MIN_LOG2);
 
   if (needJs) return renderJsJob(job, bits, psLog2, t0);
 
@@ -613,12 +667,19 @@ function processJob(job) {
    * path still ran a 128-bit integer loop per pixel: 1.6 s for a 1248x704 frame
    * at 2^-42, against 200 ms with one reference orbit and double pixels. */
   else if (bits > 64 && psLog2 <= -34) {
-    mode = 1;
-    const o = ensureOrbit(job, bits);
-    /* The elected reference is stored normalised (see viewKey); the kernel
-     * wants it in this pass buffer's pixel grid. */
-    extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refU * job.width, refPy: o.refV * job.height,
-              stride: o.stride, series: o.series, dd: o.dd, fromEnv: !!o.fromEnv };
+    if (foldedFamily) {
+      /* C++ double-double direct: the whole orbit stays in WebAssembly, with
+       * the exact centre from p[54..57].  No glitch repair is needed because
+       * there is no reference orbit to diverge from. */
+      mode = 3;
+    } else {
+      mode = 1;
+      const o = ensureOrbit(job, bits);
+      /* The elected reference is stored normalised (see viewKey); the kernel
+       * wants it in this pass buffer's pixel grid. */
+      extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refU * job.width, refPy: o.refV * job.height,
+                stride: o.stride, series: o.series, dd: o.dd, fromEnv: !!o.fromEnv };
+    }
   }
 
   const lut = setLut(job.palette, job.paletteStops, job.paletteLUT, job.paletteKey);
@@ -707,7 +768,8 @@ function processJob(job) {
     width: job.width, height: job.height,
     data: out,
     meta: {
-      mode: mode === 0 ? 'direct' : mode === 1 ? 'perturb' : 'newton',
+      mode: mode === 0 ? 'direct' : mode === 1 ? 'perturb'
+            : mode === 2 ? 'newton' : 'dd-direct',
       bits, ms: performance.now() - t0,
       glitches, glitchFix, refLen: extra ? extra.orbitLen : 0,
       /* 'env' = the frame-wide orbit came from the page; 'own' = this tile
