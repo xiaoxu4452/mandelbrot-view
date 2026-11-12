@@ -78,7 +78,10 @@ const state = {
    * iteration), so a slow ramp period is what makes the colours keep moving
    * as the view zooms instead of the same bands being rescaled to the frame.
    * 140 iterations per cycle is its 0.045 rad/iteration. */
-  palette: 'orchid',
+  /* Ice blue is the front door: it is the scheme this renderer was tuned
+   * against, and a violet default made every new session look "wrong" before
+   * the user had touched anything.  Presets still carry their own palettes. */
+  palette: 'ice',
   scheme: 'bands',      // 'bands' = smooth palette bands (vivid, default); 'distance' = rim-only
   /* A GLSL `vec4 color(Data)` body imported from a reference preset's
    * `parameters.colorscheme.codegl`.  When set it replaces the built-in
@@ -206,13 +209,25 @@ const SCENE_KIND = {
   mandelbrot: 0, multibrot: 0, tricorn: 1, burningship: 2,
   celtic: 3, perpendicular: 4, phoenix: 5
 };
-/* 1e-6 plane units per pixel: at 2000 px that is a 2e-3 wide frame.  Above it
- * the shader's double-float coordinates are exact enough that a committed
- * frame is indistinguishable from the CPU's. */
-const SCENE_MIN_PIXEL = 1e-6;
-/* Past this one frame stops being interactive; the CPU path has the series
- * approximation that makes those views affordable. */
-const SCENE_MAX_ITER = 20000;
+/* Reach of the two fragment programs.
+ *
+ * `fast` iterates in float32, `df64` in double-float (48-bit mantissa, ~1e-14
+ * relative).  The old 1e-6 gate was eight orders of magnitude short of what
+ * df64 actually delivers, so from ~1000x zoom onwards the page refused the
+ * shader for *everything* — including a palette change, which then re-ran the
+ * whole frame on the CPU (measured 5.5 s at 2^-30).  That is the stutter on
+ * "switch a colour / switch a fractal". */
+const SCENE_MIN_PIXEL = 1.2e-14;
+/* Two limits, because a paint is not the same budget as a gesture:
+ *
+ *   · pixels x iterations — what one fragment pass actually costs.  A deep
+ *     view is happy to spend a couple of seconds on a committed frame, but a
+ *     pointer event that spends that per move drops the gesture entirely.
+ *   · maxIter — the kernel's own loop cap; past it the SA/perturbation path
+ *     on the CPU is the only one that finishes. */
+const SCENE_MAX_COST = 2.0e10;  // committed frame
+const SCENE_LIVE_COST = 4.0e8;   // one draw per input event
+const SCENE_MAX_ITER = 4000;
 let sceneLast = null;            // last view the scene drew
 let sceneResult = null;          // { program, ms } of the last scene draw
 let sceneFail = '';              // why the shader last declined
@@ -268,9 +283,12 @@ function scenePaletteKey() {
 /** Draw the current view with the shader.  Returns true when it painted. */
 function sceneDraw(v, opts = {}) {
   if (!v) return false;
-  if (opts.final) {
-    if (v.maxIter > SCENE_MAX_ITER) { sceneFail = 'iter'; return false; }
-    if (v.pixel < SCENE_MIN_PIXEL) { sceneFail = 'depth'; return false; }
+  if (v.pixel < SCENE_MIN_PIXEL) { sceneFail = 'depth'; return false; }
+  if (v.maxIter > SCENE_MAX_ITER) { sceneFail = 'iter'; return false; }
+  const cost = Math.max(1, v.width | 0) * Math.max(1, v.height | 0) * (v.maxIter | 0);
+  if (cost > (opts.final ? SCENE_MAX_COST : SCENE_LIVE_COST)) {
+    sceneFail = opts.final ? 'cost' : 'cost-live';
+    return false;
   }
   glCanvas.width = v.width;
   glCanvas.height = v.height;
@@ -485,6 +503,7 @@ let wasmEnabled = null;
 const mainQueue = [];
 const thumbQueue = [];
 let pending = 0;
+let envSeq = 0;
 
 function initWorkers() {
   // The desktop shell computes in C++ and only needs one worker as a fallback
@@ -560,6 +579,95 @@ function cancelRemote() {
   remoteQueue.length = 0;
 }
 
+/* ---------------- Frame-wide reference environment ----------------
+ *
+ * A deep frame has one reference orbit, not one per tile.  Electing it costs a
+ * high-precision pass over the whole iteration budget; letting every worker do
+ * that for every tile is why splitting a 2^-57 view into 512 px tiles was
+ * *slower* than rendering it as a single gigantic tile — and why that single
+ * tile (over the kernel's 1 MiB slot) fell back to JavaScript and froze the
+ * page for minutes.
+ *
+ * So the page builds it once, keeps the arrays, and ships them with every tile
+ * of that view; each worker copies them into its own orbit slot.  The transfer
+ * happens once per worker per view (`rec.envSig`), not once per tile.
+ */
+let sharedEnv = null;      // { sig, payload } — payload is what workers adopt
+let envPreparing = null;   // signature currently being built
+let envShareBroken = false; // set after a failed prepare: fall back for good
+
+/* Content signature of a view: the same fields the worker's own `viewKey`
+ * hashes — and deliberately *not* the pass buffer size, because the reference
+ * orbit belongs to the plane region, not to a resolution.  Hashing the buffer
+ * made every pass of a progressive chain rebuild it, and a tile dispatched
+ * after the next pass had started fell back to electing its own reference,
+ * which is visible as a seam at exactly that tile's edge. */
+function envSigFor(payload) {
+  const s = payload.spec;
+  return [s.mode, s.kind, s.power,
+    s.julia ? s.julia.re + ',' + s.julia.im : '',
+    payload.center.re, payload.center.im, payload.span.m, payload.span.e,
+    payload.maxIter, payload.bits].join('|');
+}
+
+/* Can this view use the shared environment at all?  The JS high-precision path
+ * (custom formulas, bit depths past the kernel's tier) owns its orbit cache in
+ * render.js and is not wired to adopt one, so those views keep the single-tile
+ * deep pass. */
+function envShareable(spec, psLog2) {
+  if (NATIVE || wasmEnabled === false || envShareBroken) return false;
+  /* The out-of-browser core takes tiles over HTTP as JSON, and the orbit is
+   * megabytes of doubles — shipping it per tile would cost more than building
+   * it.  Its deep passes keep the single-tile shape until it can cache orbits
+   * server-side. */
+  if (remoteEnabled()) return false;
+  if (!spec) return false;
+  if (spec.mode === 'x') return false;                 // custom expression
+  if (psLog2 < -16300) return false;                   // beyond the kernel's tiers
+  if (spec.mode === 'n') return true;                  // Newton
+  return spec.kind === 'mandelbrot' || spec.kind === 'multibrot';
+}
+
+function prepareEnv(payload, sig, done) {
+  const rec = workers.find(w => w.ready && !w.busy) || workers.find(w => w.ready) || workers[0];
+  if (!rec) { done(null); return; }
+  rec.busy = true;
+  const id = `env${++envSeq}`;
+  const timer = setTimeout(() => {
+    if (rec.envJob !== id) return;
+    rec.envJob = null; rec.envWait = null; rec.busy = false;
+    envShareBroken = true;
+    console.warn('[env] prepare timed out; deep tiles fall back to per-tile orbits');
+    done(null); pump();
+  }, 120000);
+  rec.envJob = id;
+  rec.envWait = (msg) => {
+    clearTimeout(timer);
+    rec.envJob = null;
+    rec.busy = false;
+    if (msg.error || !msg.re) {
+      /* One failure is enough: never loop (a re-entered runPass would ask for
+       * the same environment again), and never leave the frame unrendered. */
+      envShareBroken = true;
+      console.warn('[env] prepare failed: ' + (msg.error || 'no orbit arrays') +
+                   ' — deep tiles will elect their own references');
+      done(null);
+    } else {
+      const env = {
+        key: msg.key, len: msg.len, stride: msg.stride,
+        refU: msg.refU, refV: msg.refV, dd: !!msg.dd, series: msg.series,
+        re: msg.re, im: msg.im, reLo: msg.reLo, imLo: msg.imLo
+      };
+      sharedEnv = { sig, payload: env };
+      console.info(`[env] orbit len=${msg.len} dd=${msg.dd ? 1 : 0} ` +
+                   `sa=${msg.series ? msg.series.skip : 0} — shared by all tiles`);
+      done(env);
+    }
+    pump();
+  };
+  rec.w.postMessage({ type: 'prepare', id, job: payload });
+}
+
 function dispatch(job) {
   // User palettes carry their stop table with the job: workers / the remote
   // renderer never read localStorage, so the definition must travel along.
@@ -585,6 +693,14 @@ function dispatchLocal(job) {
   }
   const rec = idleWorker();
   if (!rec) { (job.thumb ? thumbQueue : mainQueue).push(job); return false; }
+  /* Deep tile of a frame whose reference orbit is already built: hand the
+   * arrays over the first time this worker sees the view.  Structured clone
+   * copies them, so the page keeps its own for the remaining tiles. */
+  if (job.envSig && sharedEnv && sharedEnv.sig === job.envSig &&
+      rec.envSig !== job.envSig && !job.env) {
+    job.payload.env = sharedEnv.payload;
+    rec.envSig = job.envSig;
+  }
   rec.busy = true;
   pending++;
   rec.w.postMessage({ type: 'render', job: job.payload });
@@ -602,6 +718,12 @@ function pump() {
 }
 
 function onWorkerMessage(rec, msg) {
+  if (msg.type === 'env') {
+    const wait = rec.envWait;
+    rec.envWait = null;
+    if (wait) wait(msg);
+    return;
+  }
   if (msg.type === 'ready') {
     rec.ready = true;
     if (wasmEnabled === null) {
@@ -1315,6 +1437,87 @@ function effectiveCycle() {
 }
 
 /** Draw one pass of tiles onto the canvas: low-resolution passes are smoothly upscaled so no mosaic blocks appear */
+/* ---------------- Colour-position field ----------------
+ *
+ * The CPU pass can hand back the *colour position* of every pixel instead of
+ * its RGBA (kernel.cpp `gField`, worker.js `job.asField`).  The palette is the
+ * only thing that turns a position into a colour, so a palette change does not
+ * invalidate a single iteration: re-shading a finished frame costs one table
+ * lookup per pixel instead of the whole render.
+ *
+ * Measured at 2^-30 (2496x1408): 5.5 s for the CPU re-render it replaces,
+ * ~45 ms to re-shade.  The cache is keyed on everything that *does* move a
+ * pixel's position — the view, the iteration budget, cycle/offset/bands and
+ * the shade policy — but deliberately not on the palette itself.
+ */
+let fieldCaptureOn = true; // debug switch: __mb.field(false) renders straight to RGBA
+let fieldCache = null;     // { key, w, h, data: Float32Array }
+let fieldBuild = null;     // the final pass of the current render, accumulating
+
+function fieldKeyNow() {
+  return [state.center.re, state.center.im, state.span.m, state.span.e,
+    effectiveIterTotal(), effectiveCycle(), state.offset, state.bands,
+    state.shade, state.spec.mode, state.spec.kind, state.spec.power,
+    state.spec.julia ? state.spec.julia.re + ',' + state.spec.julia.im : '',
+    state.traps, state.aa, state.bits, state.glsl ? 1 : 0,
+    canvas.width, canvas.height].join('|');
+}
+
+/** Shade `data` (one colour position per pixel, -1 = interior) into RGBA. */
+function shadeField(data, w, h, lut) {
+  const out = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0, n = w * h, o = 0; i < n; i++, o += 4) {
+    const u = data[i];
+    if (!(u >= 0)) { out[o] = 5; out[o + 1] = 6; out[o + 2] = 9; out[o + 3] = 255; continue; }
+    let x = u * 512;
+    let i0 = x | 0;
+    if (i0 > 511) i0 = 511;
+    const f = x - i0, j0 = (i0 + 1) & 511;
+    const a = i0 * 4, b = j0 * 4;
+    out[o] = lut[a] + (lut[b] - lut[a]) * f;
+    out[o + 1] = lut[a + 1] + (lut[b + 1] - lut[a + 1]) * f;
+    out[o + 2] = lut[a + 2] + (lut[b + 2] - lut[a + 2]) * f;
+    out[o + 3] = 255;
+  }
+  return out;
+}
+
+/** The 512-entry table the CPU path would use for the current colours. */
+function currentLut() {
+  const stops = customPaletteStops(state.palette) ||
+    (Array.isArray(state.stops) ? resampleStops(state.stops, 64) : null);
+  if (stops) registerCustomPalette(state.palette, stops);
+  return paletteLUT(state.palette);
+}
+
+/** Re-shade the cached field with the current palette.  False = render. */
+function reshadeFromField() {
+  if (!fieldCache) return false;
+  if (fieldCache.key !== fieldKeyNow()) return false;
+  const t0 = performance.now();
+  const rgba = shadeField(fieldCache.data, fieldCache.w, fieldCache.h, currentLut());
+  composeTile(ctx, { canvas: tileCv, ctx: tileCtx },
+    { x: 0, y: 0, w: fieldCache.w, h: fieldCache.h, data: rgba },
+    fieldCache.w / canvas.width);
+  lastMeta = Object.assign({}, lastMeta, { ms: performance.now() - t0, engine: 'reshade' });
+  frameSeq++;
+  updateHud(true);
+  takeSnapshot();
+  return true;
+}
+
+/**
+ * A colour changed and nothing else did.  In order of cost:
+ *   1. the fragment shader repaints from its own iteration — one draw;
+ *   2. the cached colour-position field is re-shaded — one table lookup;
+ *   3. otherwise the frame really has to be re-rendered.
+ */
+function recolourOnly() {
+  if (scenePass()) return;
+  if (reshadeFromField()) return;
+  scheduleRender(60);
+}
+
 function drawTile(msg, scale) {
   /* `tailKept` is the worker's workspace self-check: bytes of the tile slot the
    * kernel failed to write (always 0 on a healthy layout). */
@@ -1322,8 +1525,25 @@ function drawTile(msg, scale) {
     (window.__mbTiles = window.__mbTiles || []).push({
       x: msg.x, y: msg.y, w: msg.w, h: msg.h, s: scale,
       mode: msg.meta && msg.meta.mode, gl: msg.meta && msg.meta.glitches,
-      tailKept: msg.meta && msg.meta.tailKept
+      tailKept: msg.meta && msg.meta.tailKept,
+      /* 'env' = this tile adopted the frame-wide reference orbit.  A deep
+       * frame must be all 'env': tiles that elect their own disagree at the
+       * seams, because each reference leaves its own glitch pattern. */
+      ref: msg.meta && msg.meta.refSrc, ms: msg.meta && Math.round(msg.meta.ms)
     });
+  }
+  if (msg.meta && msg.meta.field) {
+    const f = msg.data;
+    /* Keep the raw positions for the re-shade cache before they are consumed
+     * by the colour stage. */
+    if (fieldBuild && fieldBuild.w === msg.width && fieldBuild.h === msg.height) {
+      for (let y = 0; y < msg.h; y++) {
+        const src = y * msg.w;
+        fieldBuild.data.set(f.subarray(src, src + msg.w), (msg.y + y) * fieldBuild.w + msg.x);
+      }
+    }
+    msg = { x: msg.x, y: msg.y, w: msg.w, h: msg.h,
+            data: shadeField(f, msg.w, msg.h, paletteLUT(state.palette)) };
   }
   composeTile(ctx, { canvas: tileCv, ctx: tileCtx }, msg, scale);
 }
@@ -1728,16 +1948,20 @@ function runPass(vId, plan, done, planList) {
   const pw = Math.max(8, Math.round(W * s * ss));
   const ph = Math.max(8, Math.round(H * s * ss));
   const iter = iterForPlan(plan);
-  /* Tiles exist so the work can run in parallel; a deep pass is the exception.
-   * Above the perturbation threshold every tile elects its own reference point
-   * and builds its own high-precision orbit, which costs tens of seconds at
-   * 2^-57.  Splitting the frame there multiplied that by the tile count and
-   * made the pass slower than the single-tile version it replaced, so the deep
-   * pass stays one tile with the pool working *inside* it. */
+  /* Tiles exist so the work can run in parallel.  A deep pass used to be the
+   * exception — every tile elected its own reference point and built its own
+   * high-precision orbit, so splitting the frame multiplied that cost and was
+   * slower than one enormous tile.  One enormous tile is worse than it sounds:
+   * it exceeds the kernel's 1 MiB output slot, falls back to the JavaScript
+   * renderer for the whole frame, and leaves the page frozen with half a
+   * picture (and, past the reference's precision, whole blocks of flat
+   * colour).  prepareEnv() now builds the orbit once for the view and every
+   * tile adopts it, so the deep pass tiles like any other. */
   const deepPass = psLog2Now() <= -45;
+  const shareEnv = deepPass && envShareable(state.spec, psLog2Now());
   /* One tile must fit the shell's 1 MB shared slot (512x512 RGBA), so the
    * upper bound is a hard 512 even when supersampling asks for more. */
-  const tw = deepPass
+  const tw = (deepPass && !shareEnv)
     ? Math.max(pw, ph)
     : Math.min(512, Math.max(40, Math.round(Math.min(TILE, state.tilePx || TILE) *
                                             Math.max(s, 0.5) * ss)));
@@ -1750,6 +1974,31 @@ function runPass(vId, plan, done, planList) {
   tiles.sort((a, b) =>
     Math.hypot(a.x + a.w / 2 - pw / 2, a.y + a.h / 2 - ph / 2) -
     Math.hypot(b.x + b.w / 2 - pw / 2, b.y + b.h / 2 - ph / 2));
+
+  /* Build (or find) the frame-wide reference orbit before dispatching.  The
+   * prepare is one message round trip on one worker; the alternative for every
+   * worker is the same high-precision pass, in parallel, once per view. */
+  let envSig = null;
+  if (shareEnv) {
+    const p0 = buildPayload(tiles[0], pw, ph, iter);
+    envSig = envSigFor(p0);
+    if (!(sharedEnv && sharedEnv.sig === envSig)) {
+      if (envPreparing === envSig) return;          // its callback re-enters
+      envPreparing = envSig;
+      const t = performance.now();
+      console.info(`[env] building reference orbit for ${tiles.length} tiles ` +
+                   `(2^${psLog2Now().toFixed(1)}, ${iter} iter)`);
+      updateHudSoon();
+      prepareEnv(p0, envSig, (env) => {
+        envPreparing = null;
+        if (vId !== viewId) return;                 // view changed while building
+        nativeLog(`[env] ready in ${(performance.now() - t).toFixed(0)} ms`);
+        console.info(`[env] ready in ${(performance.now() - t).toFixed(0)} ms`);
+        runPass(vId, plan, done, planList);         // re-enter with the env in place
+      });
+      return;
+    }
+  }
   const total = tiles.length;
   const idx = planList.indexOf(plan);
   let got = 0;
@@ -1767,6 +2016,14 @@ function runPass(vId, plan, done, planList) {
   const passT0 = performance.now();
   startPassClock(passT0);
 
+  /* The final CPU pass doubles as the colour-position capture: the tiles come
+   * back as one float per pixel, the page shades them, and the raw positions
+   * are kept so a palette change is a table lookup instead of a re-render. */
+  /* The out-of-browser core returns raw RGBA over HTTP (JSON meta + binary
+   * body), so the field capture stays on the in-page worker path. */
+  const captureField = final && !useFrame && !state.glsl && !remoteEnabled() && fieldCaptureOn;
+  fieldBuild = captureField ? { w: pw, h: ph, data: new Float32Array(pw * ph) } : null;
+
   for (const rect of tiles) {
     const payload = buildPayload(rect, pw, ph, iter);
     // Skeleton pass -> normal -> final.  The native kernel spends far fewer
@@ -1780,8 +2037,10 @@ function runPass(vId, plan, done, planList) {
      * pass asks for that and the preview passes stay at 1. */
     payload.aa = final ? 2 : 1;
     payload.frame = useFrame;
+    payload.asField = captureField;
     dispatch({
       payload,
+      envSig,
       onDone: (msg) => {
         if (msg.viewId !== vId) return;
         /* The compositor scale is a property of the *pass buffer*, not of this
@@ -1808,6 +2067,15 @@ function runPass(vId, plan, done, planList) {
           lastMeta = Object.assign({}, msg.meta, { ms: performance.now() - passT0 });
           stopPassClock();
           updateHud();
+          /* A complete final pass in field mode becomes the re-shade cache.
+           * Anything that moves a pixel's colour position invalidates it (see
+           * fieldKeyNow), so a stale entry can never be used for a new view. */
+          if (captureField && fieldBuild) {
+            fieldCache = { key: fieldKeyNow(), w: fieldBuild.w, h: fieldBuild.h, data: fieldBuild.data };
+          } else if (final) {
+            fieldCache = null;
+          }
+          fieldBuild = null;
           const settle = () => {
             takeSnapshot();
             if (nativeCanvasMode())
@@ -2707,7 +2975,7 @@ function commitStops(list, sort = true) {
   if (sort) s.sort((a, b) => a.pos - b.pos);
   state.stops = s;
   syncPaletteStrip();
-  scheduleRender(140);
+  recolourOnly();
 }
 
 function syncPaletteStrip() {
@@ -2846,7 +3114,7 @@ function bindGradientEditor() {
     state.stops = null;                   // back to the selected palette's ramp
     gradSel = 0;
     syncPaletteStrip();
-    scheduleRender(60);
+    recolourOnly();
   };
 }
 
@@ -5165,7 +5433,7 @@ function bindUi() {
     }
     syncSchemeParams();
     syncColorUi();               // dim the band-only rows when a scheme is on
-    renderNow();
+    recolourOnly();
   };
   $('sel-scheme').onchange = (e) => { state.scheme = e.target.value; renderNow(); };
   const selShade = $('sel-shade');
@@ -5773,6 +6041,8 @@ function boot() {
                   seg: (on) => { segOn = !!on; return segOn; },
                   /* Same view, cache off: isolates the field copy's cost. */
                   nocache: (on) => { state.noFieldCache = !!on; return state.noFieldCache; },
+                  /* A/B switch for the colour-position capture path. */
+                  field: (on) => { fieldCaptureOn = !!on; fieldCache = null; return fieldCaptureOn; },
                   forcecopy: (on) => { state.forceCopy = !!on; return state.forceCopy; },
                   /* Force a pass plan (measurement only), e.g. the old 0.16/0.5/1.0. */
                   plan: (arr) => {

@@ -59,6 +59,10 @@ tools/bench*/
 !tools/tilecheck.mjs
 !tools/pinchcheck.mjs
 !tools/kernel-layout.mjs
+!tools/colortime.mjs
+!tools/reshadecheck.mjs
+!tools/wheelzoom.mjs
+!tools/deeptime.mjs
 !tools/webprobe.mjs
 !tools/grabcanvas.mjs
 wasm/t/

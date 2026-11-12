@@ -105,10 +105,22 @@ function growMem(bytes) {
 /* ---------- Reference-orbit cache ---------- */
 let orbitCacheEntry = null;   // { key, ptr, len, stride, refPx, refPy }
 
+/* Identity of a *view*, not of a buffer.
+ *
+ * The reference orbit belongs to the plane region: same centre, same span, same
+ * iteration budget means the same orbit, no matter what resolution the pass is
+ * drawn at.  Width and height used to be part of this key, which made every
+ * pass of a progressive chain build its own orbit (the skeleton pass runs at
+ * 0.16x, the final at 1x) and made a tile dispatched after the next pass had
+ * started fall back to electing its own — visible as a seam exactly at that
+ * tile's edge, because each reference leaves its own glitch pattern.
+ *
+ * The reference *pixel* is therefore stored normalised (refU/refV) and scaled
+ * to the buffer at use time. */
 function viewKey(job, bits) {
   const s = job.spec;
   return [s.mode, s.kind, s.power, s.julia ? s.julia.re + ',' + s.julia.im : '',
-    job.center.re, job.center.im, job.span.m, job.span.e, job.width, job.height,
+    job.center.re, job.center.im, job.span.m, job.span.e,
     job.maxIter, bits, s.phoenixP, s.newtonDegree].join('|');
 }
 
@@ -156,9 +168,57 @@ function pickTileReference(job, bits) {
   return best;
 }
 
+/**
+ * Adopt the frame-wide environment computed by `prepareEnv` (see app.js).
+ *
+ * A deep pass used to be one viewport-sized tile, because every tile elected
+ * its own reference point and built its own high-precision orbit: a 512 px
+ * split multiplied that cost by the tile count and was slower than the single
+ * tile it replaced.  The page now builds the orbit *once* per view and ships
+ * the arrays with the job, so tiling is free again and the pool can split a
+ * deep frame like any other.
+ */
+function adoptEnv(job, env) {
+  const stride = env.stride;
+  const bytes = stride * (env.dd ? 32 : 16) + 64;
+  growMem(bytes + 1024);
+
+  const re = env.re instanceof Float64Array ? env.re : new Float64Array(env.re);
+  const im = env.im instanceof Float64Array ? env.im : new Float64Array(env.im);
+  heap.set(new Uint8Array(re.buffer, re.byteOffset, re.byteLength), ORBIT);
+  heap.set(new Uint8Array(im.buffer, im.byteOffset, im.byteLength), ORBIT + stride * 8);
+  if (env.dd) {
+    const reLo = env.reLo instanceof Float64Array ? env.reLo : new Float64Array(env.reLo);
+    const imLo = env.imLo instanceof Float64Array ? env.imLo : new Float64Array(env.imLo);
+    heap.set(new Uint8Array(reLo.buffer, reLo.byteOffset, reLo.byteLength), ORBIT + stride * 16);
+    heap.set(new Uint8Array(imLo.buffer, imLo.byteOffset, imLo.byteLength), ORBIT + stride * 24);
+  }
+  return {
+    key: env.key, ptr: ORBIT, len: env.len, stride,
+    /* Normalised reference position: the same orbit serves every pass and
+     * every tile, whatever resolution the pass buffer is. */
+    refU: env.refU, refV: env.refV,
+    series: env.series, dd: !!env.dd, fromEnv: true,
+    src: { re, im, reLo: env.reLo, imLo: env.imLo }
+  };
+}
+
 function ensureOrbit(job, bits) {
   const key = viewKey(job, bits);
-  if (orbitCacheEntry && orbitCacheEntry.key === key) return orbitCacheEntry;
+  if (orbitCacheEntry && orbitCacheEntry.key === key) {
+    /* Same view, already built (this worker may even be the one that served
+     * the `prepare`).  If the page shipped its copy, adopt the flag so the
+     * tile reports the same provenance as its neighbours. */
+    if (job.env && job.env.key === key) orbitCacheEntry.fromEnv = true;
+    return orbitCacheEntry;
+  }
+  /* Frame-wide environment handed over by the page: no arithmetic needed, the
+   * orbit was already elected once for the whole view. */
+  if (job.env && job.env.key === key) {
+    orbitCacheEntry = adoptEnv(job, job.env);
+    orbitCacheEntry.fromEnv = true;
+    return orbitCacheEntry;
+  }
 
   self.postMessage({ type: 'stage', stage: 'orbit' });
   const orb = _internals.pickReference(job, bits);
@@ -202,7 +262,11 @@ function ensureOrbit(job, bits) {
 
   orbitCacheEntry = {
     key, ptr: ORBIT, len: orb.len, stride,
-    refPx: orb.refPx, refPy: orb.refPy, series, dd
+    refU: orb.refPx / job.width, refV: orb.refPy / job.height,
+    fromEnv: false, series, dd,
+    /* Kept so a `prepare` request can hand the arrays to the other workers
+     * without a second high-precision pass. */
+    src: { re: orbFull.re, im: orbFull.im, reLo: orbFull.reLo, imLo: orbFull.imLo }
   };
   return orbitCacheEntry;
 }
@@ -376,6 +440,10 @@ function setupParams(job, mode, extra) {
   p[41] = de.on === false ? 0 : 1;
   p[42] = de.width > 0 ? de.width : 1.0;
   p[43] = de.strength != null ? de.strength : 0.85;
+  /* 53 = field mode: emit the colour position instead of RGBA (see kernel.cpp).
+   * The page keeps this to re-shade a finished frame when only the palette
+   * changes. */
+  p[53] = job.asField ? 1 : 0;
   // Colour scheme (0 = palette bands, 1 = reference "Distance": black field,
   // one-pixel white rim).  Mirrors the native kernel's Request::scheme.
   p[44] = job.scheme === 1 ? 1 : 0;
@@ -532,7 +600,10 @@ function processJob(job) {
   else if (bits > 64 && psLog2 <= -45) {
     mode = 1;
     const o = ensureOrbit(job, bits);
-    extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refPx, refPy: o.refPy, stride: o.stride, series: o.series, dd: o.dd };
+    /* The elected reference is stored normalised (see viewKey); the kernel
+     * wants it in this pass buffer's pixel grid. */
+    extra = { orbitPtr: o.ptr, orbitLen: o.len, refPx: o.refU * job.width, refPy: o.refV * job.height,
+              stride: o.stride, series: o.series, dd: o.dd, fromEnv: !!o.fromEnv };
   }
 
   const lut = setLut(job.palette, job.paletteStops);
@@ -576,8 +647,12 @@ function processJob(job) {
 
   const pixels = job.w * job.h;
   const bytes = pixels * 4;
-  const out = new Uint8ClampedArray(bytes);
-  out.set(heap.subarray(OUT, OUT + bytes));
+  /* Field mode returns one float per pixel (the colour position), same bytes
+   * as the RGBA it replaces — see kernel.cpp gField and app.js shadeField. */
+  const out = job.asField ? new Float32Array(pixels) : new Uint8ClampedArray(bytes);
+  const src8 = heap.subarray(OUT, OUT + bytes);
+  if (job.asField) new Uint8Array(out.buffer).set(src8);
+  else out.set(src8);
   /* KF frame statistics: nMin/nMax/nMaxExceptCentre of this tile, sampled
      from the escaped pixels.  The host aggregates them per pass and feeds the
      result back as the next pass's Stretched interval. */
@@ -592,7 +667,10 @@ function processJob(job) {
    * whole tiles in JavaScript (which used to cost an order of magnitude
    * and still left speckle noise behind). */
   let glitchFix = 0;
-  if (mode === 1 && glitches > 0) {
+  /* Glitch repair repaints RGBA; in field mode the buffer holds floats, so the
+   * repair pass is skipped and the glitched pixels keep their raw position
+   * (they are re-iterated on the next full render anyway). */
+  if (mode === 1 && glitches > 0 && !job.asField) {
     const n = Math.min(glitches, GLITCH_CAP);
     const list = new Int32Array(wasm.memory.buffer, GLITCH, n * 2);
     const dataView = new Uint8ClampedArray(wasm.memory.buffer, OUT, bytes);
@@ -609,13 +687,23 @@ function processJob(job) {
   return {
     type: 'tile', id: job.id, viewId: job.viewId,
     x: job.x, y: job.y, w: job.w, h: job.h,
+    /* The pass buffer this tile belongs to: the page needs it to place a field
+     * tile inside the frame-wide colour-position buffer. */
+    width: job.width, height: job.height,
     data: out,
     meta: {
       mode: mode === 0 ? 'direct' : mode === 1 ? 'perturb' : 'newton',
       bits, ms: performance.now() - t0,
       glitches, glitchFix, refLen: extra ? extra.orbitLen : 0,
+      /* 'env' = the frame-wide orbit came from the page; 'own' = this tile
+       * elected its own.  A deep frame must be all 'env', or tiles disagree at
+       * their boundaries (each reference has its own glitch pattern). */
+      refSrc: extra ? (extra.fromEnv ? 'env' : 'own') : '-',
       saSkip: extra && extra.series ? extra.series.skip : 0,
       engine: 'wasm', limited: bits < requiredBitsFromLog2(psLog2),
+      /* True when this tile carries colour positions instead of RGBA
+       * (kernel.cpp gField): the page shades them and keeps them for re-shading. */
+      field: !!job.asField,
       stats, tailKept, tileH: job.h, tileW: job.w
     }
   };
@@ -637,6 +725,36 @@ self.onmessage = async (e) => {
       self.postMessage(res, [res.data.buffer]);
     } catch (err) {
       self.postMessage({ type: 'error', id: msg.job.id, message: String(err && err.stack || err) });
+    }
+  } else if (msg.type === 'prepare') {
+    /* Build the reference orbit for a whole frame and hand it back, so every
+     * worker that renders a tile of that frame can adopt it instead of paying
+     * for its own election.  See adoptEnv(). */
+    await ready;
+    try {
+      const job = msg.job;
+      const psLog2 = job.psLog2 != null ? job.psLog2 : Math.log2(job.pixelSize);
+      const bits = resolveBitsFromLog2(job.bits, psLog2);
+      const o = ensureOrbit(job, bits);
+      const s = o.src || {};
+      /* Copies, not transfers.  These arrays are render.js's own cached
+       * reference orbit; transferring them would detach that cache entry and
+       * the next build would throw "Construct on a detached ArrayBuffer". */
+      const out = {
+        type: 'env', id: msg.id, key: o.key,
+        len: o.len, stride: o.stride, refU: o.refU, refV: o.refV,
+        dd: !!o.dd, series: o.series || null,
+        re: s.re ? s.re.slice() : null,
+        im: s.im ? s.im.slice() : null,
+        reLo: o.dd && s.reLo ? s.reLo.slice() : null,
+        imLo: o.dd && s.imLo ? s.imLo.slice() : null
+      };
+      self.postMessage(out);
+      /* The orbit stays valid in this worker, so the first tile it renders
+       * adopts the page's copy and copies it back over live memory — cheap,
+       * and it keeps the two paths on exactly the same data. */
+    } catch (err) {
+      self.postMessage({ type: 'env', id: msg.id, error: String(err && err.message || err) });
     }
   } else if (msg.type === 'resetOrbit') {
     orbitCacheEntry = null;

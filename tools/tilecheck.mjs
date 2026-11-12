@@ -48,17 +48,47 @@ await send('Page.enable');
 await send('Page.reload', { ignoreCache: true });
 await new Promise(r => setTimeout(r, 9000));
 
+/* A deep view exercises the perturbation path, where the reference orbit is
+ * elected once per frame and every tile adopts it (app.js prepareEnv).  Its
+ * tiling must be as independent as the direct path's: a tile that starts at a
+ * different offset may not compute a different pixel. */
+const DEEP = Number(arg('deep', 0));
+if (DEEP) {
+  await ev(`(() => { const st = window.__mb.state; st.gpu = false;
+    st.center = { re: '-0.743643887037151', im: '0.131825904205330' };
+    st.span = { m: 1.6, e: ${DEEP} }; window.__mb.render(); return 1; })()`);
+  await new Promise(r => setTimeout(r, 1500));
+}
+/* A real deep preset is the better test for the perturbation path: the
+ * synthetic point above sits in a flat exterior pocket where almost every
+ * pixel is a glitch and the repair pass — not the tiling — dominates. */
+const PRESET = arg('preset', '');
+if (PRESET) {
+  await ev(`document.getElementById('btn-presets').click(); 1`);
+  await new Promise(r => setTimeout(r, 900));
+  const hit = await ev(`(() => { const el = document.querySelector('.pcard[data-id="${PRESET}"]');
+    if (!el) return 0; el.click(); return 1; })()`);
+  if (!hit) { console.error('preset not found: ' + PRESET); process.exit(2); }
+  await new Promise(r => setTimeout(r, 600));
+  await ev(`(() => { const x = document.querySelector('#modal-root [data-close]'); if (x) x.click(); return 1; })()`);
+  await new Promise(r => setTimeout(r, 1500));
+}
+
 const render = async (tilePx, slot) => {
+  const base = Number(await ev('window.__mb.frames()'));
   await ev(`(() => { const st = window.__mb.state; st.gpu = false; st.tilePx = ${tilePx}; st.aa = 1;
     window.__mb.render(); return 1; })()`);
-  let prev = -1;
-  for (let i = 0; i < 80; i++) {
-    await new Promise(r => setTimeout(r, 300));
-    const n = await ev('window.__mb.frames()');
-    if (n === prev) break;
-    prev = n;
+  /* `frameSeq` only moves when the whole progressive chain finished (app.js
+   * renderPlan -> next()), so waiting for it to *increase* is the only reliable
+   * "this frame is complete" signal.  Waiting for it to stop changing fires on
+   * the first poll — the counter sits still while a pass runs. */
+  let done = false;
+  for (let i = 0; i < 400; i++) {
+    await new Promise(r => setTimeout(r, 400));
+    if (Number(await ev('window.__mb.frames()')) > base) { done = true; break; }
   }
-  await new Promise(r => setTimeout(r, 400));
+  if (!done) console.log(`  (${tilePx}px: frame did not settle, sampling anyway)`);
+  await new Promise(r => setTimeout(r, 500));
   return JSON.parse(await ev(`(() => {
     const cv = document.getElementById('fractal');
     const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
@@ -71,8 +101,9 @@ const render = async (tilePx, slot) => {
   })()`));
 };
 
-const big = await render(512, 0);
-const small = await render(40, 1);
+const T1 = Number(arg('t1', 512)), T2 = Number(arg('t2', DEEP ? 256 : 40));
+const big = await render(T1, 0);
+const small = await render(T2, 1);
 const spikeRows = [];
 for (let y = 1; y < big.prof.length - 1; y++) {
   const d = Math.abs(big.prof[y] - (big.prof[y - 1] + big.prof[y + 1]) / 2);
@@ -91,7 +122,7 @@ const cmp = JSON.parse(await ev(`(() => {
 
 console.log(`canvas             ${big.W}x${big.H}`);
 console.log(`seam rows (>6/255) ${spikeRows.length} ${JSON.stringify(spikeRows.slice(0, 8))}`);
-console.log(`512 vs 40 tiles    ${cmp.n} px differ (max Δ ${cmp.maxd})`);
+console.log(`${T1} vs ${T2} tiles   ${cmp.n} px differ (max Δ ${cmp.maxd})`);
 console.log(`errors             ${errs.slice(-2).join(' | ') || 'none'}`);
 const pass = spikeRows.length === 0 && cmp.n === 0 && !errs.length;
 console.log(pass ? 'PASS' : 'FAIL');

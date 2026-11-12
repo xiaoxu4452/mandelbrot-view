@@ -248,7 +248,7 @@ export function initJuliaView(opts) {
      * changes both windows together.  A preset's own scheme (a codegl program
      * with its own uniforms) is still honoured when the main view is on one:
      * that is the only case the dock cannot reproduce from the LUT. */
-    const pal = (getPalette && getPalette()) || 'orchid';
+    const pal = (getPalette && getPalette()) || 'ice';
     const cycle = Math.max(2, (getCycle && getCycle()) || 140);
     const offset = (getOffset && getOffset()) || 0;
     const key = [c.re, c.im, center.re, center.im, zoom, rotation, maxIter,
