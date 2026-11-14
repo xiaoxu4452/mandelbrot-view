@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Mandelbrot View — Desktop Core</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236aa9ff' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236aa9ff'/%3E%3C/svg%3E" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="stylesheet" href="shell.css?v=1" />
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="hud">
+  <span id="hud-coord">—</span>
+  <span id="hud-zoom">—</span>
+  <span id="hud-stat">—</span>
+</div>
+
+<div id="panel">
+  <div class="row">
+    <label>迭代上限</label>
+    <div class="iter-line">
+      <input id="iter" type="number" min="100" max="200000" step="100" />
+      <label class="chk"><input id="iter-auto" type="checkbox" checked />自动</label>
+    </div>
+  </div>
+  <div class="row">
+    <label>配色</label>
+    <select id="palette">
+      <option value="rainbow">rainbow</option>
+      <option value="nebula">nebula</option>
+      <option value="fire">fire</option>
+      <option value="ocean">ocean</option>
+      <option value="mono">mono</option>
+    </select>
+  </div>
+  <div class="row">
+    <label class="chk"><input id="julia-on" type="checkbox" />Julia 集</label>
+  </div>
+  <div class="row" id="julia-row" hidden>
+    <label>Julia 参数 c</label>
+    <input id="julia-re" type="text" value="-0.7435" spellcheck="false" />
+    <input id="julia-im" type="text" value="0.1314" spellcheck="false" />
+  </div>
+  <div class="row">
+    <button id="btn-copy">复制视点链接</button>
+    <button id="btn-home">回到首页</button>
+  </div>
+  <div class="note" id="note"></div>
+</div>
+
+<div id="panel-toggle" title="设置">⚙</div>
+<div id="splash">desktop core · wasm</div>
+
+<script src="shell.js?v=1"></script>
+</body>
+</html>

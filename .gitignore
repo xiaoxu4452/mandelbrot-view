@@ -1,0 +1,36 @@
+# Build artefacts and machine-local state
+node_modules/
+.workbuddy/
+*.log
+
+# The webcore build re-mirrors the desktop sources and writes the wasm here;
+# the served binary lives at the repository root (core.wasm, committed).
+webcore/src-mirror/
+webcore/.tmp/
+webcore/core.wasm
+
+# Scratch and evidence
+.tmp/
+.tmp-edge/
+legacy/
+
+# Machine-local projects (never part of the web repo)
+desktop/
+core/
+Meter Mandelbrot/
+.staging/
+evidence/
+download/
+iconic/
+native/
+kf-src/
+release/
+spike-native-canvas/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+legacy/
+.vs/
+.backup-web/

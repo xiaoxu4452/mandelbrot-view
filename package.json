@@ -1,0 +1,22 @@
+{
+  "name": "mandelbrot-view",
+  "version": "2.0.0",
+  "description": "Mandelbrot/Julia explorer running the desktop C++ core compiled to WebAssembly",
+  "type": "module",
+  "license": "MIT",
+  "author": "xiaoxu4452",
+  "homepage": "https://xiaoxu4452.github.io/mandelbrot-view/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaoxu4452/mandelbrot-view.git"
+  },
+  "scripts": {
+    "page": "node server/static-server.mjs",
+    "build:core": "node webcore/build.mjs",
+    "test:core": "node webcore/test.mjs",
+    "smoke": "node tools/_shell-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.65.0"
+  }
+}
