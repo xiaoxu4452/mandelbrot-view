@@ -1,0 +1,104 @@
+# Build artefacts and machine-local state
+node_modules/
+.workbuddy/
+*.log
+desktop/src/bin/
+
+# Dev-only captures produced by the tools/ harness
+tools/*.png
+tools/*.bin
+tools/*.json.bak
+js/app.js.bak
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local-only material: the desktop port, rendered evidence and scratch copies.
+# None of it is served by the page, and `evidence/` alone is hundreds of MB, so
+# it must never reach the Pages artifact (`upload-pages-artifact` uploads `.`).
+Meter Mandelbrot/
+evidence/
+.backup-web/
+download/
+iconic/
+native/
+kf-src/
+release/
+spike-native-canvas/
+# Scratch probes and one-off capture scripts (`_` prefix).  The maintained ones
+# are whitelisted below.
+tools/_*
+
+# NOTE: core/mandelbrot-core.zip is a build artefact but it is committed on
+# purpose — GitHub Pages serves it to the browser so users can download the
+# local render core without a build step.
+
+# Dev scratch harnesses (kept locally, not part of the repo)
+tools/*.mjs
+# Captures and scratch data produced while chasing a bug
+tools/*.bmp
+tools/*.txt
+tools/*.ps1
+tools/*.py
+tools/*.js
+tools/bench*/
+!tools/build-kernel.mjs
+!tools/build-core-package.mjs
+!tools/gen-presets.mjs
+!tools/searchviews.mjs
+!tools/hpverify.mjs
+!tools/hpconverge.mjs
+!tools/jettest.mjs
+!tools/customcmp.mjs
+!tools/sabench.mjs
+!tools/shot.mjs
+!tools/fullframe.mjs
+!tools/png.mjs
+# Regression checks that must survive in the repo (they gate a release):
+!tools/tilecheck.mjs
+!tools/pinchcheck.mjs
+!tools/kernel-layout.mjs
+!tools/colortime.mjs
+!tools/reshadecheck.mjs
+!tools/wheelzoom.mjs
+!tools/bridge-crosscheck.mjs
+!tools/deepstress.mjs
+!tools/itertest.mjs
+!tools/repro17.mjs
+!tools/wgpucheck.mjs
+!tools/deeptime.mjs
+!tools/webprobe.mjs
+!tools/grabcanvas.mjs
+!tools/jsonschema-check.mjs
+!tools/jsonimport-check.mjs
+!tools/layercheck.mjs
+!tools/ddcheck.mjs
+!tools/ddbrowser.mjs
+!tools/rebasecheck.mjs
+!tools/servercheck.mjs
+!tools/_desktopshot.mjs
+!tools/_release-upload.mjs
+!tools/_publish.mjs
+!tools/sync-desktop-ui.mjs
+wasm/t/
+tools/*.sh
+tools/*.html
+
+# Generated shell payload and local build output
+desktop/src/shell/ui_resources.cpp
+desktop/src/build/
+desktop/Mandelbrot View.exe
+
+# Vendored third-party source trees (Boost / MPIR / MPFR) are committed on
+# purpose so a clone can build offline; tools/fetch-third-party.py remains the
+# reference for versions and provenance.
+!tools/fetch-third-party.py
+.tmp-edge/
+
+.vs/
+!tools/_itertest.mjs
+!tools/_deepstress.mjs
+!tools/_repro17.mjs
+desktop core
