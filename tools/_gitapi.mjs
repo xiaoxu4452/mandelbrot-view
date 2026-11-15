@@ -28,24 +28,38 @@ const API = `https://api.github.com/repos/${owner}/${repo}`;
 const git = (...a) => execFileSync('git', a, { maxBuffer: 256 * 1024 * 1024 });
 
 async function api(path, init = {}) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const r = await fetch(API + path, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${TOKEN}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'mandelbrot-view-deploy',
-        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(init.headers || {})
-      }
-    });
-    const text = await r.text();
+  let lastErr = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let r, text;
+    try {
+      r = await fetch(API + path, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'mandelbrot-view-deploy',
+          ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+          ...(init.headers || {})
+        }
+      });
+      text = await r.text();
+    } catch (e) {
+      /* The egress proxy drops large uploads now and then ("other side
+       * closed").  A network failure is as retryable as a 5xx. */
+      lastErr = e;
+      await new Promise(s => setTimeout(s, 1200 * (attempt + 1)));
+      continue;
+    }
     if (r.ok) return text ? JSON.parse(text) : null;
-    if (r.status >= 500 || r.status === 429) { await new Promise(s => setTimeout(s, 1500 * (attempt + 1))); continue; }
+    if (r.status >= 500 || r.status === 429 || r.status === 408) {
+      lastErr = new Error(`${init.method || 'GET'} ${path} -> ${r.status}`);
+      await new Promise(s => setTimeout(s, 1500 * (attempt + 1)));
+      continue;
+    }
     throw new Error(`${init.method || 'GET'} ${path} -> ${r.status} ${text.slice(0, 300)}`);
   }
-  throw new Error(`${init.method || 'GET'} ${path} failed after retries`);
+  throw new Error(`${init.method || 'GET'} ${path} failed after retries: ${lastErr && lastErr.message}`);
 }
 
 const message = git('log', '-1', '--format=%B', localSha).toString().replace(/\s+$/, '');
@@ -67,6 +81,11 @@ for (const path of changed) {
   const sha = git('rev-parse', `${localSha}:${path}`).toString().trim();
   const mode = git('ls-tree', localSha, '--', path).toString().split(' ')[0].trim();
   const buf = git('cat-file', 'blob', sha);
+  /* Content-addressed: a blob that is already there (yesterday's core.wasm,
+   * any unchanged asset) must not be uploaded again — the 3 MB body is exactly
+   * what the proxy keeps dropping. */
+  const exists = await api(`/git/blobs/${sha}`, {}).then(() => true, () => false);
+  if (exists) { tree.push({ path, mode: mode === '100755' ? '100755' : '100644', type: 'blob', sha }); process.stdout.write(`  blob ${path} (already there)\n`); continue; }
   const blob = await api('/git/blobs', {
     method: 'POST',
     body: JSON.stringify({ content: buf.toString('base64'), encoding: 'base64' })
