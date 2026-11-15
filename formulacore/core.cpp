@@ -548,3 +548,181 @@ __attribute__((export_name("fc_out_size")))
 int32_t fc_out_size(void) { return static_cast<int32_t>(g_field.size() * sizeof(float)); }
 
 }  // extern "C"
+
+/* ==========================================================================
+ * Stage 2, part 1: perturbation rendering against an EXTERNAL, arbitrary-
+ * precision reference orbit.
+ *
+ * The page (or the Node test) builds ONE orbit with the project's high-
+ * precision libraries and hands over its double-valued samples plus the jet
+ * coefficients of F at each step.  Every pixel then advances a tiny offset
+ * delta in float-exp form (mantissa + binary exponent), so a 10^-600 pixel
+ * scale never underflows a double.  Precision cost grows with the single
+ * orbit, never with the pixel count -- which is the "arbitrary precision AND
+ * constant per-pixel speed" requirement.
+ *
+ * Layout of coefA / coefB, both [orbitLen][JK+1][2] doubles (re, im):
+ *   F(Z + eps, C + eta) = sum_k a_k eps^k + sum_k b_k eps^k eta   (+ O(eta^2))
+ *   a_0 is Z_{n+1} and is already in the orbit, so the recurrence starts at
+ *   k = 1.  For z^2+c: a_1 = 2 Z, a_2 = 1, b_0 = 1, everything else 0 --
+ *   exactly the classic perturbation recurrence.
+ * ========================================================================== */
+
+static constexpr int JK = 4;
+
+struct FE {
+    double m = 0.0;
+    int e = 0;                 // value = m * 2^e
+};
+static inline FE fe_norm(double m, int e) {
+    if (m == 0.0 || !std::isfinite(m)) return FE{0.0, 0};
+    int k = 0;
+    const double f = std::frexp(m, &k);
+    return FE{f, e + k};
+}
+static inline FE fe_scale(FE a, double k) {
+    if (k == 0.0 || a.m == 0.0) return FE{0.0, 0};
+    return fe_norm(a.m * k, a.e);
+}
+static inline FE fe_add(FE a, FE b) {
+    if (a.m == 0.0) return b;
+    if (b.m == 0.0) return a;
+    const int e = std::max(a.e, b.e);
+    return fe_norm(std::ldexp(a.m, a.e - e) + std::ldexp(b.m, b.e - e), e);
+}
+static inline FE fe_mul(FE a, FE b) {
+    if (a.m == 0.0 || b.m == 0.0) return FE{0.0, 0};
+    return fe_norm(a.m * b.m, a.e + b.e);
+}
+static inline double fe_double(FE a) {
+    if (a.m == 0.0 || a.e < -1070) return 0.0;
+    if (a.e > 1020) return a.m > 0 ? 1e300 : -1e300;
+    return std::ldexp(a.m, a.e);
+}
+struct C2 { FE r, i; };
+static inline C2 c2_zero() { return C2{FE{0.0, 0}, FE{0.0, 0}}; }
+static inline C2 c2_add(C2 a, C2 b) {
+    return C2{fe_add(a.r, b.r), fe_add(a.i, b.i)};
+}
+static inline C2 c2_mul(C2 a, C2 b) {
+    return C2{fe_add(fe_mul(a.r, b.r), fe_scale(fe_mul(a.i, b.i), -1.0)),
+              fe_add(fe_mul(a.r, b.i), fe_mul(a.i, b.r))};
+}
+static inline C2 c2_from(double r, double i) {
+    return C2{fe_norm(r, 0), fe_norm(i, 0)};
+}
+
+extern "C" {
+
+__attribute__((export_name("fc_jet_order")))
+int32_t fc_jet_order(void) { return JK; }
+
+/** Render a band (y0..y1) of the view by perturbation.  The field is the same
+ * single-channel f32 smooth-iteration field as fc_render(), -1 = interior. */
+__attribute__((export_name("fc_render_perturb")))
+int32_t fc_render_perturb(int32_t prog,
+                          int32_t w, int32_t h, int32_t maxiter,
+                          int32_t mode, double bail2,
+                          int32_t orbitLen,
+                          const double* orbZr, const double* orbZi,
+                          const double* coefA, const double* coefB,
+                          double dMant, int32_t dExp2,
+                          double rotCos, double rotSin,
+                          int32_t y0, int32_t y1,
+                          int32_t saSkip, const double* saAt) {
+    g_error.clear();
+    if (prog < 0 || static_cast<size_t>(prog) >= g_programs.size()) {
+        g_error = "bad program id"; return 1;
+    }
+    if (w < 1 || h < 1 || w > 8192 || h > 8192 || maxiter < 1) {
+        g_error = "bad frame dimensions"; return 2;
+    }
+    if (orbitLen < 1 || !orbZr || !orbZi || !coefA || !coefB) {
+        g_error = "missing reference orbit"; return 3;
+    }
+    if (y0 < 0 || y1 > h || y1 <= y0) { g_error = "bad band"; return 4; }
+    const int N = std::min(maxiter, orbitLen);
+    const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
+    g_field.assign(static_cast<size_t>(w) * h, -1.0f);
+    const double glitchEps = std::ldexp(1.0, -20);
+
+    for (int y = y0; y < y1; ++y) {
+        for (int x = 0; x < w; ++x) {
+            /* Plane offset, kept in float-exp form from the very first step so
+             * a 10^-600 pixel scale is still representable. */
+            const FE X = fe_norm((static_cast<double>(x) + 0.5 - 0.5 * w) * dMant, dExp2);
+            const FE Y = fe_scale(fe_norm((static_cast<double>(y) + 0.5 - 0.5 * h) * dMant, dExp2), -1.0);
+            const FE u = fe_add(fe_scale(X, rotCos), fe_scale(Y, -rotSin));
+            const FE v = fe_add(fe_scale(X, rotSin), fe_scale(Y, rotCos));
+            const C2 offset{u, v};
+            /* Julia: the pixel IS z0, so the offset is delta-z and c is fixed.
+             * Mandelbrot: every z0 is 0 and the offset is delta-c. */
+            C2 dz = (mode == 1) ? offset : c2_zero();
+            const C2 dc = (mode == 1) ? c2_zero() : offset;
+
+            /* Series approximation: the coefficients were integrated once
+             * with the orbit, so the ~690 "growth" iterations at 10^-300 are
+             * replaced by ONE polynomial evaluation.  saSkip is frame-wide
+             * (radtest over the largest offset), so the cost is the same at
+             * every depth. */
+            const int n0 = (mode == 0 && saAt && saSkip > 0 && saSkip < N) ? saSkip : 0;
+            if (n0 > 0) {
+                C2 sum = c2_zero(), pw = dc;
+                for (int k = 1; k <= JK; ++k) {
+                    sum = c2_add(sum, c2_mul(c2_from(saAt[k * 2], saAt[k * 2 + 1]), pw));
+                    pw = c2_mul(pw, dc);
+                }
+                dz = sum;
+            }
+
+            float value = -1.0f;
+            for (int n = n0; n < N; ++n) {
+                const C2 Z = c2_from(orbZr[n], orbZi[n]);
+                const C2 z = c2_add(Z, dz);
+                const FE zr2 = fe_mul(z.r, z.r), zi2 = fe_mul(z.i, z.i);
+                const double z2 = fe_double(fe_add(zr2, zi2));
+                if (!(z2 <= bail2)) {
+                    double sm;
+                    if (!std::isfinite(z2)) sm = static_cast<double>(n) + 1.0;
+                    else {
+                        const double logz = 0.5 * std::log(std::max(z2, 1e-300));
+                        sm = static_cast<double>(n) + 1.0 - std::log2(logz / logBail);
+                    }
+                    if (!(sm >= 0.0) || !std::isfinite(sm)) sm = 0.0;
+                    value = static_cast<float>(sm);
+                    break;
+                }
+                /* Cancellation test: |Z + delta| << max(|Z|, |delta|). */
+                const double az = std::hypot(fe_double(z.r), fe_double(z.i));
+                const double aZ = std::hypot(orbZr[n], orbZi[n]);
+                const double ad = std::hypot(fe_double(dz.r), fe_double(dz.i));
+                if (az < glitchEps * std::max(aZ, ad)) {
+                    /* Stage 2 part 2 replaces this with a rebase onto a child
+                     * reference.  For now the pixel stays unresolved (-1). */
+                    value = -1.0f;
+                    break;
+                }
+                if (n + 1 >= N) break;
+
+                /* delta' = sum_{k>=1} a_k delta^k
+                 *        + (b_0 + sum_{k>=1} b_k delta^k) * delta_c */
+                const double* a = coefA + static_cast<size_t>(n) * (JK + 1) * 2;
+                const double* b = coefB + static_cast<size_t>(n) * (JK + 1) * 2;
+                C2 nd = c2_zero();
+                C2 pw = dz;
+                for (int k = 1; k <= JK; ++k) {
+                    nd = c2_add(nd, c2_mul(c2_from(a[k * 2], a[k * 2 + 1]), pw));
+                    nd = c2_add(nd, c2_mul(c2_from(b[k * 2], b[k * 2 + 1]),
+                                           c2_mul(pw, dc)));
+                    pw = c2_mul(pw, dz);
+                }
+                nd = c2_add(nd, c2_mul(c2_from(b[0], b[1]), dc));
+                dz = nd;
+            }
+            g_field[static_cast<size_t>(y) * w + x] = value;
+        }
+    }
+    return 0;
+}
+
+}  // extern "C"

@@ -92,14 +92,28 @@ compiles a user expression into bytecode and renders it:
 | `formulacore/build.mjs` | zig -> wasm32-wasi (same toolchain as `webcore/`) |
 | `formulacore/test.mjs` | `z^2+c` pixel-exact against a Node reference, plus 9 nested-function cases |
 
-Stage 1 evaluates every pixel in double precision, so it is a **correctness
-reference, not the shipping engine**: it cannot survive deep zoom.  Stage 2 —
-the one that must ship — keeps ONE arbitrary-precision reference orbit (the
-project's BigFloat / GMP high-precision libraries) and advances each pixel with
-jet (automatic-differentiation) perturbation, series approximation and glitch
-repair, exactly like the Mandelbrot core.  That is how arbitrary precision and
-constant per-pixel speed coexist: precision cost grows only with that single
-orbit, never with the pixel count.
+Stage 1 evaluates every pixel in double precision: a correctness reference
+for the expression engine, not a shipping engine.  `orbit.mjs` +
+`core.cpp:fc_render_perturb` are stage 2 — ONE arbitrary-precision BigInt
+fixed-point reference orbit (80..360 decimals, chosen from the zoom), jet
+coefficients, float-exp pixel offsets, a frame-wide linear series-approximation
+skip and glitch detection.  `perturb-test.mjs` proves the two hard
+requirements (c = i is an exact Misiurewicz point, so it has structure at any
+depth):
+
+| zoom | direct double | perturb + SA | saSkip | frame |
+| --- | --- | --- | --- | --- |
+| 1e10 | 96 levels | 98 levels | 18 | 273.9 ms |
+| 1e30 | **flat black** | 91 levels | 71 | 308.9 ms |
+| 1e100 | **flat black** | 88 levels | 257 | 270.4 ms |
+| 1e300 | **flat black** | 94 levels | 789 | 269.7 ms |
+
+Cost ratio 1e300 / 1e10 = **0.98x**: precision cost grows only with the single
+orbit, never with the pixel count.  At shallow zoom the perturbed frame is
+pixel-identical to the direct one.  Still outstanding before this can replace
+the JS fallback: a general jet VM for non-polynomial expressions (coefficients
+are currently analytic for z^d+c), glitch **rebase**, band workers, and wiring
+it into `coreCanDraw()`.
 
 ### Diagnostics
 
