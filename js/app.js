@@ -2,29 +2,29 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=45';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=45';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=45';
-import { setLang, t, getLang } from './i18n.js?v=45';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=45';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=45';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=45';
-import { openCorePanel } from './corepanel.js?v=45';
-import { initGlassSelects } from './glass-select.js?v=45';
-import { composeTile } from './drawlib.js?v=45';
-import { SceneRenderer } from './glscene.js?v=45';
-import { MainGPU } from './wgpu/main.js?v=45';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=45';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=51';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=51';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=51';
+import { setLang, t, getLang } from './i18n.js?v=51';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=51';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=51';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=51';
+import { openCorePanel } from './corepanel.js?v=51';
+import { initGlassSelects } from './glass-select.js?v=51';
+import { composeTile } from './drawlib.js?v=51';
+import { SceneRenderer } from './glscene.js?v=51';
+import { MainGPU } from './wgpu/main.js?v=51';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=51';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=45';
-import { initJuliaView } from './juliaview.js?v=45';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=45';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=51';
+import { initJuliaView } from './juliaview.js?v=51';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=51';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=45';
-import { KINDS } from './formulas.js?v=45';
-import * as webcore from './webcore.js?v=17';
+         REF_MAX_PARAM } from './refpreset.js?v=51';
+import { KINDS } from './formulas.js?v=51';
+import * as webcore from './webcore.js?v=23';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=45';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=51';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -286,6 +286,23 @@ const SCENE_KIND = {
  * gesture previews may still use it, but only above 1e-4 pixel scale where
  * float32/df64 coordinates are exact. */
 const SCENE_FINAL_ENABLED = /[?&]scene=1/.test(location.search);
+/* Does the RENDERED picture carry `state.rotation`?
+ *
+ * It never has: the page's tile kernel maps pixels with the identity basis, and
+ * so do the thumbnails and every picture the preset library ships.  The gesture
+ * math (planeDelta) DOES apply the angle, which is why zooming a rotated card
+ * walked the picture away from the pointer -- measured on
+ * retinamandelbrot-example-6 (rotation -75 deg): one notch at a point 335 px off
+ * centre moved the painted point 135 px, six notches 362 px.  That is the
+ * "coordinates go wrong when zooming" on the preset cards, and 20 of the 23
+ * shipped cards carry a rotation.
+ *
+ * So the basis is shared: gestures and renderer both use it.  The core does
+ * support a turned basis (mb_render's rotCos/rotSin), so flipping this to true
+ * would make the pictures honour the panel -- at the price of recomposing every
+ * rotated card against thumbnails that are drawn unrotated. */
+const VIEW_ROTATION = false;
+const viewAngle = () => (VIEW_ROTATION ? (state.rotation || 0) : 0);
 const SCENE_MIN_PIXEL = 1.0e-4;
 /* Two limits, because a paint is not the same budget as a gesture:
  *
@@ -354,7 +371,7 @@ function sceneView() {
     centerRe: Number(state.center.re) || 0,
     centerIm: Number(state.center.im) || 0,
     pixel,
-    rot: state.rotation || 0,
+    rot: viewAngle(),
     width: canvas.width, height: canvas.height,
     maxIter: effectiveIterTotal(),
     power: spec.power | 0 || 2,
@@ -1028,7 +1045,15 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
    * The `hi <= cap * 1.05` bound is what actually rejects a bogus high value,
    * and it does that on its own. */
   const atLimit = cap > 0 && hi >= cap - 1 && hi <= cap * 1.05;
-  if (!atLimit || observedIter.refine >= ITER.maxRefine) return;
+  /* ONE raise per view, exactly like the starved path above.
+   *
+   * `atLimit` cannot tell "clipped" from "a boundary pixel that genuinely ran
+   * to the ceiling", and a whole-set view always has the latter: the first
+   * raise makes the ceiling 4000, some pixel escapes at 3999, and the rule
+   * fires again -- 500 -> 4000 -> 5164 -> 6622 -> 8597, ~30% a round.  The
+   * picture never changed; only the wait did (a preset frame went 0.25 s ->
+   * 2.6 s across four repaints of the same view). */
+  if (!atLimit || observedIter.repainted || observedIter.refine >= ITER.maxRefine) return;
   const obs = observedIter.observedMax;
   const budget = Math.max(vertexIterBudget(obs, obs),
                           checkCanvasIterBudget(obs));
@@ -1039,6 +1064,7 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
   if (next <= observedIter.cap) return;
   observedIter.cap = next;
   observedIter.refine++;
+  observedIter.repainted = true;
   nativeLog(`[iter] observed ${hi | 0}/${cap} -> ${next} (refine ${observedIter.refine})`);
 }
 
@@ -1083,7 +1109,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=45', { type: 'module' });
+    const w = new Worker('js/worker.js?v=51', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -2151,7 +2177,8 @@ function fieldKeyNow(withCycle = true) {
    * changing the palette phase is a table lookup, not a render. */
   return [state.center.re, state.center.im, state.span.m, state.span.e,
     effectiveIterTotal(), withCycle ? effectiveCycle() : '-', withCycle ? state.offset : '-',
-    state.bands, state.shade, state.spec.mode, state.spec.kind, state.spec.power,
+    state.bands, state.shade, state.rotation || 0,
+    state.spec.mode, state.spec.kind, state.spec.power,
     state.spec.julia ? state.spec.julia.re + ',' + state.spec.julia.im : '',
     state.traps, state.aa, state.bits, state.glsl ? 1 : 0,
     canvas.width, canvas.height].join('|');
@@ -2172,12 +2199,17 @@ function coreCycleFor(escMin, escMax) {
   if (state.cycleAuto) return fromFrame;
   const fixed = Math.max(2, state.cycle | 0);
   /* A preset's band count was chosen at the preset's own scale.  At a depth
-   * where the whole frame escapes inside half a band it paints one flat
-   * colour — a solid rectangle, which is what a 10^600 view looked like with
-   * the shipped cycle of 140 and its 44-iteration range.  Honour the frame's
-   * own range only in that case, so the preset's look is untouched at every
-   * scale where it means anything. */
-  if (span * 2 < fixed) return fromFrame;
+   * where the whole frame escapes inside a FRACTION of one band it paints one
+   * flat colour — a solid rectangle, which is what a 10^600 view looked like
+   * with the shipped cycle of 140 and its 44-iteration range.  Honour the
+   * frame's own range only in that case, so the preset's look is untouched at
+   * every scale where it means anything.
+   *
+   * One third, not one half: a Julia card ships cycle 1759 against an
+   * 863-iteration frame, i.e. deliberately half a ramp, and treating that as
+   * "flat" redrew it with 86 bands — a rainbow speckle where the card is a
+   * soft gradient (measured on retinajulia-example-1). */
+  if (span * 3 < fixed) return fromFrame;
   return fixed;
 }
 
@@ -3076,7 +3108,11 @@ let coreFails = 0;
  * soft at arm's length and the pass still lands while the user is looking at
  * the preview.  A phone gets a third of that: its wasm is slower still, the
  * screen is held closer, and a pinch that waits two seconds reads as broken. */
-const CORE_MAX_PIXELS = TOUCH_UI ? 0.85e6 : 1.8e6;
+/* Budget for one core frame.  A phone at 390x844 with the 1.5x backing store is
+ * 0.74 Mpx, so 1.5 Mpx leaves room for a tablet in portrait and for a wider
+ * pinch; below the canvas size the core renders a smaller buffer and the
+ * compositor stretches it, which is exactly the softness the 1.5x is for. */
+const CORE_MAX_PIXELS = TOUCH_UI ? 1.5e6 : 1.8e6;
 /* A quarter-width preview covers 1/11 of the pixels: one sixth of the wait, and
  * enough structure to know which way the view is going. */
 const CORE_PREVIEW_SCALE = 0.34;
@@ -3102,8 +3138,13 @@ function coreCanDraw() {
   }
   if (state.traps > 0 || state.inverse) return no('traps');
   if (state.scheme === 'distance') return no('distance');
-  if (state.rotation) return no('rotation');
-  if (state.glsl && String(state.glsl).trim()) return no('glsl');
+  /* `glsl` is the card's own colour program.  It only draws when the WebGL
+   * scene is enabled (?scene=1); without it the frame is shaded from the same
+   * palette table either way, so a preset that carries a shader is NOT a reason
+   * to drop to the page kernel -- and dropping to it was the whole bug, because
+   * that kernel works in doubles and loses the view past ~1e8 (the presets ship
+   * 24-40 digit coordinates precisely so they can be zoomed). */
+  if (SCENE_FINAL_ENABLED && state.glsl && String(state.glsl).trim()) return no('glsl');
   coreWhy = '';
   return true;
 }
@@ -3120,6 +3161,10 @@ function coreJob(scale, maxiter) {
     julia,
     juliaRe: julia ? state.spec.julia.re : '0',
     juliaIm: julia ? state.spec.julia.im : '0',
+    /* Same basis as `planeDelta`: viewAngle(), not the panel's angle -- see the
+     * flag's note.  Passing the raw rotation here is what made a rotated card
+     * zoom into a different place than it was drawn at. */
+    rot: viewAngle(),
   };
 }
 
@@ -3391,7 +3436,7 @@ function takeSnapshot() {
  */
 function planeDelta(dxPx, dyPx) {
   const p = psPair();
-  const th = state.rotation || 0;
+  const th = viewAngle();
   const c = Math.cos(th), s = Math.sin(th);
   const x = dxPx * p.m;
   const y = -dyPx * p.m;
@@ -7399,6 +7444,11 @@ function boot() {
   try {
     const sc = parseFloat(localStorage.getItem('mb.scale') || '');
     if (sc >= 1 && sc <= 2) state.renderScale = sc;
+    /* Phones ship 2-3 physical pixels per CSS pixel; at 1x the picture is
+     * magnified 2-3x by the compositor and looks soft next to the rest of the
+     * UI.  1.5x is the point where the structure reads as drawn rather than
+     * stretched, and the core now has the headroom for it (six bands). */
+    else if (TOUCH_UI) state.renderScale = 1.5;
   } catch { /* private mode */ }
   if ($('sel-scale')) $('sel-scale').value = String(state.renderScale);
   resizeCanvas();
@@ -7436,7 +7486,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=45')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=51')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

@@ -12,7 +12,7 @@
  * arguments and the standard identities for complex ones; arg / atan2 use double precision.
  * ----------------------------------------------------------------*/
 
-import { contextFor } from './bigfixed.js?v=45';
+import { contextFor } from './bigfixed.js?v=51';
 
 /* ---------------- Constants ---------------- */
 

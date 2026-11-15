@@ -18,7 +18,7 @@
 let core = null;
 
 async function loadCore() {
-  const resp = await fetch('../core.wasm?v=20');
+  const resp = await fetch('../core.wasm?v=26');
   const bytes = await resp.arrayBuffer();
   const mod = await WebAssembly.compile(bytes);
   let memView = null;
@@ -134,13 +134,18 @@ async function loadCore() {
       const h = y1 - y0;
       const t0 = performance.now();
       const common = [a, b, Number(job.zoomMant) || 1, job.zoomExp10 | 0];
+      /* Identity unless the card is rotated; the core composes the same pixel
+       * basis the page's planeDelta does. */
+      const rc0 = Number(job.rotCos), rs0 = Number(job.rotSin);
+      const rotCos = Number.isFinite(rc0) ? rc0 : 1;
+      const rotSin = Number.isFinite(rs0) ? rs0 : 0;
       const rc = band
         ? e.mb_render_strip(...common, w, hFull, y0, y1, job.maxiter | 0,
-            job.julia ? 1 : 0, jr, ji, pal, 0, 0, 16, 1, 1, 0, 1, 1, 0,
-            job.interiorPalette ? 1 : 0)
+            job.julia ? 1 : 0, jr, ji, pal, 0, 0, 16, 1, 1, 0, 1,
+            rotCos, rotSin, job.interiorPalette ? 1 : 0)
         : e.mb_render(...common, w, h, job.maxiter | 0,
-            job.julia ? 1 : 0, jr, ji, pal, 0, 0, 16, 1, 1, 0, 1, 1, 0,
-            job.interiorPalette ? 1 : 0);
+            job.julia ? 1 : 0, jr, ji, pal, 0, 0, 16, 1, 1, 0, 1,
+            rotCos, rotSin, job.interiorPalette ? 1 : 0);
       const ms = performance.now() - t0;
       const err = rc ? readStr(e.mb_error()) : '';
       const outP = e.mb_out_ptr(), outN = e.mb_out_size();

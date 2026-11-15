@@ -37,7 +37,7 @@ let seq = 0;
 const jobs = new Map();       // id -> { parts, want, resolve, reject, w, h }
 
 function bootOne() {
-  const w = new Worker('js/webcore-worker.js?v=22', { type: 'classic' });
+  const w = new Worker('js/webcore-worker.js?v=28', { type: 'classic' });
   w.ready = false;
   w.onmessage = (ev) => {
     const m = ev.data;
@@ -147,7 +147,7 @@ function zoomFromSpan(span) {
  * Replies with the smooth iteration of every pixel (interior = -1) and the
  * frame's stats; the palette band is the page's business.
  */
-export function coreRender({ re, im, span, w, h, maxiter, julia, juliaRe, juliaIm }) {
+export function coreRender({ re, im, span, w, h, maxiter, julia, juliaRe, juliaIm, rot }) {
   ensure();
   const z = zoomFromSpan(span);
   const id = ++seq;
@@ -156,6 +156,7 @@ export function coreRender({ re, im, span, w, h, maxiter, julia, juliaRe, juliaI
     zoomMant: z.mant, zoomExp10: z.exp,
     width: w | 0, height: h | 0, maxiter: maxiter | 0,
     julia: !!julia, juliaRe: String(juliaRe || '0'), juliaIm: String(juliaIm || '0'),
+    rotCos: Math.cos(+rot || 0), rotSin: Math.sin(+rot || 0),
   };
   /* One band per worker, but a band has to be tall enough to pay for its own
    * reference orbit (~170 ms at 10^600, and every band builds its own).  Below
