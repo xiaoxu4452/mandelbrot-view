@@ -2,29 +2,29 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=31';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=31';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=31';
-import { setLang, t, getLang } from './i18n.js?v=31';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=31';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=31';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=31';
-import { openCorePanel } from './corepanel.js?v=31';
-import { initGlassSelects } from './glass-select.js?v=31';
-import { composeTile } from './drawlib.js?v=31';
-import { SceneRenderer } from './glscene.js?v=31';
-import { MainGPU } from './wgpu/main.js?v=31';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=31';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=34';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=34';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=34';
+import { setLang, t, getLang } from './i18n.js?v=34';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=34';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=34';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=34';
+import { openCorePanel } from './corepanel.js?v=34';
+import { initGlassSelects } from './glass-select.js?v=34';
+import { composeTile } from './drawlib.js?v=34';
+import { SceneRenderer } from './glscene.js?v=34';
+import { MainGPU } from './wgpu/main.js?v=34';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=34';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=31';
-import { initJuliaView } from './juliaview.js?v=31';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=31';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=34';
+import { initJuliaView } from './juliaview.js?v=34';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=34';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=31';
-import { KINDS } from './formulas.js?v=31';
-import * as webcore from './webcore.js?v=3';
+         REF_MAX_PARAM } from './refpreset.js?v=34';
+import { KINDS } from './formulas.js?v=34';
+import * as webcore from './webcore.js?v=6';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=31';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=34';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1083,7 +1083,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=31', { type: 'module' });
+    const w = new Worker('js/worker.js?v=34', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -2145,13 +2145,61 @@ let fieldCaptureOn = true; // debug switch: __mb.field(false) renders straight t
 let fieldCache = null;     // { key, w, h, data: Float32Array }
 let fieldBuild = null;     // the final pass of the current render, accumulating
 
-function fieldKeyNow() {
+function fieldKeyNow(withCycle = true) {
+  /* A core frame caches *smooth iterations*, not colour positions, so its
+   * cycle and offset are applied at shade time and must not invalidate it:
+   * changing the palette phase is a table lookup, not a render. */
   return [state.center.re, state.center.im, state.span.m, state.span.e,
-    effectiveIterTotal(), effectiveCycle(), state.offset, state.bands,
-    state.shade, state.spec.mode, state.spec.kind, state.spec.power,
+    effectiveIterTotal(), withCycle ? effectiveCycle() : '-', withCycle ? state.offset : '-',
+    state.bands, state.shade, state.spec.mode, state.spec.kind, state.spec.power,
     state.spec.julia ? state.spec.julia.re + ',' + state.spec.julia.im : '',
     state.traps, state.aa, state.bits, state.glsl ? 1 : 0,
     canvas.width, canvas.height].join('|');
+}
+
+/** Shade cached smooth iterations the way a core frame is drawn.
+ *
+ * The palette band is chosen from the frame's *own* escape range, which is the
+ * desktop's rule (`effective_palette_scale`: ten bands across the frame).  The
+ * old `iterTotal / 10` estimate agrees at shallow depth, where the range really
+ * is most of the budget, and collapses at 1e600: there the whole picture spans
+ * 44 iterations out of an 80000 ceiling, so one band covers everything and the
+ * frame comes out a single flat colour. */
+function coreCycleFor(escMin, escMax) {
+  const span = (escMax | 0) - (escMin | 0) + 1;
+  const fromFrame = clamp(Math.round(span / 10), 2, 4096);
+  if (!(span > 1)) return effectiveCycle();
+  if (state.cycleAuto) return fromFrame;
+  const fixed = Math.max(2, state.cycle | 0);
+  /* A preset's band count was chosen at the preset's own scale.  At a depth
+   * where the whole frame escapes inside half a band it paints one flat
+   * colour — a solid rectangle, which is what a 10^600 view looked like with
+   * the shipped cycle of 140 and its 44-iteration range.  Honour the frame's
+   * own range only in that case, so the preset's look is untouched at every
+   * scale where it means anything. */
+  if (span * 2 < fixed) return fromFrame;
+  return fixed;
+}
+
+function shadeSmoothField(smooth, w, h, cycle, offset, lut) {
+  const out = new Uint8ClampedArray(w * h * 4);
+  const inv = 1 / Math.max(2, cycle);
+  for (let i = 0, n = w * h, o = 0; i < n; i++, o += 4) {
+    const s = smooth[i];
+    if (!(s >= 0)) { out[o] = 5; out[o + 1] = 6; out[o + 2] = 9; out[o + 3] = 255; continue; }
+    const t = s * inv + offset;
+    const u = t - Math.floor(t);
+    let x = u * 512;
+    let i0 = x | 0;
+    if (i0 > 511) i0 = 511;
+    const f = x - i0, j0 = (i0 + 1) & 511;
+    const a = i0 * 4, b = j0 * 4;
+    out[o] = lut[a] + (lut[b] - lut[a]) * f;
+    out[o + 1] = lut[a + 1] + (lut[b + 1] - lut[a + 1]) * f;
+    out[o + 2] = lut[a + 2] + (lut[b + 2] - lut[a + 2]) * f;
+    out[o + 3] = 255;
+  }
+  return out;
 }
 
 /** Shade `data` (one colour position per pixel, -1 = interior) into RGBA. */
@@ -2184,9 +2232,14 @@ function currentLut() {
 /** Re-shade the cached field with the current palette.  False = render. */
 function reshadeFromField() {
   if (!fieldCache) return false;
-  if (fieldCache.key !== fieldKeyNow()) return false;
+  const smooth = fieldCache.kind === 'smooth';
+  if (fieldCache.key !== fieldKeyNow(!smooth)) return false;
   const t0 = performance.now();
-  const rgba = shadeField(fieldCache.data, fieldCache.w, fieldCache.h, currentLut());
+  const rgba = smooth
+    ? shadeSmoothField(fieldCache.data, fieldCache.w, fieldCache.h,
+        coreCycleFor(fieldCache.escMin, fieldCache.escMax), state.offset || 0,
+        currentLut())
+    : shadeField(fieldCache.data, fieldCache.w, fieldCache.h, currentLut());
   /* Re-shading paints the 2D canvas.  The shader declined this frame (that is
    * why recolourOnly() reached here), so the GL layer must not stay on top:
    * otherwise a palette click visibly does nothing. */
@@ -3067,11 +3120,16 @@ function coreJob(scale, maxiter) {
 function coreFrame(job, gen, final, aa = 1) {
   return webcore.coreRender(job).then((msg) => {
     if (gen !== coreGen) return false;         // a newer view owns the canvas
-    const rgba = shadeField(msg.field, msg.w, msg.h, currentLut());
+    const st0 = msg.stats || {};
+    const cycle = coreCycleFor(st0.minEsc, st0.maxEsc);
+    const rgba = shadeSmoothField(msg.field, msg.w, msg.h, cycle,
+      state.offset || 0, currentLut());
     if (final) {
-      /* The same cache the CPU path keeps: a palette change re-shades these
-       * positions instead of re-iterating the frame. */
-      fieldCache = { key: fieldKeyNow(), w: msg.w, h: msg.h, data: msg.field };
+      /* Cache the smooth iterations, not the colours: a palette change, a
+       * palette phase or a re-banding is then a table lookup over the same
+       * frame instead of another 1.4 s render. */
+      fieldCache = { kind: 'smooth', key: fieldKeyNow(false), w: msg.w, h: msg.h,
+        data: msg.field, escMin: st0.minEsc | 0, escMax: st0.maxEsc | 0 };
     }
     paintFrame({ w: msg.w, h: msg.h, data: rgba }, msg.w / canvas.width);
     if (!final) return true;
@@ -7348,7 +7406,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=31')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=34')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a
@@ -7416,6 +7474,17 @@ function boot() {
                   /* Metadata of the last finished pass: orbit time, whether the
                    * environment came from the cache, bits, glitches. */
                   meta: () => lastMeta,
+                  /* Which palette band the current frame is shaded with, and
+                   * from what: the core caches smooth iterations, so this is
+                   * the only place to see the band rule's decision. */
+                  bands: () => ({
+                    auto: !!state.cycleAuto, cycle: state.cycle | 0,
+                    eff: effectiveCycle(),
+                    field: fieldCache && fieldCache.kind === 'smooth'
+                      ? coreCycleFor(fieldCache.escMin, fieldCache.escMax) : null,
+                    esc: fieldCache ? [fieldCache.escMin, fieldCache.escMax] : null,
+                    offset: state.offset || 0,
+                  }),
                   /* WebGPU engine probe: its geometry and a float-field
                    * readback, so tools/wgpucheck.mjs can A/B the shader's
                    * iteration counts against a direct evaluation. */

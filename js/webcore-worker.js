@@ -18,7 +18,7 @@
 let core = null;
 
 async function loadCore() {
-  const resp = await fetch('../core.wasm?v=6');
+  const resp = await fetch('../core.wasm?v=9');
   const bytes = await resp.arrayBuffer();
   const mod = await WebAssembly.compile(bytes);
   let memView = null;
@@ -121,17 +121,17 @@ async function loadCore() {
       if (rc) return { rc, err, mode, ms, stats, w, h };
 
       const n = w * h;
-      const inv = 1 / Math.max(2, job.cycle | 0);
-      const off = +job.offset || 0;
       const pos = new Float32Array(n);
       let inside = 0;
       if (mode === 1) {
+        /* One float per pixel: the smooth iteration count, interior as -1.
+         * The palette band is chosen on the page from this frame's own escape
+         * range, so shading (and re-banding, and a palette change) never needs
+         * another render. */
         const f = new Float32Array(e.memory.buffer, outP, n * 4);
         for (let i = 0, q = 0; i < n; i++, q += 4) {
           const s = f[q];
-          if (!(s >= 0)) { pos[i] = -1; inside++; continue; }
-          const u = s * inv + off;
-          pos[i] = u - Math.floor(u);
+          if (s >= 0) pos[i] = s; else { pos[i] = -1; inside++; }
         }
       } else {
         /* No field (a future palette mode): report it rather than serving an

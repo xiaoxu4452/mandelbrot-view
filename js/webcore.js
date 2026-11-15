@@ -19,7 +19,7 @@ let onReady = null;
 
 function ensure() {
   if (worker) return worker;
-  worker = new Worker('js/webcore-worker.js?v=4', { type: 'classic' });
+  worker = new Worker('js/webcore-worker.js?v=7', { type: 'classic' });
   worker.onmessage = (ev) => {
     const m = ev.data;
     if (m.type === 'ready') {
@@ -77,10 +77,11 @@ function zoomFromSpan(span) {
  *   w, h      pixel size of this frame (a reduced preview passes a smaller w/h
  *             with the same span: the region covered does not change)
  *   maxiter   iteration ceiling
- *   cycle     iterations per palette band, `offset` the palette phase
+ *
+ * The reply carries the smooth iteration count per pixel (interior = -1) plus
+ * the frame's stats; the palette band is the page's business.
  */
-export function coreRender({ re, im, span, w, h, maxiter, cycle, offset,
-                             julia, juliaRe, juliaIm }) {
+export function coreRender({ re, im, span, w, h, maxiter, julia, juliaRe, juliaIm }) {
   ensure();
   const z = zoomFromSpan(span);
   const id = ++seq;
@@ -90,7 +91,6 @@ export function coreRender({ re, im, span, w, h, maxiter, cycle, offset,
       re: String(re), im: String(im),
       zoomMant: z.mant, zoomExp10: z.exp,
       width: w | 0, height: h | 0, maxiter: maxiter | 0,
-      cycle: Math.max(2, cycle | 0), offset: +offset || 0,
       julia: !!julia, juliaRe: String(juliaRe || '0'), juliaIm: String(juliaIm || '0'),
       field: true,
     } });
