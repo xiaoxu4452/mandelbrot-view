@@ -2,29 +2,29 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=51';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=51';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=51';
-import { setLang, t, getLang } from './i18n.js?v=51';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=51';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=51';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=51';
-import { openCorePanel } from './corepanel.js?v=51';
-import { initGlassSelects } from './glass-select.js?v=51';
-import { composeTile } from './drawlib.js?v=51';
-import { SceneRenderer } from './glscene.js?v=51';
-import { MainGPU } from './wgpu/main.js?v=51';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=51';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=52';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=52';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=52';
+import { setLang, t, getLang } from './i18n.js?v=52';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=52';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=52';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=52';
+import { openCorePanel } from './corepanel.js?v=52';
+import { initGlassSelects } from './glass-select.js?v=52';
+import { composeTile } from './drawlib.js?v=52';
+import { SceneRenderer } from './glscene.js?v=52';
+import { MainGPU } from './wgpu/main.js?v=52';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=52';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=51';
-import { initJuliaView } from './juliaview.js?v=51';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=51';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=52';
+import { initJuliaView } from './juliaview.js?v=52';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=52';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=51';
-import { KINDS } from './formulas.js?v=51';
-import * as webcore from './webcore.js?v=23';
+         REF_MAX_PARAM } from './refpreset.js?v=52';
+import { KINDS } from './formulas.js?v=52';
+import * as webcore from './webcore.js?v=52';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=51';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=52';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1109,7 +1109,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=51', { type: 'module' });
+    const w = new Worker('js/worker.js?v=52', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -1779,6 +1779,32 @@ let viewId = 0;
 let tileTotal = 0;
 let tileDone = 0;
 let lastMeta = null;
+/* Sizes of the last painted core pass (see coreFrame). */
+let lastPaint = null;
+/* ---- stale-frame bookkeeping -------------------------------------------
+ * The canvas may only ever show the view `state` names.  A frame that arrives
+ * for an older view is dropped — painting it would put the pre-gesture picture
+ * back on top.  Dropping is only safe while another pass is on its way: a view
+ * that dispatches nothing leaves the previous picture on screen, and every
+ * later gesture then translates *that* bitmap again, which is exactly the
+ * "the picture jumps to a displaced place and never catches up" report.  So a
+ * drop arms one retry; a landed frame disarms it. */
+let coreDrops = 0;
+let coreDropWhy = '';
+let coreRetryAt = 0;
+function noteCoreDrop(why) {
+  coreDrops++;
+  coreDropWhy = why;
+  /* 'gen' is a frame superseded by a newer pass that is already running. */
+  if (why !== 'stale') return;
+  if (drag || pinch) return;              // the gesture end will render
+  if (coreRetryAt || wheelTimer) return;  // a pass is already scheduled
+  coreRetryAt = setTimeout(() => {
+    coreRetryAt = 0;
+    if (drag || pinch) return;
+    renderNow();
+  }, 120);
+}
 /* Escape-count span over EVERY tile of the current pass.  `lastMeta` alone is
  * whatever tile arrived last — often a uniform one at deep zoom — and reading
  * "no structure" off it told the user a detailed frame had none. */
@@ -2352,6 +2378,13 @@ function drawTile(msg, scale, passW, passH) {
  */
 function paintFrame(f, scale) {
   if (!f || !f.data) return;
+  /* One canvas, one owner.  The GL and WebGPU layers sit *on top* of the 2D
+   * canvas (a class on <html> decides which is displayed), so painting here
+   * while either of them is up writes to an invisible surface: the frame
+   * "completes" in the HUD and the picture never changes.  Whichever engine
+   * paints this canvas is the picture from now on. */
+  setGlSurface(false);
+  setWgpuSurface(false);
   composeTile(ctx, { canvas: frameCv, ctx: frameCtx },
     { x: 0, y: 0, w: f.w, h: f.h, data: f.data }, scale);
 }
@@ -3172,11 +3205,14 @@ function coreJob(scale, maxiter) {
  *  `aa` > 1 means the buffer is supersampled and the compositor box-reduces it. */
 function coreFrame(job, gen, final, aa = 1) {
   return webcore.coreRender(job).then((msg) => {
-    if (gen !== coreGen) return false;         // a newer view owns the canvas
+    if (gen !== coreGen) { noteCoreDrop('gen', job); return false; }  // a newer view owns the canvas
     /* The view can also move without a new pass being dispatched (a gesture in
      * progress); painting this frame then would fight the preview. */
     if (job.re !== state.center.re || job.im !== state.center.im ||
-        job.span.m !== state.span.m || job.span.e !== state.span.e) return false;
+        job.span.m !== state.span.m || job.span.e !== state.span.e) {
+      noteCoreDrop('stale', job);
+      return false;
+    }
     const st0 = msg.stats || {};
     const cycle = coreCycleFor(st0.minEsc, st0.maxEsc);
     const rgba = shadeSmoothField(msg.field, msg.w, msg.h, cycle,
@@ -3189,6 +3225,14 @@ function coreFrame(job, gen, final, aa = 1) {
         data: msg.field, escMin: st0.minEsc | 0, escMax: st0.maxEsc | 0 };
     }
     paintFrame({ w: msg.w, h: msg.h, data: rgba }, msg.w / canvas.width);
+    /* Diagnostics for the "picture is a strip / lands offset" reports: one
+     * record per painted pass with the sizes the frame was written at, so a
+     * mismatch between the buffer and the canvas is visible without a debugger.
+     * (Read by tools/ checks; never drawn.) */
+    lastPaint = { w: msg.w, h: msg.h, want: job.w, wantH: job.h,
+                  cw: canvas.width, ch: canvas.height, final,
+                  re: job.re, im: job.im, m: job.span.m, e: job.span.e };
+    if (coreRetryAt) { clearTimeout(coreRetryAt); coreRetryAt = 0; }
     if (!final) return true;
     const st = msg.stats || {};
     const julia = state.spec.mode === 'j';
@@ -3452,9 +3496,14 @@ function planeDelta(dxPx, dyPx) {
  *  anchor can follow the pointer.  Build the sum in fixed point instead so the
  *  coordinate keeps exactly the width the renderer is using. */
 function screenToPlaneHi(clientX, clientY) {
-  const r = canvas.getBoundingClientRect();
-  const sx = (clientX - r.left) * (canvas.width / Math.max(1, r.width));
-  const sy = (clientY - r.top) * (canvas.height / Math.max(1, r.height));
+  /* The same client->bitmap map the gestures use (viewFit, `object-fit:
+   * contain` letterboxing included).  The plain rect ratio this used to do
+   * ignores the letterbox bars, so every anchor -- a Julia seed, a zoom point,
+   * a preset -- was off by the bar width whenever the bitmap and the element
+   * did not share an aspect ratio exactly. */
+  const { k: kf, ox, oy } = viewFit();
+  const sx = (clientX - ox) / kf;
+  const sy = (clientY - oy) / kf;
   const d = planeDelta(sx - canvas.width / 2, sy - canvas.height / 2);
   const bits = Math.max(128, requiredBitsFromLog2(psLog2Now(), effectiveIterTotal()));
   return {
@@ -3472,9 +3521,9 @@ function screenToPlaneHi(clientX, clientY) {
  *  whole-set scale.  Anything that becomes a *coordinate of the main view*
  *  (a Julia seed, a preset, a zoom anchor) must use screenToPlaneHi. */
 function screenToPlane(clientX, clientY) {
-  const r = canvas.getBoundingClientRect();
-  const sx = (clientX - r.left) * (canvas.width / Math.max(1, r.width));
-  const sy = (clientY - r.top) * (canvas.height / Math.max(1, r.height));
+  const { k: kf, ox, oy } = viewFit();
+  const sx = (clientX - ox) / kf;
+  const sy = (clientY - oy) / kf;
   const d = planeDelta(sx - canvas.width / 2, sy - canvas.height / 2);
   const k = Math.pow(2, d.e);
   return {
@@ -3986,10 +4035,45 @@ function inCardioidOrBulb(re, im) {
   return (x + 1) * (x + 1) + y * y <= 0.0625;             // period-2 bulb
 }
 
+/* ---- `?diag=1`: the state the canvas is actually showing -----------------
+ * "The picture walks away from the pointer and keeps jumping" is either the
+ * canvas not being repainted (a stale frame, or a layer on top of it) or the
+ * view it was painted for not being the one the HUD reads.  Printing both
+ * numbers side by side settles which, from a single screenshot.
+ */
+const DIAG = /[?&]diag=1/.test(location.search);
+let diagEl = null;
+function diagTick() {
+  if (!DIAG) return;
+  if (!diagEl) {
+    diagEl = document.createElement('div');
+    diagEl.id = 'mb-diag';
+    diagEl.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:99999;' +
+      'font:11px/1.35 ui-monospace,Consolas,monospace;color:#e8eef6;' +
+      'background:rgba(8,10,14,.82);border:1px solid rgba(255,255,255,.18);' +
+      'border-radius:6px;padding:6px 8px;pointer-events:none;white-space:pre;' +
+      'max-width:52vw;text-align:left;';
+    document.body.appendChild(diagEl);
+  }
+  const p = lastPaint;
+  const layer = wgpuSurface ? 'wgpu' : (glSurface ? 'gl' : '2d');
+  const same = p ? (p.re === state.center.re && p.im === state.center.im &&
+                    p.m === state.span.m && p.e === state.span.e) : false;
+  const cut = (v) => String(v == null ? '-' : v).slice(0, 24);
+  diagEl.textContent =
+    `state   ${cut(state.center.re)} ${cut(state.center.im)}\n` +
+    `        span ${(+state.span.m).toPrecision(6)}e${state.span.e}\n` +
+    `painted ${p ? cut(p.re) + ' ' + cut(p.im) : '-'}\n` +
+    `        span ${p ? (+p.m).toPrecision(6) + 'e' + p.e : '-'}  ${same ? 'MATCH' : 'STALE'}\n` +
+    `layer ${layer}  buffer ${p ? p.w + 'x' + p.h : '-'}  canvas ${canvas.width}x${canvas.height}\n` +
+    `drops ${coreDrops}${coreDropWhy ? ' ' + coreDropWhy : ''}  gen ${coreGen}`;
+}
+
 function updateHud(done = false) {
   /* Every "this pass is finished" call stamps the clock, so a queued live
    * repaint cannot overwrite it (see updateHudSoon). */
   if (done) hudDoneStamp = performance.now();
+  diagTick();
   const d = depthNow();
   const ps = psNow();
   /* The width on screen is the width the renderer actually used.  Before this
@@ -7482,11 +7566,12 @@ function boot() {
   /* Raw renderer handle, for the deep-frame diagnostics tools. */
   window.__mbgpu = mainGPU;
   window.__mb = { state, screenToPlane, screenToPlaneHi, planeToScreen, julia: juliaView,
+                  paint: () => lastPaint, drops: () => ({ n: coreDrops, why: coreDropWhy }),
                   render: renderNow, apply: applyRefPresetPatch,
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=51')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=52')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a
