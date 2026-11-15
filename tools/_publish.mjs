@@ -23,20 +23,53 @@ function git(...a) {
   return execFileSync('git', a, { maxBuffer: 256 * 1024 * 1024 }).toString().trim();
 }
 
-/* The token may come from the environment (the credential manager pops a
- * dialog when it is queried from a process without a console, so the shell
- * fetches it once and hands it over). */
-let CACHED = process.env.GITHUB_TOKEN || '';
-function token() {
-  if (CACHED) return CACHED;
-  const out = execFileSync('git', ['credential', 'fill'], {
-    input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8'
-  });
-  const m = out.match(/^password=(.*)$/m);
-  if (!m) throw new Error('no credential for github.com');
-  CACHED = m[1].trim();
-  return CACHED;
+/* Several GitHub identities are stored in the Windows credential manager.
+ * `git credential fill` without a username hint returns whichever entry is
+ * currently the default -- it switched to 01arcticfox, which only has pull
+ * access to this repo, and POST /git/blobs then answers 404 forever.  Ask for
+ * each candidate explicitly and keep the first token that really can push. */
+function storedToken(username) {
+  const input = 'protocol=https\nhost=github.com\n' +
+    (username ? `username=${username}\n` : '') + '\n';
+  try {
+    const out = execFileSync('git', ['credential', 'fill'], { input, encoding: 'utf8' });
+    const m = out.match(/^password=(.*)$/m);
+    return m ? m[1].trim() : null;
+  } catch { return null; }
 }
+
+async function hasPush(t) {
+  try {
+    const r = await fetch(API, {
+      headers: {
+        Authorization: `Bearer ${t}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'mandelbrot-view-publish'
+      }
+    });
+    if (!r.ok) return false;
+    const j = JSON.parse(await r.text());
+    return !!(j.permissions && j.permissions.push);
+  } catch { return false; }
+}
+
+async function pickToken() {
+  if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN;
+  const seen = new Set();
+  for (const u of [owner, '01arcticfox', '']) {
+    const t = storedToken(u);
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    if (await hasPush(t)) {
+      console.log(`[publish] using GitHub credential ${u || '(default)'} (push access)`);
+      return t;
+    }
+    console.log(`[publish] credential ${u || '(default)'} has no push access, skipping`);
+  }
+  throw new Error(`no stored GitHub credential has push access to ${owner}/${repo}`);
+}
+const TOKEN = await pickToken();
 
 async function api(path, init = {}) {
   /* The egress proxy drops the 3 MB core.wasm body now and then ("other side
@@ -50,7 +83,7 @@ async function api(path, init = {}) {
       r = await fetch(API + path, {
         ...init,
         headers: {
-          Authorization: `Bearer ${token()}`,
+          Authorization: `Bearer ${TOKEN}`,
           Accept: 'application/vnd.github+json',
           'X-GitHub-Api-Version': '2022-11-28',
           'User-Agent': 'mandelbrot-view-publish',
@@ -107,7 +140,7 @@ console.log(`[publish] local ${localSha.slice(0, 8)}  remote ${remoteSha.slice(0
 
 const out = execFileSync(process.execPath,
   ['tools/_gitapi.mjs', owner, repo, localSha, diffBase, remoteSha],
-  { env: { ...process.env, GITHUB_TOKEN: token() }, stdio: 'inherit' });
+  { env: { ...process.env, GITHUB_TOKEN: TOKEN }, stdio: 'inherit' });
 
 const after = await api('/git/ref/heads/main');
 console.log('[publish] remote main is now ' + after.object.sha);
