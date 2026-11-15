@@ -16,7 +16,26 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const DESKTOP_SRC = 'C:/Users/harve/Desktop/mande/new/src';
+/* Where the core sources come from.
+ *
+ * This build compiles the *desktop* core, which normally lives in the desktop
+ * project's tree; that tree is not part of this repository, so a clone could
+ * not rebuild core.wasm.  `webcore/src/` is therefore a vendored copy of
+ * exactly the TUs and headers below (refreshed by `node webcore/sync-src.mjs`),
+ * and it is the default.  Point MB_SRC at a desktop checkout to build against
+ * the live sources instead — that is what the author's machine does, and the
+ * patches are asserted against either. */
+const DESKTOP_SRC = (() => {
+  const candidates = [
+    process.env.MB_SRC,
+    'C:/Users/harve/Desktop/mande/new/src',
+    path.join(ROOT, 'src'),
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(path.join(c, 'render.cpp'))) return c;
+  }
+  throw new Error('no core sources: set MB_SRC or run webcore/sync-src.mjs');
+})();
 const MIRROR = path.join(ROOT, 'src-mirror');
 const OUT = path.join(ROOT, 'core.wasm');
 

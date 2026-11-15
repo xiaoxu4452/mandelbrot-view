@@ -13,8 +13,13 @@
   "scripts": {
     "page": "node server/static-server.mjs",
     "build:core": "node webcore/build.mjs",
+    "sync:src": "node webcore/sync-src.mjs",
     "test:core": "node webcore/test.mjs",
-    "smoke": "node tools/_shell-smoke.mjs"
+    "test:view": "node webcore/test-view.mjs",
+    "test:families": "node tools/_families-check.mjs",
+    "smoke": "node tools/_shell-smoke.mjs",
+    "bump": "node tools/_bump-cache.mjs",
+    "publish": "node tools/_publish.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.65.0"
