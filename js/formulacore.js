@@ -12,7 +12,7 @@
  * and falls back to the page's JS kernel -- a formula should never disable the
  * Mandelbrot core for every later view.
  */
-const WORKER_URL = 'js/formulacore-worker.js?v=57';
+const WORKER_URL = 'js/formulacore-worker.js?v=58';
 const MAX_WORKERS = 6;
 const poolSize = (() => {
   const hc = (navigator.hardwareConcurrency || 4) | 0;

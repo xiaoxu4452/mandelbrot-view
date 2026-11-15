@@ -75,6 +75,7 @@ node formulacore/general-test.mjs  # arbitrary-expression jet perturbation
 node formulacore/bands-test.mjs    # parallel bands vs one frame
 node tools/_formula-ui-check.mjs   # page wiring in a real browser
 node tools/_formula-deep-check.mjs # 1e30 jet frame vs JS kernel
+node tools/_julia-fix-check.mjs    # short-reference Julia views
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 
@@ -168,10 +169,29 @@ custom / nested-trig / multibrot(3) expressions render in C++ wasm, and at
 1e30 the jet engine lands a 29-level structured frame in **2.48 s** while the
 old JS kernel takes 5.78 s and leaves 67% of the frame dark.
 
-Still outstanding: the `deep.cpp` Julia interior-default root fix (recompiles
-`core.wasm`, so it needs its own run against the desktop PNGs), and extending
-the formula core to the non-holomorphic built-in families (tricorn, burning
-ship, celtic, perpendicular, phoenix), which need a wider reference ladder.
+**Julia black-frame root fix.** `webcore/src/deep.cpp` no longer turns a
+short-lived Julia reference into a black frame: when `ref.escaped`, the scalar
+kernel continues that pixel from its last known `z` with a plain double
+iteration (`z <- z^2 + c`) up to `maxiter`.  No `Z_n` is needed past the
+reference's end because `z` is already near the bailout radius, so double is
+ample.  Genuine interior views still report interior.  The branch is
+Julia-only, so the Mandelbrot path is byte-for-byte unchanged: rebuilding with
+`MB_SRC=webcore/src node webcore/build.mjs` and running `node webcore/test.mjs`
+gives **100.000% / maxDelta 0** against the desktop `mset.exe` PNGs on all four
+reference views.
+
+The page's v55 guard (keep the previous frame when a final frame is all
+interior with a reference shorter than half the budget) remains as a second
+line of defence.  `node tools/_julia-fix-check.mjs` compares the old and new
+binaries on views whose reference really does die early (measured
+`refLen 75..255` of 2000); the new core keeps 0% interior and a structured
+escape range.  Those probes did NOT reproduce the exact "every pixel interior"
+view from the bug report, so a direct before/after screenshot of that one view
+is still worth taking with `?diag=1`.
+
+Still outstanding: extending the formula core to the non-holomorphic built-in
+families (tricorn, burning ship, celtic, perpendicular, phoenix), which need a
+wider reference ladder.
 
 ### Diagnostics
 

@@ -36,7 +36,7 @@
  * Limits come straight from the binary's #defines: NCOLOR 20, NPARAM 10.
  * ----------------------------------------------------------------*/
 
-import { REF_DEFAULT_LOG_FREQ } from './palettes.js?v=57';
+import { REF_DEFAULT_LOG_FREQ } from './palettes.js?v=58';
 
 const ZOOM_SPAN = 2.0;      // span = ZOOM_SPAN / zoom
 

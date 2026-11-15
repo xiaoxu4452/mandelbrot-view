@@ -132,9 +132,22 @@ wasm 逐点渲染（仍不是 JS 内核），深景走 jet 扰动。C++ 解析�
 渲染；1e30 深视点 jet 引擎 **2.48 s** 落帧、29 档结构，而旧 JS 内核 5.78 s 且
 67% 画面仍是暗区。
 
-仍待完成：`deep.cpp` 里 Julia 的 interior 兜底根治（要重编 `core.wasm`，须单独与
-桌面 PNG 逐像素验收）；以及把公式核心扩展到非全纯内建族（tricorn、burning ship、
-celtic、perpendicular、phoenix，需要更宽的参考梯）。
+**Julia 黑屏根治。** `webcore/src/deep.cpp` 不再把「参考轨道早死」变成黑帧：当
+`ref.escaped` 时，标量内核从像素最后一个已知的 `z` 出发，用普通 double 继续迭代
+（`z <- z^2 + c`）到 `maxiter`。参考结束后不再需要 `Z_n`，因为此时 `z` 已接近逃逸
+半径，double 精度足够；真正的内部点仍判 interior。该分支**只对 Julia 生效**，
+Mandelbrot 路径逐字节未变：用 `MB_SRC=webcore/src node webcore/build.mjs` 重编后
+跑 `node webcore/test.mjs`，四个参考视点与桌面 `mset.exe` 的 PNG 仍是
+**100.000% / maxDelta 0**。
+
+v55 的页面侧保护（末帧全部 interior 且参考短于预算一半时保留上一帧）保留为第二道
+防线。`node tools/_julia-fix-check.mjs` 在参考确实早死的视点上（实测
+`refLen 75..255 / 2000`）对比新旧二进制：新核心保持 0% interior 且有结构化的逃逸
+范围。这些探针**没有复现出用户截图里那个「整帧判内部」的精确视点**，因此最好仍用
+`?diag=1` 对那一个视点补一张直接的前后对照。
+
+仍待完成：把公式核心扩展到非全纯内建族（tricorn、burning ship、celtic、
+perpendicular、phoenix，需要更宽的参考梯）。
 
 ### 诊断开关
 

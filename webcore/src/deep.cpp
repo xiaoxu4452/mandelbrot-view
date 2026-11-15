@@ -478,8 +478,14 @@ inline void iterate_quad_d(const RefCache& ref, const double* d0r, const double*
 #endif  // __AVX2__
 
 inline void iterate_pixel_d(const RefCache& ref, double d0r, double d0i,
-                            bool want_distance, double scale, PxResult& out) {
+                            bool want_distance, double scale, PxResult& out,
+                            double julCr, double julCi, int maxiter) {
     const double bail2 = want_distance ? kEscape2Dist : kEscape2;
+    /* Keep the LAST (Z_n, d_n) pair.  If the reference escapes before this
+     * pixel, there is no Z past ref.len -- but z is then already O(bailout),
+     * so a plain double iteration can finish the pixel without any reference
+     * at all (see the escaped branch below). */
+    double lastZR = 0.0, lastZI = 0.0, lastDR = d0r, lastDI = d0i;
 
     int n0 = 0;
     double dr = d0r, di = d0i;
@@ -540,6 +546,7 @@ inline void iterate_pixel_d(const RefCache& ref, double d0r, double d0i,
             }
         }
 
+        lastZR = Zr; lastZI = Zi; lastDR = dr; lastDI = di;
         if (n + 1 >= ref.len) break;
 
         // Julia has no constant term; see RefCache::julia.
@@ -563,6 +570,41 @@ inline void iterate_pixel_d(const RefCache& ref, double d0r, double d0i,
         out.interior = true;
         out.iter = -1;
         out.smooth = -1.0;
+        return;
+    }
+    /* Root fix for the deep-Julia black frame.  A reference that escapes at
+     * step L is NOT evidence that the pixels are interior: every pixel past L
+     * used to be labelled a glitch, and when the repair ladder could not cover
+     * them they fell through to the interior default (deep_render).  Without
+     * a Z_n there is no perturbation -- but z is already near the bailout
+     * radius, so double precision is ample for the remaining iterations.
+     * This branch is Julia-ONLY; the Mandelbrot path (and therefore the whole
+     * desktop PNG acceptance suite) is byte-for-byte unchanged. */
+    if (ref.julia && ref.escaped && maxiter > ref.len) {
+        double zr = lastZR + lastDR, zi = lastZI + lastDI;
+        const double lb = 0.5 * std::log(bail2);
+        for (int n = ref.len; n < maxiter; ++n) {
+            ++out.steps;
+            const double nr = zr * zr - zi * zi + julCr;
+            const double ni = 2.0 * zr * zi + julCi;
+            zr = nr; zi = ni;
+            const double z2 = zr * zr + zi * zi;
+            if (!(z2 <= bail2)) {
+                out.iter = n + 1;
+                double ratio = (!std::isfinite(z2))
+                    ? 1e15
+                    : (0.5 * std::log(std::max(z2, 1e-300))) / lb;
+                if (ratio < 1e-15) ratio = 1e-15;
+                out.smooth = static_cast<double>(n) + 2.0 - std::log2(ratio);
+                if (out.smooth < 0.0) out.smooth = 0.0;
+                out.glitch = 0;
+                return;
+            }
+        }
+        out.interior = true;         // genuinely bounded for the whole budget
+        out.iter = -1;
+        out.smooth = -1.0;
+        out.glitch = 0;
         return;
     }
     out.glitch = ref.len - 1;
@@ -742,7 +784,10 @@ inline void render_pixel(const View& v, const RefCache& ref, int x, int y,
     if (ref.dbl_ok) {
         double dr = 0.0, di = 0.0;
         v.delta_d(x, y, ref.anchor_x, ref.anchor_y, dr, di);
-        iterate_pixel_d(ref, dr, di, want_dist, v.p->scale.to_double(), r);
+        const double jcr = (ref.julia && v.p->jr) ? v.p->jr->to_double() : 0.0;
+        const double jci = (ref.julia && v.p->ji) ? v.p->ji->to_double() : 0.0;
+        iterate_pixel_d(ref, dr, di, want_dist, v.p->scale.to_double(), r,
+                        jcr, jci, v.p->maxiter);
         return;
     }
     CFexp d0;

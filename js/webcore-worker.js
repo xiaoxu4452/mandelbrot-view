@@ -18,7 +18,7 @@
 let core = null;
 
 async function loadCore() {
-  const resp = await fetch('../core.wasm?v=57');
+  const resp = await fetch('../core.wasm?v=58');
   const bytes = await resp.arrayBuffer();
   const mod = await WebAssembly.compile(bytes);
   let memView = null;

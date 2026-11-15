@@ -12,7 +12,7 @@
  * Output is the SAME single-channel f32 smooth-iteration field webcore's
  * worker returns (interior = -1), so shadeSmoothField() needs no changes.
  */
-import { buildFormulaEnvironment } from '../formulacore/env.js?v=57';
+import { buildFormulaEnvironment } from '../formulacore/env.js?v=58';
 
 /* deep.cpp: kEscape2 = 4.0.  Both cores must use the same bailout so their
  * smoothed iteration fields line up (see formulacore/align-test.mjs). */
