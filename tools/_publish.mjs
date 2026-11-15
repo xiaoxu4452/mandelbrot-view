@@ -39,25 +39,54 @@ function token() {
 }
 
 async function api(path, init = {}) {
-  const r = await fetch(API + path, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token()}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'mandelbrot-view-publish',
-      ...(init.body ? { 'Content-Type': 'application/json' } : {})
+  /* The egress proxy drops the 3 MB core.wasm body now and then ("other side
+   * closed"); fetch throws instead of returning a status, so a plain await
+   * loses the publish halfway.  Both a transport failure and a 5xx are
+   * retryable -- blob uploads are content-addressed, so a retry is idempotent. */
+  let lastErr = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let r, text;
+    try {
+      r = await fetch(API + path, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${token()}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'mandelbrot-view-publish',
+          ...(init.body ? { 'Content-Type': 'application/json' } : {})
+        }
+      });
+      text = await r.text();
+    } catch (e) {
+      lastErr = e;
+      await new Promise((s) => setTimeout(s, 1500 * (attempt + 1)));
+      continue;
     }
-  });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`${init.method || 'GET'} ${path} -> ${r.status} ${text.slice(0, 400)}`);
-  return text ? JSON.parse(text) : null;
+    if (r.ok) return text ? JSON.parse(text) : null;
+    if (r.status >= 500 || r.status === 429 || r.status === 408) {
+      lastErr = new Error(`${init.method || 'GET'} ${path} -> ${r.status}`);
+      await new Promise((s) => setTimeout(s, 1500 * (attempt + 1)));
+      continue;
+    }
+    throw new Error(`${init.method || 'GET'} ${path} -> ${r.status} ${text.slice(0, 400)}`);
+  }
+  throw new Error(`${init.method || 'GET'} ${path} failed after retries: ${lastErr && lastErr.message}`);
 }
 
 const localSha = git('rev-parse', 'HEAD');
+const localTree = git('rev-parse', 'HEAD^{tree}');
 const ref = await api('/git/ref/heads/main');
 const remoteSha = ref.object.sha;
 const remoteCommit = await api(`/git/commits/${remoteSha}`);
+/* The published commit is rebuilt (single-parent history), so its sha never
+ * equals the local one and comparing shas re-uploads the tree every run.  The
+ * tree is the content: if it already matches, there is nothing to publish. */
+if (remoteCommit.tree && remoteCommit.tree.sha === localTree) {
+  console.log(`[publish] remote ${remoteSha.slice(0, 8)} tree already ${localTree.slice(0, 8)}`);
+  console.log('[publish] nothing to do');
+  process.exit(0);
+}
 const remoteTree = remoteCommit.tree.sha;
 
 /* The local commit that carries the remote tree: the diff base. */
