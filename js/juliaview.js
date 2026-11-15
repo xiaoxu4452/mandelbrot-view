@@ -20,9 +20,9 @@
  *   2. the point under the pointer              (mode 1, "follow")
  *   3. the main view's centre                   (nothing picked yet)
  * ----------------------------------------------------------------*/
-import { SceneRenderer, lutFor } from './glscene.js?v=54';
-import { paletteLUT } from './palettes.js?v=54';
-import { putColor, shadeSmooth } from './drawlib.js?v=54';
+import { SceneRenderer, lutFor } from './glscene.js?v=55';
+import { paletteLUT } from './palettes.js?v=55';
+import { putColor, shadeSmooth } from './drawlib.js?v=55';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const $ = (id) => document.getElementById(id);

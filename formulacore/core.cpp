@@ -1,0 +1,550 @@
+// formulacore/core.cpp — independent C++/wasm core for arbitrary formula sets.
+//
+// This is the stage-1 engine.  It is deliberately a SEPARATE module from
+// webcore/core.wasm: that one is the desktop's z^2+c perturbation core, whose
+// reference-orbit / SA / glitch machinery is specific to polynomials.  Here the
+// iteration map is an expression the user writes, so the engine is built around
+// a complex elementary-function library and a compiled expression VM instead.
+//
+// Stage 1 provides:
+//   * a self-contained complex number type and ~35 elementary functions
+//     (trig / hyperbolic / inverse / exp / log / pow / sqrt / rounding ...),
+//     composed from real libm so no complex-lib symbols are needed under wasi;
+//   * a lexer + Pratt parser (implicit multiplication, right-associative ^,
+//     variables z/c/n/p, constants i/pi/e/tau, parameters, nested calls) that
+//     compiles to a stack bytecode;
+//   * a whole-view renderer returning the SAME single-channel f32 smooth-
+//     iteration field webcore's worker hands to shadeSmoothField (-1 = inside).
+//
+// Stage 2 (not in this file yet) replaces the double centre with the desktop's
+// arbitrary-precision BigFloat reference orbit and adds jet (automatic-
+// differentiation) perturbation, series approximation and glitch repair, which
+// is what makes deep zoom exact for non-polynomial maps.  The ABI below is
+// already shaped so that change stays inside this module.
+//
+// Build: node formulacore/build.mjs   Test: node formulacore/test.mjs
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+// ---------------------------------------------------------------- complex --
+struct C {
+    double r = 0.0, i = 0.0;
+};
+static inline C mk(double r, double i = 0.0) { return C{r, i}; }
+static inline C add(C a, C b) { return C{a.r + b.r, a.i + b.i}; }
+static inline C sub(C a, C b) { return C{a.r - b.r, a.i - b.i}; }
+static inline C mul(C a, C b) {
+    return C{a.r * b.r - a.i * b.i, a.r * b.i + a.i * b.r};
+}
+static inline C neg(C a) { return C{-a.r, -a.i}; }
+static inline C scale(C a, double k) { return C{a.r * k, a.i * k}; }
+static inline double abs2(C a) { return a.r * a.r + a.i * a.i; }
+static inline C divc(C a, C b) {
+    const double d = abs2(b);
+    if (d == 0.0) return C{0.0, 0.0};
+    return C{(a.r * b.r + a.i * b.i) / d, (a.i * b.r - a.r * b.i) / d};
+}
+static inline C inv(C a) { return divc(C{1.0, 0.0}, a); }
+
+static inline C cexp(C z) {
+    const double e = std::exp(z.r);
+    return C{e * std::cos(z.i), e * std::sin(z.i)};
+}
+static inline C clog(C z) {
+    return C{std::log(std::max(std::hypot(z.r, z.i), 1e-300)),
+             std::atan2(z.i, z.r)};
+}
+static inline C csqrt(C z) {
+    const double m = std::hypot(z.r, z.i);
+    const double a = std::sqrt(std::max(0.0, (m + z.r) * 0.5));
+    const double b = std::sqrt(std::max(0.0, (m - z.r) * 0.5));
+    return C{a, z.i < 0 ? -b : b};
+}
+static inline C cpow(C a, C b) {
+    if (a.i == 0.0 && b.i == 0.0 && a.r >= 0.0)
+        return C{std::pow(a.r, b.r), 0.0};
+    if (b.i == 0.0 && b.r == static_cast<double>(static_cast<int>(b.r)) &&
+        std::fabs(b.r) < 64.0) {
+        // Exact integer power: avoids a branch cut for negative real bases.
+        int n = static_cast<int>(b.r);
+        if (n < 0) { a = inv(a); n = -n; }
+        C out{1.0, 0.0};
+        for (int k = 0; k < n; ++k) out = mul(out, a);
+        return out;
+    }
+    return cexp(mul(b, clog(a)));
+}
+static inline C csin(C z) {
+    return C{std::sin(z.r) * std::cosh(z.i), std::cos(z.r) * std::sinh(z.i)};
+}
+static inline C ccos(C z) {
+    return C{std::cos(z.r) * std::cosh(z.i), -std::sin(z.r) * std::sinh(z.i)};
+}
+static inline C ctan(C z) { return divc(csin(z), ccos(z)); }
+static inline C csinh(C z) {
+    return C{std::sinh(z.r) * std::cos(z.i), std::cosh(z.r) * std::sin(z.i)};
+}
+static inline C ccosh(C z) {
+    return C{std::cosh(z.r) * std::cos(z.i), std::sinh(z.r) * std::sin(z.i)};
+}
+static inline C ctanh(C z) { return divc(csinh(z), ccosh(z)); }
+
+static inline C casin_impl(C z) {
+    const C iz = C{-z.i, z.r};
+    const C root = csqrt(sub(C{1.0, 0.0}, mul(z, z)));
+    return mul(C{0.0, -1.0}, clog(add(iz, root)));
+}
+static inline C cacos_impl(C z) {
+    const C root = csqrt(sub(C{1.0, 0.0}, mul(z, z)));
+    return mul(C{0.0, -1.0}, clog(add(z, mul(C{0.0, 1.0}, root))));
+}
+static inline C catan_impl(C z) {
+    // (i/2) log((i + z)/(i - z))
+    const C I{0.0, 1.0};
+    const C q = divc(add(I, z), sub(I, z));
+    return mul(C{0.0, 0.5}, clog(q));
+}
+static inline C casinh_impl(C z) {
+    return clog(add(z, csqrt(add(mul(z, z), C{1.0, 0.0}))));
+}
+static inline C cacosh_impl(C z) {
+    return clog(add(z, csqrt(sub(mul(z, z), C{1.0, 0.0}))));
+}
+static inline C catanh_impl(C z) {
+    return scale(clog(divc(add(C{1.0, 0.0}, z), sub(C{1.0, 0.0}, z))), 0.5);
+}
+
+static const double LN10 = 2.3025850929940456840179914546843642;
+
+// ------------------------------------------------------------ function set --
+enum Fn : uint8_t {
+    F_SIN, F_COS, F_TAN, F_ASIN, F_ACOS, F_ATAN,
+    F_SINH, F_COSH, F_TANH, F_ASINH, F_ACOSH, F_ATANH,
+    F_EXP, F_LOG, F_LOG10, F_SQRT, F_CBRT,
+    F_ABS, F_ARG, F_CONJ, F_RE, F_IM, F_SGN, F_INV, F_SQR, F_CUBE,
+    F_FLOOR, F_CEIL, F_ROUND, F_SIGN, F_SQ, F_RECIP,
+    F_POW, F_ATAN2, F_HYPOT, F_MIN, F_MAX, F_LOGBASE,
+    F_COUNT
+};
+
+struct FnDef { const char* name; int arity; Fn id; };
+static const FnDef FN_DEFS[] = {
+    {"sin",1,F_SIN},   {"cos",1,F_COS},   {"tan",1,F_TAN},
+    {"asin",1,F_ASIN}, {"acos",1,F_ACOS}, {"atan",1,F_ATAN},
+    {"sinh",1,F_SINH}, {"cosh",1,F_COSH}, {"tanh",1,F_TANH},
+    {"asinh",1,F_ASINH},{"acosh",1,F_ACOSH},{"atanh",1,F_ATANH},
+    {"exp",1,F_EXP},   {"log",1,F_LOG},   {"ln",1,F_LOG},
+    {"log10",1,F_LOG10},{"sqrt",1,F_SQRT},{"cbrt",1,F_CBRT},
+    {"abs",1,F_ABS},   {"arg",1,F_ARG},   {"conj",1,F_CONJ},
+    {"re",1,F_RE},     {"real",1,F_RE},   {"im",1,F_IM}, {"imag",1,F_IM},
+    {"sgn",1,F_SGN},   {"inv",1,F_INV},   {"sqr",1,F_SQR},
+    {"cube",1,F_CUBE}, {"floor",1,F_FLOOR},{"ceil",1,F_CEIL},
+    {"round",1,F_ROUND},{"sign",1,F_SIGN},{"square",1,F_SQ},
+    {"recip",1,F_RECIP},
+    {"pow",2,F_POW},   {"atan2",2,F_ATAN2},{"hypot",2,F_HYPOT},
+    {"min",2,F_MIN},   {"max",2,F_MAX},   {"logbase",2,F_LOGBASE},
+};
+
+static C callFn(Fn f, C a, C b) {
+    switch (f) {
+        case F_SIN: return csin(a);
+        case F_COS: return ccos(a);
+        case F_TAN: return ctan(a);
+        case F_ASIN: return casin_impl(a);
+        case F_ACOS: return cacos_impl(a);
+        case F_ATAN: return catan_impl(a);
+        case F_SINH: return csinh(a);
+        case F_COSH: return ccosh(a);
+        case F_TANH: return ctanh(a);
+        case F_ASINH: return casinh_impl(a);
+        case F_ACOSH: return cacosh_impl(a);
+        case F_ATANH: return catanh_impl(a);
+        case F_EXP: return cexp(a);
+        case F_LOG: return clog(a);
+        case F_LOG10: return scale(clog(a), 1.0 / LN10);
+        case F_SQRT: return csqrt(a);
+        case F_CBRT: return cexp(scale(clog(a), 1.0 / 3.0));
+        case F_ABS: return C{std::hypot(a.r, a.i), 0.0};
+        case F_ARG: return C{std::atan2(a.i, a.r), 0.0};
+        case F_CONJ: return C{a.r, -a.i};
+        case F_RE: return C{a.r, 0.0};
+        case F_IM: return C{a.i, 0.0};
+        case F_SGN: {
+            const double m = std::hypot(a.r, a.i);
+            return m > 0 ? scale(a, 1.0 / m) : C{0.0, 0.0};
+        }
+        case F_INV: case F_RECIP: return inv(a);
+        case F_SQR: case F_SQ: return mul(a, a);
+        case F_CUBE: return mul(mul(a, a), a);
+        case F_FLOOR: return C{std::floor(a.r), std::floor(a.i)};
+        case F_CEIL: return C{std::ceil(a.r), std::ceil(a.i)};
+        case F_ROUND: return C{std::round(a.r), std::round(a.i)};
+        case F_SIGN: return C{a.r < 0 ? -1.0 : (a.r > 0 ? 1.0 : 0.0),
+                              a.i < 0 ? -1.0 : (a.i > 0 ? 1.0 : 0.0)};
+        case F_POW: return cpow(a, b);
+        case F_ATAN2: return C{std::atan2(a.r, b.r), 0.0};
+        case F_HYPOT: return C{std::hypot(a.r, b.r), 0.0};
+        case F_MIN: return abs2(a) <= abs2(b) ? a : b;
+        case F_MAX: return abs2(a) >= abs2(b) ? a : b;
+        case F_LOGBASE: return divc(clog(b), clog(a));
+        default: return C{0.0, 0.0};
+    }
+}
+
+// ------------------------------------------------------------- expression --
+enum : uint8_t {
+    OP_NUM, OP_Z, OP_C, OP_N, OP_P, OP_I, OP_PI, OP_E, OP_TAU, OP_PARAM,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_POW, OP_NEG,
+    OP_CALL1, OP_CALL2
+};
+struct Op {
+    uint8_t code = 0;
+    uint8_t fn = 0;
+    int16_t arg = 0;
+    C val{};
+};
+struct Program {
+    std::vector<Op> ops;
+    std::vector<std::string> params;
+    bool ok = false;
+};
+
+enum TokKind : uint8_t { T_END, T_NUM, T_ID, T_OP, T_LP, T_RP, T_COMMA };
+struct Tok {
+    TokKind k = T_END;
+    double num = 0.0;
+    std::string id;
+    char op = 0;
+    int pos = 0;
+};
+
+static std::string g_error;
+
+static std::vector<Tok> lex(const std::string& s, std::string& err) {
+    std::vector<Tok> out;
+    int p = 0;
+    const int n = static_cast<int>(s.size());
+    while (p < n) {
+        const char ch = s[p];
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') { ++p; continue; }
+        if ((ch >= '0' && ch <= '9') || (ch == '.' && p + 1 < n && s[p + 1] >= '0' && s[p + 1] <= '9')) {
+            int q = p;
+            while (q < n && ((s[q] >= '0' && s[q] <= '9') || s[q] == '.')) ++q;
+            if (q < n && (s[q] == 'e' || s[q] == 'E')) {
+                int k = q + 1;
+                if (k < n && (s[k] == '+' || s[k] == '-')) ++k;
+                if (k < n && s[k] >= '0' && s[k] <= '9') {
+                    while (k < n && s[k] >= '0' && s[k] <= '9') ++k;
+                    q = k;
+                }
+            }
+            Tok t; t.k = T_NUM; t.pos = p; t.num = std::strtod(s.substr(p, q - p).c_str(), nullptr);
+            out.push_back(std::move(t)); p = q; continue;
+        }
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_') {
+            int q = p;
+            while (q < n && ((s[q] >= 'a' && s[q] <= 'z') || (s[q] >= 'A' && s[q] <= 'Z') ||
+                             (s[q] >= '0' && s[q] <= '9') || s[q] == '_')) ++q;
+            Tok t; t.k = T_ID; t.pos = p; t.id = s.substr(p, q - p);
+            out.push_back(std::move(t)); p = q; continue;
+        }
+        if (ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '^') {
+            Tok t; t.k = T_OP; t.op = ch; t.pos = p; out.push_back(std::move(t)); ++p; continue;
+        }
+        if (ch == '(') { Tok t; t.k = T_LP; t.pos = p; out.push_back(std::move(t)); ++p; continue; }
+        if (ch == ')') { Tok t; t.k = T_RP; t.pos = p; out.push_back(std::move(t)); ++p; continue; }
+        if (ch == ',') { Tok t; t.k = T_COMMA; t.pos = p; out.push_back(std::move(t)); ++p; continue; }
+        err = "unexpected character '" + std::string(1, ch) + "' at " + std::to_string(p);
+        return {};
+    }
+    Tok e; e.k = T_END; e.pos = n; out.push_back(std::move(e));
+    return out;
+}
+
+struct Compiler {
+    std::vector<Tok> t;
+    int p = 0;
+    Program out;
+    std::string err;
+
+    const Tok& peek() const { return t[static_cast<size_t>(p)]; }
+    Tok take() { return t[static_cast<size_t>(p++)]; }
+    void emit(uint8_t code, uint8_t fn = 0, int arg = 0, C val = C{0.0, 0.0}) {
+        Op o; o.code = code; o.fn = fn; o.arg = static_cast<int16_t>(arg); o.val = val;
+        out.ops.push_back(o);
+    }
+    static bool startsValue(const Tok& x) {
+        return x.k == T_NUM || x.k == T_ID || x.k == T_LP;
+    }
+    static int prec(char op) {
+        switch (op) {
+            case '+': case '-': return 10;
+            case '*': case '/': return 20;
+            case '^': return 30;
+            default: return 0;
+        }
+    }
+    static uint8_t binCode(char op) {
+        switch (op) {
+            case '+': return OP_ADD;
+            case '-': return OP_SUB;
+            case '*': return OP_MUL;
+            case '/': return OP_DIV;
+            case '^': return OP_POW;
+            default: return OP_MUL;
+        }
+    }
+
+    void expr(int minPrec) {
+        prefix();
+        if (!err.empty()) return;
+        for (;;) {
+            const Tok& nx = peek();
+            int pr = 0;
+            bool implicit = false;
+            char op = '*';
+            if (nx.k == T_OP) { op = nx.op; pr = prec(op); if (pr < minPrec) break; take(); }
+            else if (startsValue(nx) && minPrec <= 20) { pr = 20; implicit = true; op = '*'; }
+            else break;
+            // '^' is right-associative; everything else is left-associative.
+            expr(op == '^' ? pr : pr + 1);
+            if (!err.empty()) return;
+            emit(implicit ? OP_MUL : binCode(op));
+        }
+    }
+
+    void prefix() {
+        const Tok x = take();
+        if (x.k == T_NUM) { emit(OP_NUM, 0, 0, C{x.num, 0.0}); return; }
+        if (x.k == T_OP && (x.op == '-' || x.op == '+')) {
+            expr(40);
+            if (x.op == '-') emit(OP_NEG);
+            return;
+        }
+        if (x.k == T_LP) {
+            expr(0);
+            if (err.empty()) {
+                if (peek().k != T_RP) { err = "missing ')' at " + std::to_string(peek().pos); return; }
+                take();
+            }
+            return;
+        }
+        if (x.k != T_ID) {
+            err = "expected a value at " + std::to_string(x.pos);
+            return;
+        }
+        if (peek().k == T_LP) {
+            take();  // '('
+            std::vector<Op> argOps;
+            int arity = 0;
+            if (peek().k != T_RP) {
+                for (;;) {
+                    const size_t before = out.ops.size();
+                    expr(0);
+                    if (!err.empty()) return;
+                    if (out.ops.size() == before) { err = "empty argument"; return; }
+                    ++arity;
+                    if (peek().k == T_COMMA) { take(); continue; }
+                    break;
+                }
+            }
+            if (peek().k != T_RP) { err = "missing ')' after " + x.id; return; }
+            take();
+            int found = -1, fa = 0;
+            for (const FnDef& d : FN_DEFS) {
+                if (x.id == d.name) { found = static_cast<int>(d.id); fa = d.arity; break; }
+            }
+            if (found < 0) { err = "unknown function '" + x.id + "'"; return; }
+            if (fa != arity) { err = x.id + " expects " + std::to_string(fa) + " argument(s)"; return; }
+            emit(fa == 1 ? OP_CALL1 : OP_CALL2, static_cast<uint8_t>(found));
+            return;
+        }
+        // Variables and constants.  Anything else is a named parameter.
+        if (x.id == "z") { emit(OP_Z); return; }
+        if (x.id == "c") { emit(OP_C); return; }
+        if (x.id == "n") { emit(OP_N); return; }
+        if (x.id == "p" || x.id == "zprev" || x.id == "z1") { emit(OP_P); return; }
+        if (x.id == "i" || x.id == "I") { emit(OP_I, 0, 0, C{0.0, 1.0}); return; }
+        if (x.id == "pi") { emit(OP_PI, 0, 0, C{3.14159265358979323846, 0.0}); return; }
+        if (x.id == "e" || x.id == "E") { emit(OP_E, 0, 0, C{2.71828182845904523536, 0.0}); return; }
+        if (x.id == "tau") { emit(OP_TAU, 0, 0, C{6.28318530717958647692, 0.0}); return; }
+        int idx = -1;
+        for (size_t k = 0; k < out.params.size(); ++k)
+            if (out.params[k] == x.id) { idx = static_cast<int>(k); break; }
+        if (idx < 0) { idx = static_cast<int>(out.params.size()); out.params.push_back(x.id); }
+        emit(OP_PARAM, 0, idx);
+    }
+};
+
+static std::vector<Program> g_programs;
+
+// --------------------------------------------------------------------- VM --
+static C runVM(const Program& P, C z, C c, double n, C prev,
+               const double* params, int nparam) {
+    C st[128];
+    int sp = 0;
+    for (const Op& o : P.ops) {
+        switch (o.code) {
+            case OP_NUM: st[sp++] = o.val; break;
+            case OP_Z: st[sp++] = z; break;
+            case OP_C: st[sp++] = c; break;
+            case OP_N: st[sp++] = C{n, 0.0}; break;
+            case OP_P: st[sp++] = prev; break;
+            case OP_I: case OP_PI: case OP_E: case OP_TAU: st[sp++] = o.val; break;
+            case OP_PARAM:
+                st[sp++] = (o.arg < nparam && params) ? C{params[o.arg], 0.0} : C{0.0, 0.0};
+                break;
+            case OP_NEG: { C a = st[--sp]; st[sp++] = neg(a); break; }
+            case OP_ADD: { C b = st[--sp], a = st[--sp]; st[sp++] = add(a, b); break; }
+            case OP_SUB: { C b = st[--sp], a = st[--sp]; st[sp++] = sub(a, b); break; }
+            case OP_MUL: { C b = st[--sp], a = st[--sp]; st[sp++] = mul(a, b); break; }
+            case OP_DIV: { C b = st[--sp], a = st[--sp]; st[sp++] = divc(a, b); break; }
+            case OP_POW: { C b = st[--sp], a = st[--sp]; st[sp++] = cpow(a, b); break; }
+            case OP_CALL1: { C a = st[--sp]; st[sp++] = callFn(static_cast<Fn>(o.fn), a, C{0.0, 0.0}); break; }
+            case OP_CALL2: { C b = st[--sp], a = st[--sp]; st[sp++] = callFn(static_cast<Fn>(o.fn), a, b); break; }
+            default: break;
+        }
+        if (sp < 0) sp = 0;
+        if (sp > 126) sp = 126;
+    }
+    return sp > 0 ? st[sp - 1] : C{0.0, 0.0};
+}
+
+// -------------------------------------------------------------- renderer ---
+static std::vector<float> g_field;
+
+extern "C" {
+
+__attribute__((export_name("fc_version")))
+int32_t fc_version(void) { return 1; }
+
+__attribute__((export_name("fc_alloc")))
+void* fc_alloc(int32_t n) { return std::malloc(n > 0 ? static_cast<size_t>(n) : 1); }
+
+__attribute__((export_name("fc_free")))
+void fc_free(void* p) { std::free(p); }
+
+__attribute__((export_name("fc_error")))
+const char* fc_error(void) { return g_error.c_str(); }
+
+__attribute__((export_name("fc_compile")))
+int32_t fc_compile(const char* src) {
+    g_error.clear();
+    if (!src) { g_error = "null expression"; return -1; }
+    std::string lexErr;
+    const std::vector<Tok> toks = lex(std::string(src), lexErr);
+    if (!lexErr.empty()) { g_error = lexErr; return -1; }
+    Compiler cp;
+    cp.t = toks;
+    cp.expr(0);
+    if (cp.err.empty() && cp.peek().k != T_END)
+        cp.err = "unexpected token at " + std::to_string(cp.peek().pos);
+    if (cp.err.empty() && cp.out.ops.empty()) cp.err = "empty expression";
+    if (!cp.err.empty()) { g_error = cp.err; return -1; }
+    cp.out.ok = true;
+    g_programs.push_back(std::move(cp.out));
+    return static_cast<int32_t>(g_programs.size()) - 1;
+}
+
+__attribute__((export_name("fc_param_count")))
+int32_t fc_param_count(int32_t prog) {
+    if (prog < 0 || static_cast<size_t>(prog) >= g_programs.size()) return -1;
+    return static_cast<int32_t>(g_programs[static_cast<size_t>(prog)].params.size());
+}
+
+__attribute__((export_name("fc_param_name")))
+const char* fc_param_name(int32_t prog, int32_t k) {
+    if (prog < 0 || static_cast<size_t>(prog) >= g_programs.size()) return "";
+    const auto& v = g_programs[static_cast<size_t>(prog)].params;
+    if (k < 0 || static_cast<size_t>(k) >= v.size()) return "";
+    return v[static_cast<size_t>(k)].c_str();
+}
+
+/* Whole-view render.  The field is one f32 per pixel: the smooth iteration
+ * for escaped pixels, -1 for interior — exactly what the page's
+ * shadeSmoothField() consumes for core.wasm frames. */
+__attribute__((export_name("fc_render")))
+int32_t fc_render(int32_t prog,
+                  const char* creS, const char* cimS,
+                  double zoomMant, int32_t zoomExp10,
+                  int32_t w, int32_t h, int32_t maxiter,
+                  int32_t mode, const char* jrS, const char* jiS,
+                  double bail2, int32_t nparam, const double* params,
+                  double rotCos, double rotSin) {
+    g_error.clear();
+    if (prog < 0 || static_cast<size_t>(prog) >= g_programs.size()) {
+        g_error = "bad program id"; return 1;
+    }
+    if (w < 1 || h < 1 || w > 8192 || h > 8192 || maxiter < 1 || maxiter > 2000000) {
+        g_error = "bad frame dimensions"; return 2;
+    }
+    const double zoom = zoomMant * std::pow(10.0, static_cast<double>(zoomExp10));
+    if (!(zoom > 0) || !std::isfinite(zoom)) {
+        g_error = "depth exceeds stage-1 (double) engine"; return 3;
+    }
+    const double ps = 3.0 / zoom / static_cast<double>(w);
+    const double cre = creS ? std::strtod(creS, nullptr) : 0.0;
+    const double cim = cimS ? std::strtod(cimS, nullptr) : 0.0;
+    const C jul{jrS ? std::strtod(jrS, nullptr) : 0.0,
+                jiS ? std::strtod(jiS, nullptr) : 0.0};
+    const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
+    const Program& P = g_programs[static_cast<size_t>(prog)];
+    g_field.assign(static_cast<size_t>(w) * h, -1.0f);
+
+    for (int y = 0; y < h; ++y) {
+        const double py = (static_cast<double>(y) + 0.5 - 0.5 * h) * ps;
+        for (int x = 0; x < w; ++x) {
+            const double px = (static_cast<double>(x) + 0.5 - 0.5 * w) * ps;
+            // Same basis as the page's planeDelta(): screen y grows downward,
+            // so the imaginary component of the offset is negated.
+            const double X = px, Y = -py;
+            const double u = X * rotCos - Y * rotSin;
+            const double v = X * rotSin + Y * rotCos;
+            const C pt{cre + u, cim + v};
+            C z = (mode == 1) ? pt : C{0.0, 0.0};
+            const C cc = (mode == 1) ? jul : pt;
+            C prev{0.0, 0.0};
+            float value = -1.0f;
+            for (int it = 0; it < maxiter; ++it) {
+                const C nz = runVM(P, z, cc, static_cast<double>(it), prev, params, nparam);
+                prev = z;
+                z = nz;
+                const double z2 = abs2(z);
+                if (!(z2 <= bail2)) {
+                    double sm;
+                    if (!std::isfinite(z2)) {
+                        /* exp / sinh / cos of a large complex value overflows.
+                         * There is no finite log|z| to smooth with, but the
+                         * pixel did escape: report the iteration itself rather
+                         * than letting NaN reach the field. */
+                        sm = static_cast<double>(it) + 1.0;
+                    } else {
+                        const double logz = 0.5 * std::log(std::max(z2, 1e-300));
+                        sm = static_cast<double>(it) + 1.0 -
+                             std::log2(logz / logBail);
+                    }
+                    if (!(sm >= 0.0) || !std::isfinite(sm)) sm = 0.0;
+                    value = static_cast<float>(sm);
+                    break;
+                }
+                if (!std::isfinite(z2)) break;
+            }
+            g_field[static_cast<size_t>(y) * w + x] = value;
+        }
+    }
+    return 0;
+}
+
+__attribute__((export_name("fc_out_ptr")))
+float* fc_out_ptr(void) { return g_field.empty() ? nullptr : g_field.data(); }
+
+__attribute__((export_name("fc_out_size")))
+int32_t fc_out_size(void) { return static_cast<int32_t>(g_field.size() * sizeof(float)); }
+
+}  // extern "C"

@@ -81,6 +81,26 @@ refreshes that copy from the desktop project, and `MB_SRC=<path>` builds against
 a desktop tree directly (which is what the author's machine does — the two
 produce byte-identical `core.wasm`).
 
+### Experimental: the arbitrary-formula core
+
+`formulacore/` is a **separate** C++ core, not wired into the page yet.  It
+compiles a user expression into bytecode and renders it:
+
+| file | what it is |
+| --- | --- |
+| `formulacore/core.cpp` | complex elementary-function library, Pratt expression compiler, stack VM, whole-view renderer, C ABI |
+| `formulacore/build.mjs` | zig -> wasm32-wasi (same toolchain as `webcore/`) |
+| `formulacore/test.mjs` | `z^2+c` pixel-exact against a Node reference, plus 9 nested-function cases |
+
+Stage 1 evaluates every pixel in double precision, so it is a **correctness
+reference, not the shipping engine**: it cannot survive deep zoom.  Stage 2 —
+the one that must ship — keeps ONE arbitrary-precision reference orbit (the
+project's BigFloat / GMP high-precision libraries) and advances each pixel with
+jet (automatic-differentiation) perturbation, series approximation and glitch
+repair, exactly like the Mandelbrot core.  That is how arbitrary precision and
+constant per-pixel speed coexist: precision cost grows only with that single
+orbit, never with the pixel count.
+
 ### Diagnostics
 
 | query | what it does |

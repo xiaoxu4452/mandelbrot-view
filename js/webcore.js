@@ -37,7 +37,7 @@ let seq = 0;
 const jobs = new Map();       // id -> { parts, want, resolve, reject, w, h }
 
 function bootOne() {
-  const w = new Worker('js/webcore-worker.js?v=54', { type: 'classic' });
+  const w = new Worker('js/webcore-worker.js?v=55', { type: 'classic' });
   w.ready = false;
   w.onmessage = (ev) => {
     const m = ev.data;
