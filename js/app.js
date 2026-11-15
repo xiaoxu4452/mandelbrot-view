@@ -2,29 +2,29 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=34';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=34';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=34';
-import { setLang, t, getLang } from './i18n.js?v=34';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=34';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=34';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=34';
-import { openCorePanel } from './corepanel.js?v=34';
-import { initGlassSelects } from './glass-select.js?v=34';
-import { composeTile } from './drawlib.js?v=34';
-import { SceneRenderer } from './glscene.js?v=34';
-import { MainGPU } from './wgpu/main.js?v=34';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=34';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=43';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=43';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=43';
+import { setLang, t, getLang } from './i18n.js?v=43';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=43';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=43';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=43';
+import { openCorePanel } from './corepanel.js?v=43';
+import { initGlassSelects } from './glass-select.js?v=43';
+import { composeTile } from './drawlib.js?v=43';
+import { SceneRenderer } from './glscene.js?v=43';
+import { MainGPU } from './wgpu/main.js?v=43';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=43';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=34';
-import { initJuliaView } from './juliaview.js?v=34';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=34';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=43';
+import { initJuliaView } from './juliaview.js?v=43';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=43';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=34';
-import { KINDS } from './formulas.js?v=34';
-import * as webcore from './webcore.js?v=6';
+         REF_MAX_PARAM } from './refpreset.js?v=43';
+import { KINDS } from './formulas.js?v=43';
+import * as webcore from './webcore.js?v=15';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=34';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=43';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1083,7 +1083,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=34', { type: 'module' });
+    const w = new Worker('js/worker.js?v=43', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -3065,6 +3065,10 @@ let coreOff = !CORE_ENGINE;
 let coreLoaded = false;
 let coreBooting = false;
 let coreGen = 0;
+/* Consecutive frame failures.  One bad frame (a worker that died, an OOM) must
+ * not silently downgrade the session to the old kernel; three in a row is a
+ * real incompatibility. */
+let coreFails = 0;
 
 /* Pixel budget for one core frame.  The core is scalar wasm (no AVX2, no
  * threads), so cost is ~1.4 s per megapixel on a deep view: a 4.2 Mpx buffer is
@@ -3079,24 +3083,28 @@ const CORE_PREVIEW_SCALE = 0.34;
 
 /** Can the core draw this view at all?  Everything it cannot do stays on the
  * page's own pipeline rather than being silently wrong. */
+let coreWhy = '';
 function coreCanDraw() {
-  if (coreOff || !coreLoaded) return false;
-  if (nativeCanvasMode()) return false;
+  const no = (why) => { coreWhy = why; return false; };
+  if (coreOff) return no('off');
+  if (!coreLoaded) return no('loading');
+  if (nativeCanvasMode()) return no('native');
   const spec = state.spec;
   if (spec.mode === 'j') {
-    if ((spec.power | 0 || 2) !== 2) return false;      // z^2 + k only
+    if ((spec.power | 0 || 2) !== 2) return no('julia-power');   // z^2 + k only
   } else if (spec.mode === 'm') {
     /* The core's z^2+c; multibrot powers, tricorn, burning ship, celtic,
      * perpendicular and phoenix are the page kernel's own families. */
-    if (spec.kind !== 'mandelbrot') return false;
-    if ((spec.power | 0 || 2) !== 2) return false;
+    if (spec.kind !== 'mandelbrot') return no('kind:' + spec.kind);
+    if ((spec.power | 0 || 2) !== 2) return no('power:' + spec.power);
   } else {
-    return false;
+    return no('mode:' + spec.mode);
   }
-  if (state.traps > 0 || state.inverse) return false;
-  if (state.scheme === 'distance') return false;
-  if (state.rotation) return false;
-  if (state.glsl && String(state.glsl).trim()) return false;
+  if (state.traps > 0 || state.inverse) return no('traps');
+  if (state.scheme === 'distance') return no('distance');
+  if (state.rotation) return no('rotation');
+  if (state.glsl && String(state.glsl).trim()) return no('glsl');
+  coreWhy = '';
   return true;
 }
 
@@ -3120,6 +3128,10 @@ function coreJob(scale, maxiter) {
 function coreFrame(job, gen, final, aa = 1) {
   return webcore.coreRender(job).then((msg) => {
     if (gen !== coreGen) return false;         // a newer view owns the canvas
+    /* The view can also move without a new pass being dispatched (a gesture in
+     * progress); painting this frame then would fight the preview. */
+    if (job.re !== state.center.re || job.im !== state.center.im ||
+        job.span.m !== state.span.m || job.span.e !== state.span.e) return false;
     const st0 = msg.stats || {};
     const cycle = coreCycleFor(st0.minEsc, st0.maxEsc);
     const rgba = shadeSmoothField(msg.field, msg.w, msg.h, cycle,
@@ -3156,6 +3168,7 @@ function coreFrame(job, gen, final, aa = 1) {
                   bounded: lastMeta.bounded };
     tileTotal = 1; tileDone = 1;
     frameMs = msg.ms;
+    coreFails = 0;
     if (!splash.finished) { splash.set(0.68, 'bootFirst'); splash.finish(); }
     updateHud(true);
     takeSnapshot();
@@ -3202,7 +3215,7 @@ function corePass() {
   const runFinal = () => {
     if (gen !== coreGen) return;
     coreFrame(coreJob(scaleFinal * aa, it), gen, true, aa)
-      .catch(() => { coreOff = true; renderNow(); });
+      .catch(() => { coreFails++; if (coreFails >= 3) coreOff = true; renderNow(); });
   };
   const wantPreview = W * H * scaleFinal * scaleFinal > CORE_MAX_PIXELS * 0.5;
   if (wantPreview) {
@@ -3282,7 +3295,10 @@ function blitSnapshot(dx, dy, scale = 1, cx = 0, cy = 0) {
    * `sceneCanDraw` — not `sceneView()` alone: a view the shader builds but
    * cannot draw (past df64's reach) returned truthy here and every pointer
    * event was swallowed, so a deep pan did not move the picture at all. */
-  if (glSurface && scene.ok && state.gpu) {
+  if (SCENE_FINAL_ENABLED && glSurface && scene.ok && state.gpu) {
+    /* Only a shader that is allowed to draw may swallow the gesture.  With the
+     * shader off (the default) the GL layer is never the live picture, so
+     * returning here left the bitmap frozen under the fingers. */
     const sv = sceneView();
     if (sv && sceneCanDraw(sv, false)) return;
   }
@@ -3534,10 +3550,12 @@ function startPinch() {
   if (!m) return;
   drag = null;
   canvas.classList.remove('dragging');
-  /* One canvas, one owner: a CPU pass still in flight would land on top of
-   * the pinch preview and snap the picture back under the fingers.  The
-   * single-pointer drag path already does this on first movement. */
+  /* One canvas, one owner: a pass still in flight would land on top of the
+   * pinch preview and snap the picture back under the fingers.  The single
+   * pointer drag path already does this on first movement; the core's own
+   * frame is invalidated by the generation bump (it renders the *old* view). */
   cancelAll();
+  coreGen++;
   takeSnapshot();
   /* Remember the view the gesture started from: every pointer event rebuilds
    * the view from these numbers instead of accumulating on the last one, so a
@@ -3615,17 +3633,29 @@ canvas.addEventListener('pointermove', (e) => {
       updateHud();
       return;
     }
-    if (state.gpu && scene.ok) {
-      sceneLive();
+    /* `sceneLive()` declines every frame while the shader is off (it is the
+     * default: the core owns committed frames).  This branch used to return on
+     * `state.gpu && scene.ok` alone, so on any device with WebGL — every phone
+     * — a pinch moved the *view* but never the picture: the fingers had
+     * nothing to grab until the pass landed.  Only a shader that actually drew
+     * may own the gesture. */
+    if (state.gpu && scene.ok && sceneLive()) {
       updateHud();
       return;
     }
     const vf = viewFit();
     const s = 1 / vf.k;
-    const scale = clamp(pinch.d0 / m.d, 0.2, 5);
+    /* Fingers apart (m.d > d0) zooms *in*: the span in `applyPinch` is
+     * multiplied by d0/d (<1), so the old frame has to be drawn magnified by
+     * the reciprocal.  Passing d0/d here shrank the picture while the view
+     * zoomed in — the preview moved opposite to the fingers. */
+    const scale = clamp(m.d / pinch.d0, 0.2, 5);
     const ax = (m.cx - vf.ox) * s;
     const ay = (m.cy - vf.oy) * s;
     blitSnapshot((m.cx - pinch.cx0) * s, (m.cy - pinch.cy0) * s, scale, ax, ay);
+    /* The zoom readout follows the fingers like the picture does; without this
+     * it sat on the pre-gesture value until the frame landed. */
+    updateHudSoon();
     return;
   }
 
@@ -7406,7 +7436,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=34')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=43')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a
@@ -7477,6 +7507,7 @@ function boot() {
                   /* Which palette band the current frame is shaded with, and
                    * from what: the core caches smooth iterations, so this is
                    * the only place to see the band rule's decision. */
+                  coreWhy: () => coreWhy || 'ok',
                   bands: () => ({
                     auto: !!state.cycleAuto, cycle: state.cycle | 0,
                     eff: effectiveCycle(),

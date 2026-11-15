@@ -1,58 +1,120 @@
 // webcore.js — the page's render engine: the desktop core, compiled to wasm.
 //
 // `C:\Users\harve\Desktop\mande\new` (the "Retinamandelbrot" core) is compiled
-// to core.wasm by webcore/build.mjs; this module is the thin client.  It
-// renders a whole frame and hands back the *colour position* of every pixel in
-// the same encoding the page's own field path always used (0..1, negative =
-// interior), so the UI shades it with its own palette table exactly as before.
+// to core.wasm by webcore/build.mjs; this module is the thin client.  It hands
+// back the *smooth iteration* of every pixel in the encoding the page's own
+// field path always used (negative = interior), so the UI shades it with its
+// own palette exactly as before.
 //
-// The picture therefore comes from the desktop core — reference orbit,
-// perturbation, glitch repair, series approximation, arbitrary precision — and
-// the page keeps only what it owns: the gestures, the palette, the HUD.
+// One frame is rendered by a small pool of wasm instances, each owning a
+// horizontal band (adapter.cpp `mb_render_strip`).  wasm is single-threaded —
+// GitHub Pages cannot send COOP/COEP, so there is no SharedArrayBuffer and no
+// pthreads — but rows are independent, and the only shared piece, the
+// reference orbit, is a small part of a frame's cost.  The pool is what makes
+// a scalar core use the machine's (or the phone's) cores.
 
-let worker = null;
-let seq = 0;
-const pending = new Map();
+const MAX_WORKERS = 4;
+/* `?bands=N` pins the split so the choice can be measured instead of guessed. */
+const FORCE_BANDS = (() => {
+  const n = Number(new URLSearchParams(location.search).get('bands') || 0);
+  return Number.isFinite(n) && n > 0 ? Math.min(8, n | 0) : 0;
+})();
+const poolSize = (() => {
+  const hc = (navigator.hardwareConcurrency || 4) | 0;
+  /* Leave a core for the UI thread and the compositor. */
+  return Math.max(1, Math.min(MAX_WORKERS, hc - 1));
+})();
+
+let workers = [];
+let booting = null;
 let ready = false;
 let failed = false;
-let onReady = null;
+let seq = 0;
+const jobs = new Map();       // id -> { parts, want, resolve, reject, w, h }
 
-function ensure() {
-  if (worker) return worker;
-  worker = new Worker('js/webcore-worker.js?v=7', { type: 'classic' });
-  worker.onmessage = (ev) => {
+function bootOne() {
+  const w = new Worker('js/webcore-worker.js?v=20', { type: 'classic' });
+  w.ready = false;
+  w.onmessage = (ev) => {
     const m = ev.data;
-    if (m.type === 'ready') {
-      ready = true;
-      if (onReady) onReady();
+    if (m.type === 'ready') { w.ready = true; return; }
+    const job = jobs.get(m.id);
+    if (!job) return;                        // a frame nobody is waiting for
+    if (m.type === 'error') {
+      jobs.delete(m.id);
+      job.reject(new Error(m.err || 'core error'));
       return;
     }
-    const job = pending.get(m.id);
-    if (!job) return;
-    pending.delete(m.id);
-    if (m.type === 'error') job.reject(new Error(m.err || 'core error'));
-    else job.resolve(m);
+    job.parts.push(m);
+    if (job.parts.length < job.want) return;
+    jobs.delete(m.id);
+    job.resolve({
+      w: job.w, h: job.h,
+      field: assemble(job.parts, job.w, job.h),
+      stats: mergeStats(job.parts),
+      ms: job.parts.reduce((a, p) => Math.max(a, p.ms), 0),
+    });
   };
-  worker.onerror = (e) => {
+  w.onerror = (e) => {
     failed = true;
-    for (const [, j] of pending) j.reject(new Error(e.message || 'worker failed'));
-    pending.clear();
+    for (const [, j] of jobs) j.reject(new Error(e.message || 'worker failed'));
+    jobs.clear();
   };
-  worker.postMessage({ cmd: 'boot' });
-  return worker;
+  w.postMessage({ cmd: 'boot' });
+  return w;
+}
+
+function mergeStats(parts) {
+  const st = { seconds: 0, pixels: 0, glitches: 0, refLen: 0, precDigits: 0,
+               log10Zoom: 0, minEsc: Infinity, maxEsc: -Infinity, bounded: 0 };
+  for (const p of parts) {
+    const s = p.stats || {};
+    st.seconds += s.seconds || 0;
+    st.pixels += s.pixels || 0;
+    st.glitches += s.glitches || 0;
+    st.bounded += s.bounded || 0;
+    st.refLen = Math.max(st.refLen, s.refLen || 0);
+    st.precDigits = Math.max(st.precDigits, s.precDigits || 0);
+    st.log10Zoom = s.log10Zoom || st.log10Zoom;
+    if (Number.isFinite(s.minEsc)) st.minEsc = Math.min(st.minEsc, s.minEsc);
+    if (Number.isFinite(s.maxEsc)) st.maxEsc = Math.max(st.maxEsc, s.maxEsc);
+  }
+  if (!Number.isFinite(st.minEsc)) st.minEsc = 0;
+  if (!Number.isFinite(st.maxEsc)) st.maxEsc = 0;
+  return st;
+}
+
+function assemble(parts, w, h) {
+  const out = new Float32Array(w * h);
+  for (const p of parts) out.set(p.field, (p.y0 | 0) * w);
+  return out;
+}
+
+function ensure() {
+  if (workers.length) return workers;
+  workers = Array.from({ length: poolSize }, () => bootOne());
+  return workers;
 }
 
 export function coreFailed() { return failed; }
 
-/** Resolves once the wasm core is loaded (or rejects after a first failure). */
+/** Resolves once every wasm instance in the pool is loaded. */
 export function coreReady() {
   if (ready) return Promise.resolve(true);
   if (failed) return Promise.reject(new Error('core unavailable'));
   ensure();
-  return new Promise((resolve, reject) => {
-    onReady = () => resolve(true);
-    setTimeout(() => reject(new Error('core load timeout')), 60000);
-  });
+  if (!booting) {
+    booting = new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      const tick = () => {
+        if (workers.every((w) => w.ready)) { ready = true; resolve(true); return; }
+        if (Date.now() - t0 > 60000) { reject(new Error('core load timeout')); return; }
+        setTimeout(tick, 40);
+      };
+      tick();
+    });
+  }
+  return booting;
 }
 
 /* The page's span is the complex width of the frame as m * 2^e.  The core
@@ -70,7 +132,7 @@ function zoomFromSpan(span) {
 }
 
 /**
- * Render one frame with the core.
+ * Render one frame with the pool.
  *   re, im    the centre exactly as the page holds it (a decimal string at
  *             full depth — never rounded through a double here)
  *   span      { m, e } complex width of the *whole* canvas
@@ -78,31 +140,58 @@ function zoomFromSpan(span) {
  *             with the same span: the region covered does not change)
  *   maxiter   iteration ceiling
  *
- * The reply carries the smooth iteration count per pixel (interior = -1) plus
- * the frame's stats; the palette band is the page's business.
+ * Replies with the smooth iteration of every pixel (interior = -1) and the
+ * frame's stats; the palette band is the page's business.
  */
 export function coreRender({ re, im, span, w, h, maxiter, julia, juliaRe, juliaIm }) {
   ensure();
   const z = zoomFromSpan(span);
   const id = ++seq;
+  const base = {
+    re: String(re), im: String(im),
+    zoomMant: z.mant, zoomExp10: z.exp,
+    width: w | 0, height: h | 0, maxiter: maxiter | 0,
+    julia: !!julia, juliaRe: String(juliaRe || '0'), juliaIm: String(juliaIm || '0'),
+  };
+  /* How many bands is a cost decision, and it was measured rather than
+   * guessed: each band builds its own reference orbit (wasm instances cannot
+   * share one — no SharedArrayBuffer on Pages), which is 4% of a shallow frame
+   * and 17% of a 10^600 one.  Even at 17% the pixels dominate, so the pool is
+   * worth it at every depth on a 16-core machine:
+   *
+   *   bands   1       2       4
+   *   home    625ms   340ms   261ms
+   *   lz6    4478ms  2548ms  1340ms
+   *   ci600  1586ms  1519ms  1139ms   (1280x900 headless, min of repeats)
+   *
+   * A band must still be tall enough that per-instance start-up is not all of
+   * its work; below ~24 rows that is what it becomes. */
+  const k = Math.max(1, Math.min(FORCE_BANDS || workers.length, Math.floor((h | 0) / 24)));
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    worker.postMessage({ cmd: 'render', id, job: {
-      re: String(re), im: String(im),
-      zoomMant: z.mant, zoomExp10: z.exp,
-      width: w | 0, height: h | 0, maxiter: maxiter | 0,
-      julia: !!julia, juliaRe: String(juliaRe || '0'), juliaIm: String(juliaIm || '0'),
-      field: true,
-    } });
+    const job = { parts: [], want: 1, resolve, reject, w: w | 0, h: h | 0 };
+    jobs.set(id, job);
+    if (k <= 1) {
+      workers[0].postMessage({ cmd: 'render', id, job: base });
+      return;
+    }
+    job.want = k;
+    for (let i = 0; i < k; i++) {
+      const y0 = Math.round((i * h) / k);
+      const y1 = Math.round(((i + 1) * h) / k);
+      workers[i].postMessage({ cmd: 'strip', id, job: { ...base, y0, y1 } });
+    }
   });
 }
 
 /** View operations — the core owns the arithmetic, the page only asks. */
 export function coreZoom(x, y, factor) {
   ensure();
-  worker.postMessage({ cmd: 'zoom', x, y, factor });
+  workers[0].postMessage({ cmd: 'zoom', x, y, factor });
 }
 export function corePan(dx, dy) {
   ensure();
-  worker.postMessage({ cmd: 'pan', dx, dy });
+  workers[0].postMessage({ cmd: 'pan', dx, dy });
 }
+
+/** How many wasm instances a frame is split across (for the HUD and tests). */
+export function coreWorkers() { return poolSize; }

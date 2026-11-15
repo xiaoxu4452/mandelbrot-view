@@ -10,7 +10,7 @@
  * format; the 10-bit target lives immediately before presentation.
  * ------------------------------------------------------------------ */
 
-import { COMPUTE_WGSL, SHADE_WGSL, PRESENT_WGSL, computeWgslWithoutDoubleFloat } from './wgsl.js?v=34';
+import { COMPUTE_WGSL, SHADE_WGSL, PRESENT_WGSL, computeWgslWithoutDoubleFloat } from './wgsl.js?v=43';
 import {
   buildReferenceOrbit,
   buildBla,
@@ -22,7 +22,7 @@ import {
   pickSurvivor,
   OrbitCache,
   gmpLib
-} from './ref-orbit.js?v=34';
+} from './ref-orbit.js?v=43';
 
 const WG = 8;
 

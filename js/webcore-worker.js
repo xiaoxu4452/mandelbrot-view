@@ -18,7 +18,7 @@
 let core = null;
 
 async function loadCore() {
-  const resp = await fetch('../core.wasm?v=9');
+  const resp = await fetch('../core.wasm?v=18');
   const bytes = await resp.arrayBuffer();
   const mod = await WebAssembly.compile(bytes);
   let memView = null;
@@ -93,24 +93,29 @@ async function loadCore() {
       return e.mb_view_pinch(x0, y0, x1, y1, f) === 0 ? viewState() : null;
     },
 
-    /* One whole frame.  The centre strings go in verbatim (the legacy explicit
-     * ABI), so nothing here re-prints a 100-digit coordinate before the core
-     * parses it. */
-    render(job) {
+    /* One whole frame, or one horizontal band of it.  The centre strings go in
+     * verbatim (the explicit-coordinate ABI), so nothing here re-prints a
+     * 100-digit coordinate before the core parses it. */
+    render(job, band) {
       const a = writeStr(job.re);
       const b = writeStr(job.im);
       const jr = writeStr(job.juliaRe || '0');
       const ji = writeStr(job.juliaIm || '0');
       const pal = writeStr('');            // empty => four-channel field
-      const w = job.width | 0, h = job.height | 0;
+      const w = job.width | 0;
+      const hFull = job.height | 0;
+      const y0 = band ? band[0] | 0 : 0;
+      const y1 = band ? band[1] | 0 : hFull;
+      const h = y1 - y0;
       const t0 = performance.now();
-      const rc = e.mb_render(
-        a, b, Number(job.zoomMant) || 1, job.zoomExp10 | 0,
-        w, h, job.maxiter | 0,
-        job.julia ? 1 : 0, jr, ji,
-        pal, 0, 0,
-        16, 1, 1, 0, 1,
-        1.0, 0.0, job.interiorPalette ? 1 : 0);
+      const common = [a, b, Number(job.zoomMant) || 1, job.zoomExp10 | 0];
+      const rc = band
+        ? e.mb_render_strip(...common, w, hFull, y0, y1, job.maxiter | 0,
+            job.julia ? 1 : 0, jr, ji, pal, 0, 0, 16, 1, 1, 0, 1, 1, 0,
+            job.interiorPalette ? 1 : 0)
+        : e.mb_render(...common, w, h, job.maxiter | 0,
+            job.julia ? 1 : 0, jr, ji, pal, 0, 0, 16, 1, 1, 0, 1, 1, 0,
+            job.interiorPalette ? 1 : 0);
       const ms = performance.now() - t0;
       const err = rc ? readStr(e.mb_error()) : '';
       const outP = e.mb_out_ptr(), outN = e.mb_out_size();
@@ -118,7 +123,7 @@ async function loadCore() {
       const stats = statsPOD();
       e.mb_free(a, 1); e.mb_free(b, 1); e.mb_free(jr, 1);
       e.mb_free(ji, 1); e.mb_free(pal, 1);
-      if (rc) return { rc, err, mode, ms, stats, w, h };
+      if (rc) return { rc, err, mode, ms, stats, w, h, y0 };
 
       const n = w * h;
       const pos = new Float32Array(n);
@@ -130,16 +135,16 @@ async function loadCore() {
          * another render. */
         const f = new Float32Array(e.memory.buffer, outP, n * 4);
         for (let i = 0, q = 0; i < n; i++, q += 4) {
-          const s = f[q];
-          if (s >= 0) pos[i] = s; else { pos[i] = -1; inside++; }
+          const sv = f[q];
+          if (sv >= 0) pos[i] = sv; else { pos[i] = -1; inside++; }
         }
       } else {
         /* No field (a future palette mode): report it rather than serving an
          * all-black picture as if it were a render. */
-        return { rc: 2, err: 'core returned an image, not a field', mode, ms, stats, w, h };
+        return { rc: 2, err: 'core returned an image, not a field', mode, ms, stats, w, h, y0 };
       }
       stats.bounded = inside;
-      return { rc: 0, err: '', mode, ms, stats, w, h, field: pos };
+      return { rc: 0, err: '', mode, ms, stats, w, h, y0, field: pos };
     },
   };
 }
@@ -175,12 +180,24 @@ self.onmessage = async (ev) => {
         break;
       }
       case 'render': {
-        const r = core.render(msg.job || {});
+        const r = core.render(msg.job || {}, null);
         if (r.field) {
-          self.postMessage({ type: 'frame', id: msg.id, w: r.w, h: r.h,
+          self.postMessage({ type: 'frame', id: msg.id, w: r.w, h: r.h, y0: 0,
             field: r.field, stats: r.stats, ms: r.ms, err: '' }, [r.field.buffer]);
         } else {
           self.postMessage({ type: 'error', id: msg.id, err: r.err || 'render failed',
+            stats: r.stats, ms: r.ms });
+        }
+        break;
+      }
+      case 'strip': {
+        const j = msg.job || {};
+        const r = core.render(j, [j.y0 | 0, j.y1 | 0]);
+        if (r.field) {
+          self.postMessage({ type: 'frame', id: msg.id, w: r.w, h: r.h, y0: r.y0,
+            field: r.field, stats: r.stats, ms: r.ms, err: '' }, [r.field.buffer]);
+        } else {
+          self.postMessage({ type: 'error', id: msg.id, err: r.err || 'strip failed',
             stats: r.stats, ms: r.ms });
         }
         break;

@@ -142,7 +142,12 @@ int32_t render_from(const std::string& cre, const std::string& cim,
     if (field_mode) {
         g_field4.assign(static_cast<size_t>(w) * h * 4, 0.0f);
         req.field4 = g_field4.data();
-        req.field_distance = true;
+        /* No derivative channels: the page shades the smooth iteration only,
+         * so the distance would be computed and thrown away.  Leaving it off
+         * also keeps the 4-wide perturbation loop eligible (`quad_usable`
+         * refuses a reference that wants distance), measured 1.36x faster on
+         * a 10^600 frame. */
+        req.field_distance = false;
     } else {
         req.field4 = nullptr;
     }
@@ -348,6 +353,57 @@ int32_t mb_view_render(int32_t w, int32_t h, int32_t maxiter, int32_t julia,
                        cstr(palette), paletteScale, colorMode, saOrder, useSa,
                        tileRebase, exact, threads, rotCos, rotSin,
                        interiorPalette, view().span);
+}
+
+/* ---- horizontal strips: one frame, several wasm instances --------------
+ *
+ * wasm here is single-threaded (GitHub Pages cannot send COOP/COEP, so no
+ * SharedArrayBuffer and no pthreads).  The cheap way to use a phone's cores is
+ * therefore N independent instances, each rendering a horizontal band of the
+ * same frame: rows do not depend on each other, and the only shared piece —
+ * the reference orbit — is a small fraction of the cost at every depth
+ * measured (12 ms of a 1300 ms 10^600 frame).
+ *
+ * A band's centre is the frame centre shifted by half the band's offset at the
+ * frame's own pixel scale, computed here in BigFloat; the page never
+ * arithmetic-shifts a coordinate.
+ */
+Viewport& strip_view() { static Viewport v; return v; }
+
+__attribute__((export_name("mb_render_strip")))
+int32_t mb_render_strip(int32_t centerRe, int32_t centerIm, double zoomMant,
+                        int32_t zoomExp10, int32_t width, int32_t heightFull,
+                        int32_t y0, int32_t y1, int32_t maxiter, int32_t julia,
+                        int32_t juliaRe, int32_t juliaIm, int32_t palette,
+                        double paletteScale, int32_t colorMode, int32_t saOrder,
+                        int32_t useSa, int32_t tileRebase, int32_t exact,
+                        int32_t threads, double rotCos, double rotSin,
+                        int32_t interiorPalette) {
+    if (y1 <= y0 || heightFull <= 0 || width <= 0) return 3;
+    mbxx::clear_error();
+    Viewport& v = strip_view();
+    v.zoom_mantissa = zoomMant > 0.0 ? zoomMant : 1.0;
+    v.zoom_exp10 = static_cast<int64_t>(zoomExp10);
+    v.width = width;
+    v.height = heightFull;              // pixel scale comes from the full frame
+    v.recalc();
+    v.center_re = BigFloat::from_string(cstr(centerRe));
+    if (mbxx::take_error()) return 1;
+    v.center_im = BigFloat::from_string(cstr(centerIm));
+    if (mbxx::take_error()) return 2;
+    const double dy = 0.5 * (static_cast<double>(y0) + static_cast<double>(y1))
+                    - 0.5 * static_cast<double>(heightFull);
+    v.pan_pixels(0.0, dy);
+    const int dec = v.plan.digits + 4;
+    const std::string cre = v.center_re.to_fixed(dec);
+    const std::string cim = v.center_im.to_fixed(dec);
+    return render_from(cre, cim, v.zoom_mantissa, v.zoom_exp10,
+                       width, y1 - y0, maxiter, julia != 0,
+                       julia ? cstr(juliaRe) : std::string(),
+                       julia ? cstr(juliaIm) : std::string(),
+                       cstr(palette), paletteScale, colorMode, saOrder, useSa,
+                       tileRebase, exact, threads, rotCos, rotSin,
+                       interiorPalette, v.span);
 }
 
 /* ---- legacy ABI: explicit coordinates ---------------------------------- */

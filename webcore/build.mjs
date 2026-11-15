@@ -178,7 +178,8 @@ console.log(`[mirror] ${TUS.length + HEADERS.length} files from desktop original
 
 // ---- compile ----------------------------------------------------------------
 const flags = [
-  '-target', 'wasm32-wasi', '-std=c++20', '-O2', '-fno-exceptions',
+  '-target', 'wasm32-wasi', '-std=c++20', process.env.MB_OPT || '-O2', '-fno-exceptions',
+  ...(process.env.MB_SIMD ? ['-msimd128'] : []),
   '-I', MIRROR,
   '-Wl,--no-entry',
   '-Wl,--export-memory',

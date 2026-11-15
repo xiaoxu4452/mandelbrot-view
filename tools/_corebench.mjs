@@ -2,15 +2,18 @@
 // for?  Prints wall ms and ms/Mpx so the preview scale is a decision, not a
 // guess.  Field mode (empty palette) because that is what the page consumes.
 //
-// usage: node tools/_corebench.mjs
+// usage: node tools/_corebench.mjs [wasmPath] [repeats]
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = 'D:/mandelbrot view';
 
+const WASM = process.argv[2] || path.join(ROOT, 'core.wasm');
+const REPEATS = Number(process.argv[3] || 1);
+
 async function loadCore() {
-  const mod = new WebAssembly.Module(fs.readFileSync(path.join(ROOT, 'core.wasm')));
+  const mod = new WebAssembly.Module(fs.readFileSync(WASM));
   const clock = (id, prec, out) => {
     if (out) new DataView(e.memory.buffer).setBigUint64(out, BigInt(Date.now()) * 1000000n, true);
     return 0;
@@ -61,10 +64,15 @@ const VIEWS = [
 
 for (const v of VIEWS) {
   for (const [w, h] of [[300, 170], [600, 340], [1248, 704]]) {
-    const r = render({ ...v, w, h });
+    let best = Infinity, last = null;
+    for (let i = 0; i < REPEATS; i++) {
+      last = render({ ...v, w, h });
+      if (last.ms < best) best = last.ms;
+    }
+    const r = last;
     const mpx = (w * h) / 1e6;
     console.log(`${v.tag.padEnd(7)} ${String(w + 'x' + h).padEnd(10)} rc=${r.rc} mode=${r.mode} ` +
-      `${r.ms.toFixed(0).padStart(6)}ms  ${(r.ms / mpx).toFixed(0).padStart(5)} ms/Mpx  ` +
+      `${best.toFixed(0).padStart(6)}ms  ${(best / mpx).toFixed(0).padStart(5)} ms/Mpx  ` +
       `ref=${r.refLen} dig=${r.digits} esc=${r.minEsc}..${r.maxEsc}`);
   }
 }
