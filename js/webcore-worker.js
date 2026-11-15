@@ -18,7 +18,7 @@
 let core = null;
 
 async function loadCore() {
-  const resp = await fetch('../core.wasm?v=18');
+  const resp = await fetch('../core.wasm?v=20');
   const bytes = await resp.arrayBuffer();
   const mod = await WebAssembly.compile(bytes);
   let memView = null;
@@ -31,11 +31,36 @@ async function loadCore() {
     }
     return 0;
   };
+  /* A WASI stub that returns 0 without writing its out-parameters is not a
+   * no-op: libc reads whatever was in that memory.  `environ_sizes_get` was the
+   * one that hurt — the core's first getenv() (its B2_* experiment knobs) makes
+   * libc allocate an "environment" of whatever garbage size those two words
+   * held, which measured 512 MB of zeroed memory **per wasm instance**.  Four
+   * band workers then held 2 GB of nothing, which is why splitting a deep frame
+   * across them looked no faster than one instance: they were thrashing, not
+   * computing.  Write the zeroes. */
   const imports = { wasi_snapshot_preview1: {} };
+  const zeroes = (a, b) => {
+    const dv = new DataView(coreMem.buffer);
+    dv.setUint32(a, 0, true);
+    if (b) dv.setUint32(b, 0, true);
+    return 0;
+  };
+  const stubs = {
+    clock_time_get: clock,
+    environ_sizes_get: zeroes,      // empty environment: no B2_* knobs in wasm
+    environ_get: zeroes,
+    args_sizes_get: zeroes,
+    args_get: zeroes,
+    fd_write: (fd, iovs, n, written) => {
+      new DataView(coreMem.buffer).setUint32(written, 0, true);
+      return 0;
+    },
+  };
   for (const imp of WebAssembly.Module.imports(mod)) {
     imports[imp.module] ||= {};
     if (imp.kind !== 'function') { imports[imp.module][imp.name] = 0; continue; }
-    imports[imp.module][imp.name] = imp.name === 'clock_time_get' ? clock : () => 0;
+    imports[imp.module][imp.name] = stubs[imp.name] || (() => 0);
   }
   const instance = await WebAssembly.instantiate(mod, imports);
   const e = instance.exports;

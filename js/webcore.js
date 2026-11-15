@@ -13,7 +13,11 @@
 // reference orbit, is a small part of a frame's cost.  The pool is what makes
 // a scalar core use the machine's (or the phone's) cores.
 
-const MAX_WORKERS = 4;
+/* Six is where the curve flattens: the shared reference orbit costs ~170 ms per
+ * band at 1e600 and every band pays it, so wall time is orbit + pixels/k.  On a
+ * 16-core desktop, 1248x804 at 10^600: 1 band 1695 ms, 4 bands 450 ms, 8 bands
+ * 249 ms — 6 bands lands within 15% of 8 with less memory per frame. */
+const MAX_WORKERS = 6;
 /* `?bands=N` pins the split so the choice can be measured instead of guessed. */
 const FORCE_BANDS = (() => {
   const n = Number(new URLSearchParams(location.search).get('bands') || 0);
@@ -33,7 +37,7 @@ let seq = 0;
 const jobs = new Map();       // id -> { parts, want, resolve, reject, w, h }
 
 function bootOne() {
-  const w = new Worker('js/webcore-worker.js?v=20', { type: 'classic' });
+  const w = new Worker('js/webcore-worker.js?v=22', { type: 'classic' });
   w.ready = false;
   w.onmessage = (ev) => {
     const m = ev.data;
@@ -153,20 +157,14 @@ export function coreRender({ re, im, span, w, h, maxiter, julia, juliaRe, juliaI
     width: w | 0, height: h | 0, maxiter: maxiter | 0,
     julia: !!julia, juliaRe: String(juliaRe || '0'), juliaIm: String(juliaIm || '0'),
   };
-  /* How many bands is a cost decision, and it was measured rather than
-   * guessed: each band builds its own reference orbit (wasm instances cannot
-   * share one — no SharedArrayBuffer on Pages), which is 4% of a shallow frame
-   * and 17% of a 10^600 one.  Even at 17% the pixels dominate, so the pool is
-   * worth it at every depth on a 16-core machine:
-   *
-   *   bands   1       2       4
-   *   home    625ms   340ms   261ms
-   *   lz6    4478ms  2548ms  1340ms
-   *   ci600  1586ms  1519ms  1139ms   (1280x900 headless, min of repeats)
-   *
-   * A band must still be tall enough that per-instance start-up is not all of
-   * its work; below ~24 rows that is what it becomes. */
-  const k = Math.max(1, Math.min(FORCE_BANDS || workers.length, Math.floor((h | 0) / 24)));
+  /* One band per worker, but a band has to be tall enough to pay for its own
+   * reference orbit (~170 ms at 10^600, and every band builds its own).  Below
+   * ~48 rows the orbit is the whole band's work and splitting makes the frame
+   * slower, not faster, so the split is capped by height as well. */
+  /* The split can never exceed the pool: worker i owns band i.  `?bands=` is
+   * clamped too, so a hand-typed number cannot ask for a band no worker owns. */
+  const k = Math.max(1, Math.min(FORCE_BANDS || workers.length, workers.length,
+                                 Math.floor((h | 0) / 48)));
   return new Promise((resolve, reject) => {
     const job = { parts: [], want: 1, resolve, reject, w: w | 0, h: h | 0 };
     jobs.set(id, job);

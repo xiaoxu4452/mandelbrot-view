@@ -38,6 +38,121 @@ const HEADERS = [
 // Every entry: [file, old, new, expected count]. Each replacement is asserted,
 // so a desktop-side change can never silently drift into the web build.
 const PATCHES = [
+  /* ---- band renders share one reference orbit ---------------------------
+   *
+   * A frame split into horizontal bands is still ONE view, so every band has
+   * to perturb against the same reference.  Panning each band's centre (which
+   * is how the strip entry point works: the page never does coordinate
+   * arithmetic) moved the reference with it, and the anchor is what decides
+   * everything downstream: at c=i the frame centre gives the exact periodic
+   * orbit (80001 steps, tiled), while a centre 200 rows away escapes after
+   * 1616 steps, so the band's pixels run off the end of their reference and
+   * the repair loop grinds re-rendering them.  Measured on a 1248x804 frame at
+   * 10^600: one band 1289 ms, four bands 2678 ms -- parallel work that was
+   * slower than serial.
+   *
+   * The override keeps the band's own c for anything that needs a plane
+   * coordinate (`pixel_c` for probe and repair anchors) and only redirects the
+   * reference: its c and where that c sits in this band's pixels.
+   */
+  ['render.hpp', `    bool interior_palette = false; // original iter<0 colouring for interior points`,
+   `    bool interior_palette = false; // original iter<0 colouring for interior points
+
+    /* Reference-anchor override (adapter mb_render_strip).  Empty/negative =
+     * use the view centre, which is what a whole-frame render always does. */
+    std::string ref_re, ref_im;
+    int ref_rdx = -1, ref_rdy = -1;
+    double ref_ax = 0.0, ref_ay = 0.0;
+
+    /* Row offset for a band of a shallow (direct double) frame.  The direct path
+     * has no reference orbit, so a band keeps the frame's own geometry and
+     * shifts only the ROW it starts at: panning the centre would feed a centre
+     * rounded to a double and move boundary pixels by up to 150 iterations
+     * (measured: 76 of 1 M pixels differed from the whole frame).  geom_height
+     * is the height that geometry was built for. */
+    int row0 = 0;
+    int geom_height = 0;`, 1],
+  ['render.cpp', `    const double y = (double)req.height * 0.5 - py;`,
+   `    const double gh = req.geom_height > 0 ? (double)req.geom_height : (double)req.height;
+    const double y = gh * 0.5 - py;`, 1],
+  ['render.cpp', `                    frame_offset(req, (double)x + 0.5, (double)y + 0.5, dx, dy);`,
+   `                    frame_offset(req, (double)x + 0.5, (double)(y + req.row0) + 0.5, dx, dy);`, 1],
+
+  ['render.cpp', `    BigFloat cr, ci;
+    try {`,
+   `    BigFloat cr, ci;
+    /* Band anchor: parsed here, after plan_precision, for the same reason. */
+    BigFloat refr, refi;
+    const bool band_ref = req.ref_rdx >= 0 && !req.ref_re.empty();
+    if (band_ref) {
+        refr = BigFloat::from_string(req.ref_re);
+        refi = BigFloat::from_string(req.ref_im);
+    }
+    try {`, 1],
+  ['render.cpp', `        dp.cancel = req.cancel;`,
+   `        dp.cancel = req.cancel;
+        dp.geom_height = req.geom_height;
+        if (band_ref) {
+            dp.refr = &refr;
+            dp.refi = &refi;
+            dp.ref_rdx = req.ref_rdx;
+            dp.ref_rdy = req.ref_rdy;
+            dp.ref_ax = req.ref_ax;
+            dp.ref_ay = req.ref_ay;
+        }`, 1],
+  ['deep.hpp', `    const std::atomic<bool>* cancel = nullptr;`,
+   `    const std::atomic<bool>* cancel = nullptr;
+    /* Frame height the geometry belongs to, when this is a band of a taller
+     * frame.  The series-approximation radius test is measured over the frame's
+     * diagonal, so a band that used its own height would take a shorter series
+     * skip than the whole frame and its tone would drift at the seams. */
+    int geom_height = 0;
+    // Reference-anchor override (see RenderRequest::ref_re).
+    const BigFloat* refr = nullptr;
+    const BigFloat* refi = nullptr;
+    int ref_rdx = 0, ref_rdy = 0;
+    double ref_ax = 0.0, ref_ay = 0.0;`, 1],
+  ['deep.cpp', `    if (sa_order > 8 && (long long)p.width * p.height < 400000) sa_order = 8;`,
+   `    /* ...and it is decided by the FRAME's pixel count, not the band's: a band
+     * of a 1 Mpx frame is 250 kpx, so taking the cheaper order there changed the
+     * series (skip 1594 against 1597) and with it the tone of every band that
+     * does not hold the anchor -- 82 368 of 1 M pixels differed by up to 0.34
+     * iterations, which is a visible seam. */
+    if (sa_order > 8 &&
+        (long long)p.width * (p.geom_height > 0 ? p.geom_height : p.height) < 400000) {
+        sa_order = 8;
+    }`, 1],
+  ['deep.cpp', `    const Fexp delta_max = p.scale * Fexp(std::sqrt((double)p.width * p.width +
+                                                    (double)p.height * p.height) * 0.5 + 1.0);`,
+   `    const int geom_h = p.geom_height > 0 ? p.geom_height : p.height;
+    const Fexp delta_max = p.scale * Fexp(std::sqrt((double)p.width * p.width +
+                                                    (double)geom_h * geom_h) * 0.5 + 1.0);`, 1],
+  ['deep.cpp', `    int rdx = p.width / 2, rdy = p.height / 2;`,
+   `    int rdx = p.refr ? p.ref_rdx : p.width / 2;
+    int rdy = p.refr ? p.ref_rdy : p.height / 2;`, 1],
+  ['deep.cpp', `    const bool center_ref = !v.p->julia &&
+        rdx == v.p->width / 2 && rdy == v.p->height / 2 &&
+        !(std::getenv("MB_CENTER_REF") && std::atoi(std::getenv("MB_CENTER_REF")) == 0);
+    BigFloat re, im;
+    if (center_ref) { re = *v.p->cr; im = *v.p->ci; }
+    else v.pixel_c(rdx, rdy, re, im);`,
+   `    /* A caller-supplied anchor wins: it is a c the caller knows exactly (the
+     * frame centre of a band render) and it is the same orbit the whole frame
+     * would use, so the bands stay comparable pixel for pixel. */
+    const bool anchor_ref = v.p->refr && rdx == v.p->ref_rdx && rdy == v.p->ref_rdy;
+    const bool center_ref = anchor_ref || (!v.p->julia &&
+        rdx == v.p->width / 2 && rdy == v.p->height / 2 &&
+        !(std::getenv("MB_CENTER_REF") && std::atoi(std::getenv("MB_CENTER_REF")) == 0));
+    BigFloat re, im;
+    if (anchor_ref) { re = *v.p->refr; im = *v.p->refi; }
+    else if (center_ref) { re = *v.p->cr; im = *v.p->ci; }
+    else v.pixel_c(rdx, rdy, re, im);`, 1],
+  ['deep.cpp', `    ref.anchor_x = center_ref ? (double)v.p->width * 0.5 - 0.5 : (double)rdx;
+    ref.anchor_y = center_ref ? (double)v.p->height * 0.5 - 0.5 : (double)rdy;`,
+   `    ref.anchor_x = anchor_ref ? v.p->ref_ax
+                 : center_ref ? (double)v.p->width * 0.5 - 0.5 : (double)rdx;
+    ref.anchor_y = anchor_ref ? v.p->ref_ay
+                 : center_ref ? (double)v.p->height * 0.5 - 0.5 : (double)rdy;`, 1],
   // wasi-libc has no pthreads; threads = 1 never spawns a worker, the type
   // just has to exist. See webcore/mb_thread.hpp.
   ['render.cpp', '#include <thread>', '#include "mb_thread.hpp"', 1],
@@ -161,7 +276,10 @@ fs.mkdirSync(path.join(MIRROR, 'port'), { recursive: true });
 for (const f of [...TUS, ...HEADERS]) {
   const dst = path.join(MIRROR, f);
   let text = fs.readFileSync(path.join(DESKTOP_SRC, f), 'utf8').replace(/\r\n/g, '\n');
-  if (f.endsWith('.cpp')) text = applyPatches(f, text);
+  /* Headers are patched as well: the band-anchor plumbing lives in
+   * render.hpp/deep.hpp, and a patch array that silently skipped them would
+   * compile a core whose fields nobody fills. */
+  text = applyPatches(f, text);
   if (f === 'bigfloat.cpp') {
     text = text.replace('#include "bigfloat.hpp"',
       '#include "bigfloat.hpp"\n#include "mb_noexcept.hpp"');

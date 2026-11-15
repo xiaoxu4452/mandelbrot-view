@@ -25,7 +25,45 @@
 #include <string>
 #include <vector>
 
+/* ---- allocation trace (debug builds only) ------------------------------
+ *
+ * A deep frame grows the wasm heap by half a gigabyte before it has drawn a
+ * single pixel, and that number does not move with the iteration budget or the
+ * pixel count — so it is one fixed request, not the orbit.  Half a gigabyte per
+ * worker is what makes a phone die and what stops four bands from scaling, so
+ * the request has to be found rather than guessed at.  Every allocation over
+ * MB_TRACE_MIN bytes is recorded with the phase the core was in when it asked.
+ */
+struct AllocRec {
+    int stage;
+    long long bytes;
+    long long live_after;
+};
+
 namespace {
+
+int g_stage = 0;
+long long g_live = 0;
+long long g_peak = 0;
+long long g_alloc_calls = 0;
+constexpr int kTraceMax = 64;
+AllocRec g_trace[kTraceMax];
+int g_trace_n = 0;
+long long g_trace_min = 4LL << 20;
+
+/* One-shot reference anchor for the next render (see RenderRequest::ref_re).
+ * Set by mb_render_strip, consumed and cleared by render_from, so a stale
+ * anchor can never leak into a whole-frame render. */
+struct RefAnchorCfg {
+    std::string re, im;
+    int rdx = -1, rdy = -1;
+    double ax = 0.0, ay = 0.0;
+};
+RefAnchorCfg g_ref_anchor;
+/* Band row window for a shallow frame (see RenderRequest::row0).  One-shot,
+ * like the anchor. */
+int g_band_row0 = 0;
+int g_band_geom_height = 0;
 
 std::atomic<bool> g_cancel{false};
 Image g_img;
@@ -135,6 +173,17 @@ int32_t render_from(const std::string& cre, const std::string& cim,
     req.band_iters = 0.0;       // auto: one band per 1/32 of the frame's span
     req.cancel = &g_cancel;
     req.on_tile = nullptr;
+    req.ref_re = g_ref_anchor.re;
+    req.ref_im = g_ref_anchor.im;
+    req.ref_rdx = g_ref_anchor.rdx;
+    req.ref_rdy = g_ref_anchor.rdy;
+    req.ref_ax = g_ref_anchor.ax;
+    req.ref_ay = g_ref_anchor.ay;
+    g_ref_anchor = RefAnchorCfg{};      // one-shot
+    req.row0 = g_band_row0;
+    req.geom_height = g_band_geom_height;
+    g_band_row0 = 0;
+    g_band_geom_height = 0;
 
     // Empty palette name => field4 mode: the core writes the 4-channel field
     // and the viewer owns the gradient (the desktop shell's contract).
@@ -177,7 +226,44 @@ int32_t render_from(const std::string& cre, const std::string& cim,
 
 }  // namespace
 
+/* Global replacement so every std::vector in the core is counted.  Only the
+ * web build links this TU, so the desktop binaries are unaffected. */
+void* operator new(size_t n) {
+    void* p = std::malloc(n ? n : 1);
+    g_live += (long long)n;
+    ++g_alloc_calls;
+    if (g_live > g_peak) g_peak = g_live;
+    if ((long long)n >= g_trace_min && g_trace_n < kTraceMax) {
+        g_trace[g_trace_n++] = AllocRec{g_stage, (long long)n, g_live};
+    }
+    return p;
+}
+void* operator new[](size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
+
+namespace {
+/* Phase markers: the core calls this so a trace record says where it happened. */
+void trace_stage(int s) { g_stage = s; }
+}  // namespace
+
 extern "C" {
+
+__attribute__((export_name("mb_trace_ptr")))
+void* mb_trace_ptr() { return g_trace; }
+__attribute__((export_name("mb_trace_n")))
+int32_t mb_trace_n() { return g_trace_n; }
+__attribute__((export_name("mb_trace_live")))
+double mb_trace_live() { return (double)g_live; }
+__attribute__((export_name("mb_trace_peak")))
+double mb_trace_peak() { return (double)g_peak; }
+__attribute__((export_name("mb_trace_stage")))
+void mb_trace_stage(int32_t s) { trace_stage(s); }
+__attribute__((export_name("mb_trace_reset")))
+void mb_trace_reset() { g_trace_n = 0; g_peak = g_live; }
+
 
 __attribute__((export_name("mb_alloc")))
 void* mb_alloc(int32_t n) { return std::malloc(static_cast<size_t>(n)); }
@@ -391,12 +477,45 @@ int32_t mb_render_strip(int32_t centerRe, int32_t centerIm, double zoomMant,
     if (mbxx::take_error()) return 1;
     v.center_im = BigFloat::from_string(cstr(centerIm));
     if (mbxx::take_error()) return 2;
-    const double dy = 0.5 * (static_cast<double>(y0) + static_cast<double>(y1))
-                    - 0.5 * static_cast<double>(heightFull);
-    v.pan_pixels(0.0, dy);
-    const int dec = v.plan.digits + 4;
-    const std::string cre = v.center_re.to_fixed(dec);
-    const std::string cim = v.center_im.to_fixed(dec);
+    /* Two ways to render a band, and which one is right is decided by the path
+     * the core will take for this frame:
+     *
+     *  - shallow (log10(zoom) < 8): the core iterates c directly in doubles, no
+     *    reference orbit.  Panning the centre here would hand it a centre
+     *    rounded to 53 bits, and boundary pixels then land on the other side of
+     *    their escape test.  So the geometry stays the frame's and only the
+     *    starting ROW moves (RenderRequest::row0) — the band computes exactly
+     *    the pixels the whole frame would.
+     *  - deep: perturbation, one reference orbit.  The band pans its centre (so
+     *    pixel_c lands on the plane where it should) but perturbs against the
+     *    FRAME centre's orbit, exactly as the whole frame does; see
+     *    RenderRequest::ref_re.  Julia keeps its own z0, hence no anchor. */
+    const double lz = std::log10(v.zoom_mantissa) + static_cast<double>(v.zoom_exp10);
+    const bool shallow = lz < 8.0;
+    std::string cre, cim;
+    if (shallow) {
+        cre = cstr(centerRe);
+        cim = cstr(centerIm);
+        g_band_row0 = y0;
+        g_band_geom_height = heightFull;      // geometry is the frame's
+    } else {
+        const double dy = 0.5 * (static_cast<double>(y0) + static_cast<double>(y1))
+                        - 0.5 * static_cast<double>(heightFull);
+        v.pan_pixels(0.0, dy);
+        const int dec = v.plan.digits + 4;
+        cre = v.center_re.to_fixed(dec);
+        cim = v.center_im.to_fixed(dec);
+        g_band_geom_height = heightFull;      // radius test over the frame
+        if (!julia) {
+            g_ref_anchor.re = cstr(centerRe);
+            g_ref_anchor.im = cstr(centerIm);
+            g_ref_anchor.rdx = width / 2;
+            g_ref_anchor.rdy = heightFull / 2 - y0;
+            g_ref_anchor.ax = 0.5 * static_cast<double>(width) - 0.5;
+            g_ref_anchor.ay = 0.5 * static_cast<double>(heightFull) - 0.5 -
+                              static_cast<double>(y0);
+        }
+    }
     return render_from(cre, cim, v.zoom_mantissa, v.zoom_exp10,
                        width, y1 - y0, maxiter, julia != 0,
                        julia ? cstr(juliaRe) : std::string(),
