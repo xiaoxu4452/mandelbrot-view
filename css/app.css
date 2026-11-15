@@ -127,6 +127,20 @@ html.gl-surface #fractal { opacity: 0; }
 html.wgpu-surface #fractal { opacity: 0; }
 html.wgpu-surface #glfractal { opacity: 0; }
 html.gl-surface #wgpu-fractal { opacity: 0; }
+/* Each GPU layer is on screen only while its own class says so.
+ *
+ * The two rules above only hide the *other* layer, so with neither class set
+ * both sat visible underneath #fractal and were relied on to be covered by an
+ * opaque 2D canvas.  A canvas is transparent wherever it has not been painted
+ * -- after a resize, or in a strip a partial frame did not reach -- and what
+ * showed through was the *previous* GPU frame: two different views spliced
+ * along a straight edge, which reads as "the picture jumped somewhere else".
+ * Hiding them by default makes a missing paint show the page colour, not a
+ * stale picture. */
+html:not(.wgpu-surface) #wgpu-fractal { opacity: 0; }
+html:not(.gl-surface) #glfractal { opacity: 0; }
+html.wgpu-surface #wgpu-fractal { opacity: 1; }
+html.gl-surface #glfractal { opacity: 1; }
 
 /* "No structure in this area".
  *

@@ -19,7 +19,7 @@ let gmpLibPromise = null;
 
 export async function gmpLib() {
   if (!gmpLibPromise) {
-    gmpLibPromise = import('../vendor/gmp-wasm.esm.min.js?v=52').then((m) => m.init());
+    gmpLibPromise = import('../vendor/gmp-wasm.esm.min.js?v=53').then((m) => m.init());
   }
   return gmpLibPromise;
 }
