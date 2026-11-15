@@ -52,6 +52,17 @@ async function api(path, init = {}) {
       continue;
     }
     if (r.ok) return text ? JSON.parse(text) : null;
+    /* A 404 from a *blob upload* is not a missing endpoint: the same token can
+     * read the repository and the endpoint was just used successfully by the
+     * run before.  The egress proxy answers a dropped POST with a GitHub-shaped
+     * 404 here, which is why a publish used to die on the first new file.  It
+     * is as retryable as a transport error; anything else (a real 404 on a
+     * read, a 403 from a bad token) still surfaces immediately. */
+    if (r.status === 404 && init.method === 'POST' && path === '/git/blobs') {
+      lastErr = new Error('POST /git/blobs -> 404 (transient)');
+      await new Promise(s => setTimeout(s, 1500 * (attempt + 1)));
+      continue;
+    }
     if (r.status >= 500 || r.status === 429 || r.status === 408) {
       lastErr = new Error(`${init.method || 'GET'} ${path} -> ${r.status}`);
       await new Promise(s => setTimeout(s, 1500 * (attempt + 1)));
@@ -86,10 +97,15 @@ for (const path of changed) {
    * what the proxy keeps dropping. */
   const exists = await api(`/git/blobs/${sha}`, {}).then(() => true, () => false);
   if (exists) { tree.push({ path, mode: mode === '100755' ? '100755' : '100644', type: 'blob', sha }); process.stdout.write(`  blob ${path} (already there)\n`); continue; }
-  const blob = await api('/git/blobs', {
-    method: 'POST',
-    body: JSON.stringify({ content: buf.toString('base64'), encoding: 'base64' })
-  });
+  let blob;
+  try {
+    blob = await api('/git/blobs', {
+      method: 'POST',
+      body: JSON.stringify({ content: buf.toString('base64'), encoding: 'base64' })
+    });
+  } catch (e) {
+    throw new Error(`${path} (${(buf.length / 1024).toFixed(0)} KB): ${e.message}`);
+  }
   if (blob.sha !== sha) throw new Error(`blob sha mismatch for ${path}: ${blob.sha} != ${sha}`);
   tree.push({ path, mode: mode === '100755' ? '100755' : '100644', type: 'blob', sha });
   process.stdout.write(`  blob ${path}\n`);
