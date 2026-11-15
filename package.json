@@ -18,9 +18,15 @@
     "test:view": "node webcore/test-view.mjs",
     "test:families": "node tools/_families-check.mjs",
     "test:preset-zoom": "node tools/_preset-zoom-check.mjs",
+    "build:formula": "node formulacore/build.mjs",
+    "test:formula": "node formulacore/test.mjs",
+    "test:formula-jet": "node formulacore/general-test.mjs",
+    "test:formula-perturb": "node formulacore/perturb-test.mjs",
+    "test:formula-bands": "node formulacore/bands-test.mjs",
     "smoke": "node tools/_shell-smoke.mjs",
     "bump": "node tools/_bump-cache.mjs",
-    "publish": "node tools/_publish.mjs"
+    "publish": "node tools/_publish.mjs",
+    "test:formula-align": "node formulacore/align-test.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.65.0"

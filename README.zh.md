@@ -89,9 +89,40 @@ Misiurewicz 点 c=i（任意深度都有结构）验证两个硬要求：
 | 1e300 | **全黑** | 94 档 | 789 | 269.7 ms |
 
 1e300 / 1e10 耗时比 **0.98×**：精度成本只随那一条轨道增长，与像素数无关；
-浅景下扰动帧与逐点帧逐像素相同。要替换 JS 兜底还差：非多项式表达式的通用
-jet VM（目前 z^d+c 用解析系数）、glitch **rebase**、条带 worker、接入
-`coreCanDraw()`。
+浅景下扰动帧与逐点帧逐像素相同。
+
+第二阶段第二部分接上了**通用表达式机制**。`env.mjs` 直接复用页面已有库，不重复造轮子：
+`customenv.js` 用 `hpeval.js` 为任意表达式建**一条**任意精度 BigInt 参考轨道，
+`jet.js` 沿该轨道做 1..10 阶自动微分（全纯映射）或中心差分线性导数（非全纯
+`abs`/`conj`）；系数被重排成 C++ `fc_render_jet()` 的 `coefA`/`coefB`。新 ABI
+支持运行时 jet 阶数、`y0/y1` 横带、以及 singleref glitch **rebase**（抵消时
+重锚到与像素最接近的轨道点）。
+
+`env.mjs` 给出宿主必须遵守的 `usable` 契约，为 false 时**不得采用扰动帧**：
+
+| 条件 | 扰动为何无效 | 宿主动作 |
+| --- | --- | --- |
+| 参考轨道早于预算逃逸 | 剩余像素没有 `Z_n`（铁律 #1） | 直接双精度渲染 |
+| 非多项式 / 对 c 非线性且深度 < 1e12 | 截断级数只在偏移量极小时成立 | 直接双精度渲染 |
+
+这与桌面核心一致（浅景本就走 double 直算）；多项式的级数是有限的，任意深度都精确。
+
+验收（`node formulacore/general-test.mjs`）：`z^2+c`/`z^3+c` 在 zoom 1 与逐点
+渲染逐像素一致；`sin`/`exp`/`log`/`sin*cos`/嵌套/非全纯表达式均能编译并正确
+分类；精确 Misiurewicz 点 c=i 的 `z^2+c` 在 1e10..1e300 保持 28–29 档结构、
+耗时比 **1.00×**；四条横带与整帧逐位相同。
+
+`band-worker.mjs` + `bands.mjs` 把一帧分给 N 个独立 wasm 实例、共用同一条轨道。
+`node formulacore/bands-test.mjs`：320×240 深帧 **0 像素差异**，4 worker **3.10×**。
+
+逐像素对齐（`node formulacore/align-test.mjs`，同视点同预算的 z^2+c）：采用桌面
+核心的 `kEscape2 = 4.0` 与 `n + 1 - log2` 平滑约定后，jet 场与 `core.wasm`
+**常数偏移为 0**、1e10..1e100 平均残差 0.002–0.006 迭代；10800 像素中仅 1 个
+边界像素的内外分类不同。
+
+要替换 JS 兜底还差：把 `fc_render_jet()` 接进 `coreCanDraw()`，以及根治
+`deep.cpp` 里 Julia 的 interior 兜底（需重编 `core.wasm`，必须单独与桌面 PNG
+逐像素验收）。
 
 ### 诊断开关
 

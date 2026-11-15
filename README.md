@@ -71,6 +71,8 @@ node webcore/test.mjs         # frames vs the desktop's own PNGs, pixel-exact
 node webcore/test-view.mjs    # zoom/pan/pinch round-trip in the core's viewport
 node tools/_families-check.mjs   # non-Mandelbrot families: zoom round-trip
 node tools/_preset-zoom-check.mjs # preset zoom: iteration budget must stay bounded
+node formulacore/general-test.mjs  # arbitrary-expression jet perturbation
+node formulacore/bands-test.mjs    # parallel bands vs one frame
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 
@@ -110,10 +112,49 @@ depth):
 
 Cost ratio 1e300 / 1e10 = **0.98x**: precision cost grows only with the single
 orbit, never with the pixel count.  At shallow zoom the perturbed frame is
-pixel-identical to the direct one.  Still outstanding before this can replace
-the JS fallback: a general jet VM for non-polynomial expressions (coefficients
-are currently analytic for z^d+c), glitch **rebase**, band workers, and wiring
-it into `coreCanDraw()`.
+pixel-identical to the direct one.
+
+Stage 2, part 2 connects the **general expression machinery**.  `env.mjs`
+reuses the page's own libraries instead of reimplementing them: `customenv.js`
+builds ONE arbitrary-precision BigInt reference orbit for any expression with
+`hpeval.js`, and `jet.js` produces 1..10th-order automatic-differentiation
+coefficients along it (holomorphic maps) or a central-difference linear
+derivative (non-holomorphic `abs` / `conj`).  Those are reshaped into the
+C++ `coefA`/`coefB` arrays consumed by the new `fc_render_jet()` ABI, which
+also takes a runtime jet order, a `y0/y1` band and a singleref glitch
+**rebase** (re-anchor onto the orbit point closest to a cancelling pixel).
+
+`env.mjs` publishes a **host contract**, `usable`, and the host must not paint
+a perturbed frame when it is false:
+
+| condition | why perturbation is invalid | what the host does |
+| --- | --- | --- |
+| reference escaped before the budget | no `Z_n` left for the remaining pixels (iron law #1) | direct double render |
+| non-polynomial / `c`-nonlinear map below 1e12 | a truncated Taylor series is only valid while the pixel offset stays tiny | direct double render |
+
+This mirrors the desktop core, which also renders shallow views directly in
+double precision.  Polynomials have a finite series and are exact at any zoom.
+
+Acceptance (`node formulacore/general-test.mjs`): `z^2+c` / `z^3+c` are
+pixel-identical to direct iteration at zoom 1; `sin`, `exp`, `log`, `sin*cos`,
+nested and non-holomorphic expressions are compiled and classified; deep
+`z^2+c` at the exact Misiurewicz point c = i keeps 28-29 distinct levels at
+1e10..1e300 with **1.00x** cost; four bands are bit-identical to one frame.
+
+`band-worker.mjs` + `bands.mjs` fan one frame out to N independent wasm
+instances sharing the same orbit.  `node formulacore/bands-test.mjs` measures
+**0 differing pixels** and 3.10x with 4 workers on a 320x240 deep frame.
+
+Pixel alignment (`node formulacore/align-test.mjs`, z^2+c at the same view
+and budget): with the desktop core's `kEscape2 = 4.0` and its `n + 1 - log2`
+smoothing convention, the jet field matches `core.wasm` with **zero constant
+offset** and a mean residual of 0.002-0.006 iterations at 1e10..1e100; one
+boundary pixel out of 10800 differs in interior/exterior classification.
+
+Still outstanding before this can replace the JS fallback: wiring
+`fc_render_jet()` into `coreCanDraw()`, and the `deep.cpp` Julia
+interior-default root fix (which recompiles `core.wasm` and must be verified
+against the desktop PNGs on its own).
 
 ### Diagnostics
 

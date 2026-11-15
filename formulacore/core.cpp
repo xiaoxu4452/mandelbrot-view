@@ -550,25 +550,29 @@ int32_t fc_out_size(void) { return static_cast<int32_t>(g_field.size() * sizeof(
 }  // extern "C"
 
 /* ==========================================================================
- * Stage 2, part 1: perturbation rendering against an EXTERNAL, arbitrary-
- * precision reference orbit.
+ * Stage 2: perturbation rendering against an EXTERNAL, arbitrary-precision
+ * reference orbit.
  *
- * The page (or the Node test) builds ONE orbit with the project's high-
- * precision libraries and hands over its double-valued samples plus the jet
- * coefficients of F at each step.  Every pixel then advances a tiny offset
- * delta in float-exp form (mantissa + binary exponent), so a 10^-600 pixel
- * scale never underflows a double.  Precision cost grows with the single
- * orbit, never with the pixel count -- which is the "arbitrary precision AND
- * constant per-pixel speed" requirement.
+ * The page / Node side builds ONE orbit with the project's high-precision
+ * libraries (js/hpeval.js BigInt fixed point) and derives the jet (truncated
+ * power series) coefficients along that orbit with js/jet.js automatic
+ * differentiation.  Every pixel then advances a tiny offset delta in
+ * float-exp form (mantissa + binary exponent), so a 10^-600 pixel scale never
+ * underflows a double.  Precision cost grows with the single orbit, never with
+ * the pixel count.
  *
- * Layout of coefA / coefB, both [orbitLen][JK+1][2] doubles (re, im):
- *   F(Z + eps, C + eta) = sum_k a_k eps^k + sum_k b_k eps^k eta   (+ O(eta^2))
+ * Layout of coefA / coefB, both [orbitLen][K+1][2] doubles (re, im), where K
+ * is the runtime jet order (1..JK_MAX) and stride = (K+1)*2:
+ *   F(Z + eps, C + eta) = sum_k a_k eps^k + sum_k b_k eps^k eta  (+ O(eta^2))
  *   a_0 is Z_{n+1} and is already in the orbit, so the recurrence starts at
- *   k = 1.  For z^2+c: a_1 = 2 Z, a_2 = 1, b_0 = 1, everything else 0 --
- *   exactly the classic perturbation recurrence.
+ *   k = 1.  For z^2+c: a_1 = 2 Z, a_2 = 1, b_0 = 1; for sin(z)+c the same
+ *   arrays hold the Taylor coefficients produced by jet.js.
+ *
+ * y0/y1 render ONE horizontal band: N wasm instances can share the orbit and
+ * each render a disjoint band without a lock.
  * ========================================================================== */
 
-static constexpr int JK = 4;
+static constexpr int JK_MAX = 10;
 
 struct FE {
     double m = 0.0;
@@ -590,6 +594,7 @@ static inline FE fe_add(FE a, FE b) {
     const int e = std::max(a.e, b.e);
     return fe_norm(std::ldexp(a.m, a.e - e) + std::ldexp(b.m, b.e - e), e);
 }
+static inline FE fe_sub(FE a, FE b) { return fe_add(a, fe_scale(b, -1.0)); }
 static inline FE fe_mul(FE a, FE b) {
     if (a.m == 0.0 || b.m == 0.0) return FE{0.0, 0};
     return fe_norm(a.m * b.m, a.e + b.e);
@@ -604,21 +609,158 @@ static inline C2 c2_zero() { return C2{FE{0.0, 0}, FE{0.0, 0}}; }
 static inline C2 c2_add(C2 a, C2 b) {
     return C2{fe_add(a.r, b.r), fe_add(a.i, b.i)};
 }
+static inline C2 c2_sub(C2 a, C2 b) {
+    return C2{fe_sub(a.r, b.r), fe_sub(a.i, b.i)};
+}
 static inline C2 c2_mul(C2 a, C2 b) {
-    return C2{fe_add(fe_mul(a.r, b.r), fe_scale(fe_mul(a.i, b.i), -1.0)),
+    return C2{fe_sub(fe_mul(a.r, b.r), fe_mul(a.i, b.i)),
               fe_add(fe_mul(a.r, b.i), fe_mul(a.i, b.r))};
 }
 static inline C2 c2_from(double r, double i) {
     return C2{fe_norm(r, 0), fe_norm(i, 0)};
 }
+static inline double c2_abs(C2 a) {
+    return std::hypot(fe_double(a.r), fe_double(a.i));
+}
+
+/** Render band [y0,y1).  `rebaseOn` enables singleref glitch repair: when
+ *  Z_n + delta cancels, re-anchor onto the orbit point closest to the pixel's
+ *  z and continue from there instead of dropping the pixel as "interior". */
+static int renderBand(int32_t w, int32_t h, int32_t maxiter,
+                      int32_t mode, double bail2,
+                      int32_t orbitLen,
+                      const double* Zr, const double* Zi,
+                      const double* coefA, const double* coefB,
+                      int32_t K, int32_t stride,
+                      double dMant, int32_t dExp2,
+                      double rotCos, double rotSin,
+                      int32_t y0, int32_t y1,
+                      int32_t saSkip, const double* saAt,
+                      int32_t rebaseOn) {
+    const int N = std::min(maxiter, orbitLen);
+    const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
+    const double glitchEps = std::ldexp(1.0, -20);
+    const size_t total = static_cast<size_t>(w) * h;
+    /* Do NOT clear the whole field: bands are rendered by separate instances
+     * (or successive calls) and each owns only its own rows. */
+    if (g_field.size() != total) g_field.assign(total, -1.0f);
+
+    for (int y = y0; y < y1; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const FE X = fe_norm((static_cast<double>(x) + 0.5 - 0.5 * w) * dMant, dExp2);
+            const FE Y = fe_scale(fe_norm((static_cast<double>(y) + 0.5 - 0.5 * h) * dMant, dExp2), -1.0);
+            const FE u = fe_add(fe_scale(X, rotCos), fe_scale(Y, -rotSin));
+            const FE v = fe_add(fe_scale(X, rotSin), fe_scale(Y, rotCos));
+            const C2 offset{u, v};
+            /* Julia: the pixel IS z0, so the offset is delta-z and c is fixed.
+             * Mandelbrot: every z0 is 0 and the offset is delta-c. */
+            C2 dz = (mode == 1) ? offset : c2_zero();
+            const C2 dc = (mode == 1) ? c2_zero() : offset;
+
+            /* Series approximation: s_1(n+1) = a_1(n) s_1(n) + b_0(n) is a
+             * LINEAR identity for ANY iteration map (the delta^2 term is
+             * negligible while delta is tiny), so the ~690 growth iterations
+             * at 10^-300 collapse to one polynomial evaluation.  It is
+             * integrated once with the orbit, never per pixel. */
+            int n = (mode == 0 && saAt && saSkip > 0 && saSkip < N) ? saSkip : 0;
+            if (n > 0) {
+                C2 sum = c2_zero(), pw = dc;
+                for (int k = 1; k <= K; ++k) {
+                    sum = c2_add(sum, c2_mul(c2_from(saAt[k * 2], saAt[k * 2 + 1]), pw));
+                    pw = c2_mul(pw, dc);
+                }
+                dz = sum;
+            }
+
+            float value = -1.0f;
+            int rebases = 0;
+            const int maxSteps = 2 * N + 64;
+            for (int steps = 0; steps < maxSteps && n < N; ++steps) {
+                const C2 Z = c2_from(Zr[n], Zi[n]);
+                const C2 z = c2_add(Z, dz);
+                const double z2 = fe_double(fe_add(fe_mul(z.r, z.r), fe_mul(z.i, z.i)));
+                if (!(z2 <= bail2)) {
+                    double sm;
+                    if (!std::isfinite(z2)) sm = static_cast<double>(n) + 1.0;
+                    else {
+                        const double logz = 0.5 * std::log(std::max(z2, 1e-300));
+                        /* Match webcore's iterate_pixel_d() exactly: it
+                         * reports n + 1 - log2(log|z| / log(bailout)) for
+                         * z = Z_n + delta_n.  The page normalises by the
+                         * frame's own escape range, but keeping the same
+                         * convention means no adapter when this core replaces
+                         * the JS fallback. */
+                        sm = static_cast<double>(n) + 1.0 - std::log2(logz / logBail);
+                    }
+                    if (!(sm >= 0.0) || !std::isfinite(sm)) sm = 0.0;
+                    value = static_cast<float>(sm);
+                    break;
+                }
+                /* Cancellation: |Z + delta| << max(|Z|, |delta|). */
+                const double az = c2_abs(z);
+                const double aZ = std::hypot(Zr[n], Zi[n]);
+                const double ad = c2_abs(dz);
+                if (az < glitchEps * std::max(aZ, ad)) {
+                    if (!rebaseOn || ++rebases > 12) break;   // unresolved
+                    /* singleref rebase: z is close to SOME orbit point.  Use
+                     * that point as the new reference, so delta stops cancelling
+                     * and the iteration count continues from the aligned step. */
+                    const double zr = fe_double(z.r), zi = fe_double(z.i);
+                    int best = -1;
+                    double bestD = 1e300;
+                    for (int m = 0; m < N; ++m) {
+                        if (m == n) continue;
+                        const double d = std::hypot(Zr[m] - zr, Zi[m] - zi);
+                        if (d < bestD) { bestD = d; best = m; }
+                    }
+                    if (best < 0) break;
+                    dz = c2_sub(z, c2_from(Zr[best], Zi[best]));
+                    n = best;
+                    continue;
+                }
+                if (n + 1 >= N) break;
+
+                /* delta' = sum_{k=1..K} a_k delta^k
+                 *        + (b_0 + sum_{k=1..K} b_k delta^k) * delta_c
+                 *
+                 * A truncated Taylor series is exact for polynomials; for an
+                 * entire function it is only valid while |delta| is small.
+                 * That is precisely the deep-zoom regime perturbation is FOR:
+                 * the host's `usable` contract keeps shallow/medium views on
+                 * the direct double renderer (as the desktop core does). */
+                const double* a = coefA + static_cast<size_t>(n) * stride;
+                const double* b = coefB + static_cast<size_t>(n) * stride;
+                C2 nd = c2_zero();
+                C2 pw = dz;
+                for (int k = 1; k <= K; ++k) {
+                    nd = c2_add(nd, c2_mul(c2_from(a[k * 2], a[k * 2 + 1]), pw));
+                    if (dc.r.m != 0.0 || dc.i.m != 0.0)
+                        nd = c2_add(nd, c2_mul(c2_from(b[k * 2], b[k * 2 + 1]),
+                                               c2_mul(pw, dc)));
+                    pw = c2_mul(pw, dz);
+                }
+                nd = c2_add(nd, c2_mul(c2_from(b[0], b[1]), dc));
+                dz = nd;
+                ++n;
+            }
+            g_field[static_cast<size_t>(y) * w + x] = value;
+        }
+    }
+    return 0;
+}
 
 extern "C" {
 
+/** Legacy z^d+c entry point uses K = 4. */
 __attribute__((export_name("fc_jet_order")))
-int32_t fc_jet_order(void) { return JK; }
+int32_t fc_jet_order(void) { return 4; }
 
-/** Render a band (y0..y1) of the view by perturbation.  The field is the same
- * single-channel f32 smooth-iteration field as fc_render(), -1 = interior. */
+/** Highest jet order the general renderer can consume. */
+__attribute__((export_name("fc_jet_max")))
+int32_t fc_jet_max(void) { return JK_MAX; }
+
+/** Legacy z^d+c entry point (K = 4, fixed stride).  Kept so the stage-2 part-1
+ *  acceptance numbers remain reproducible byte for byte. */
 __attribute__((export_name("fc_render_perturb")))
 int32_t fc_render_perturb(int32_t prog,
                           int32_t w, int32_t h, int32_t maxiter,
@@ -641,88 +783,43 @@ int32_t fc_render_perturb(int32_t prog,
         g_error = "missing reference orbit"; return 3;
     }
     if (y0 < 0 || y1 > h || y1 <= y0) { g_error = "bad band"; return 4; }
-    const int N = std::min(maxiter, orbitLen);
-    const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
-    g_field.assign(static_cast<size_t>(w) * h, -1.0f);
-    const double glitchEps = std::ldexp(1.0, -20);
+    return renderBand(w, h, maxiter, mode, bail2, orbitLen, orbZr, orbZi,
+                      coefA, coefB, 4, 10, dMant, dExp2, rotCos, rotSin,
+                      y0, y1, saSkip, saAt, 0);
+}
 
-    for (int y = y0; y < y1; ++y) {
-        for (int x = 0; x < w; ++x) {
-            /* Plane offset, kept in float-exp form from the very first step so
-             * a 10^-600 pixel scale is still representable. */
-            const FE X = fe_norm((static_cast<double>(x) + 0.5 - 0.5 * w) * dMant, dExp2);
-            const FE Y = fe_scale(fe_norm((static_cast<double>(y) + 0.5 - 0.5 * h) * dMant, dExp2), -1.0);
-            const FE u = fe_add(fe_scale(X, rotCos), fe_scale(Y, -rotSin));
-            const FE v = fe_add(fe_scale(X, rotSin), fe_scale(Y, rotCos));
-            const C2 offset{u, v};
-            /* Julia: the pixel IS z0, so the offset is delta-z and c is fixed.
-             * Mandelbrot: every z0 is 0 and the offset is delta-c. */
-            C2 dz = (mode == 1) ? offset : c2_zero();
-            const C2 dc = (mode == 1) ? c2_zero() : offset;
-
-            /* Series approximation: the coefficients were integrated once
-             * with the orbit, so the ~690 "growth" iterations at 10^-300 are
-             * replaced by ONE polynomial evaluation.  saSkip is frame-wide
-             * (radtest over the largest offset), so the cost is the same at
-             * every depth. */
-            const int n0 = (mode == 0 && saAt && saSkip > 0 && saSkip < N) ? saSkip : 0;
-            if (n0 > 0) {
-                C2 sum = c2_zero(), pw = dc;
-                for (int k = 1; k <= JK; ++k) {
-                    sum = c2_add(sum, c2_mul(c2_from(saAt[k * 2], saAt[k * 2 + 1]), pw));
-                    pw = c2_mul(pw, dc);
-                }
-                dz = sum;
-            }
-
-            float value = -1.0f;
-            for (int n = n0; n < N; ++n) {
-                const C2 Z = c2_from(orbZr[n], orbZi[n]);
-                const C2 z = c2_add(Z, dz);
-                const FE zr2 = fe_mul(z.r, z.r), zi2 = fe_mul(z.i, z.i);
-                const double z2 = fe_double(fe_add(zr2, zi2));
-                if (!(z2 <= bail2)) {
-                    double sm;
-                    if (!std::isfinite(z2)) sm = static_cast<double>(n) + 1.0;
-                    else {
-                        const double logz = 0.5 * std::log(std::max(z2, 1e-300));
-                        sm = static_cast<double>(n) + 1.0 - std::log2(logz / logBail);
-                    }
-                    if (!(sm >= 0.0) || !std::isfinite(sm)) sm = 0.0;
-                    value = static_cast<float>(sm);
-                    break;
-                }
-                /* Cancellation test: |Z + delta| << max(|Z|, |delta|). */
-                const double az = std::hypot(fe_double(z.r), fe_double(z.i));
-                const double aZ = std::hypot(orbZr[n], orbZi[n]);
-                const double ad = std::hypot(fe_double(dz.r), fe_double(dz.i));
-                if (az < glitchEps * std::max(aZ, ad)) {
-                    /* Stage 2 part 2 replaces this with a rebase onto a child
-                     * reference.  For now the pixel stays unresolved (-1). */
-                    value = -1.0f;
-                    break;
-                }
-                if (n + 1 >= N) break;
-
-                /* delta' = sum_{k>=1} a_k delta^k
-                 *        + (b_0 + sum_{k>=1} b_k delta^k) * delta_c */
-                const double* a = coefA + static_cast<size_t>(n) * (JK + 1) * 2;
-                const double* b = coefB + static_cast<size_t>(n) * (JK + 1) * 2;
-                C2 nd = c2_zero();
-                C2 pw = dz;
-                for (int k = 1; k <= JK; ++k) {
-                    nd = c2_add(nd, c2_mul(c2_from(a[k * 2], a[k * 2 + 1]), pw));
-                    nd = c2_add(nd, c2_mul(c2_from(b[k * 2], b[k * 2 + 1]),
-                                           c2_mul(pw, dc)));
-                    pw = c2_mul(pw, dz);
-                }
-                nd = c2_add(nd, c2_mul(c2_from(b[0], b[1]), dc));
-                dz = nd;
-            }
-            g_field[static_cast<size_t>(y) * w + x] = value;
-        }
+/** General entry point: any expression, any jet order up to JK_MAX, optional
+ *  singleref glitch rebase, and a band (y0..y1) for parallel workers. */
+__attribute__((export_name("fc_render_jet")))
+int32_t fc_render_jet(int32_t prog,
+                      int32_t w, int32_t h, int32_t maxiter,
+                      int32_t mode, double bail2,
+                      int32_t orbitLen,
+                      const double* orbZr, const double* orbZi,
+                      const double* coefA, const double* coefB,
+                      int32_t jetOrder, int32_t stride,
+                      double dMant, int32_t dExp2,
+                      double rotCos, double rotSin,
+                      int32_t y0, int32_t y1,
+                      int32_t saSkip, const double* saAt,
+                      int32_t rebase) {
+    g_error.clear();
+    if (prog < 0 || static_cast<size_t>(prog) >= g_programs.size()) {
+        g_error = "bad program id"; return 1;
     }
-    return 0;
+    if (w < 1 || h < 1 || w > 8192 || h > 8192 || maxiter < 1) {
+        g_error = "bad frame dimensions"; return 2;
+    }
+    if (orbitLen < 1 || !orbZr || !orbZi || !coefA || !coefB) {
+        g_error = "missing reference orbit"; return 3;
+    }
+    if (jetOrder < 1 || jetOrder > JK_MAX || stride < (jetOrder + 1) * 2) {
+        g_error = "bad jet order/stride"; return 5;
+    }
+    if (y0 < 0 || y1 > h || y1 <= y0) { g_error = "bad band"; return 4; }
+    return renderBand(w, h, maxiter, mode, bail2, orbitLen, orbZr, orbZi,
+                      coefA, coefB, jetOrder, stride, dMant, dExp2,
+                      rotCos, rotSin, y0, y1, saSkip, saAt, rebase);
 }
 
 }  // extern "C"
