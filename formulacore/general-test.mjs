@@ -15,7 +15,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { buildFormulaEnvironment } from './env.js';
-import { compile as compilePage } from '../js/mathlib.js?v=55';
+import { compile as compilePage } from '../js/mathlib.js?v=59';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const mod = new WebAssembly.Module(fs.readFileSync(path.join(ROOT, 'formulacore.wasm')));

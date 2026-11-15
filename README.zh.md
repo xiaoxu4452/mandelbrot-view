@@ -146,8 +146,52 @@ v55 的页面侧保护（末帧全部 interior 且参考短于预算一半时保
 范围。这些探针**没有复现出用户截图里那个「整帧判内部」的精确视点**，因此最好仍用
 `?diag=1` 对那一个视点补一张直接的前后对照。
 
-仍待完成：把公式核心扩展到非全纯内建族（tricorn、burning ship、celtic、
-perpendicular、phoenix，需要更宽的参考梯）。
+### 第三阶段：五个折叠内建族
+
+非全纯内建族（tricorn、burning ship、celtic、perpendicular、phoenix）不再只能
+用浅景页面内核。它们在实部/虚部上是**分段二次多项式**，因此
+`formulacore/core.cpp` 增加了专用内核，使用**完全精确的 δ 递推**（没有截断 Taylor
+级数，折叠处也就没有一阶 jet 误差）：
+
+```
+Dr = (2X+dr)dr - (2Y+di)di      Di = X di + Y dr + dr di
+三叉戟       d' = Dr + dc_r + i(-2Di + dc_i)
+燃烧船       d' = Dr + dc_r + i((sp-sB) Bq + 2 sp Di + dc_i)
+凯尔特       d' = ((sp-sA) Aq + sp Dr) + dc_r + i(2Di + dc_i)
+垂直         d' = Dr + dc_r + i((sp-sB) Bq + 2 sp Di + dc_i)
+凤凰         d' = Dr + p dprev_r + dc_r + i(2Di + p dprev_i + dc_i)
+```
+
+`A = X²-Y²`、`B = 2XY` 由任意精度 BigInt 轨道直接生成，不是两个 double 相减；
+`sp` 是**像素自己**的折叠符号。参考轨道从 1 条扩成 4 条（中心散布在画面上），
+glitch 像素可在**同一迭代序号**换轨重锚。`2^-900` 以外由 float-exp 内核接管，
+以内则用纯 double 的「像素单位 δ」内核，快约 10 倍。
+
+`1e12` 以下的浅景仍走页面内核（手势与配色时序已稳定），深景才切到新引擎。
+首个深景预算为 1024 迭代，**只有返回的场确实被截断**才按 4 倍增长：`1e20`
+视点在第 112 步就全部逃逸，按页面自动预算的 14 600 步会跑几分钟。
+
+`node formulacore/family-test.mjs` 用逐像素任意精度 BigInt 参考实现作金标准，
+对照 5 个族（M / Julia、浅景 / 1e20）：**数值离群 0**、横带拼接逐像素一致、
+4 轨阶梯与单轨一致。`node tools/_family-page-check.mjs` 再走一遍真实浏览器
+worker 池。
+
+### 切换预设不允许累积负担
+
+用 `node tools/_preset-lag-check.mjs`（无头 Edge 连切 12 次预设）实测并消除了
+三个互相独立的累加源：
+
+* `resizeCanvas()` 在每次 `applyDeepPixelCap()` 时都清空画布并涂深色，**哪怕
+  尺寸根本没变**，还会取消在飞的 pass。现在尺寸不变的 resize 是真正的空操作，
+  真实 resize 会回贴快照。
+* 预设网格一次排入约 111 张缩略图，单张迭代上限 12 万，3 个 worker 被长期
+  占满，之后每次切换都排在它们后面。现在缩略图上限 1.2 万迭代、只补渲可见
+  卡片、一次只跑一张，且每次切预设都丢弃排队任务。
+* 「饿死」规则对任何全 interior 帧都无条件跳到 8 万迭代，浅视点也永久继承
+  这个上限。现在按当前视点自身深度缩放该跳转。
+
+结果：同一对预设第 0 次 1298 ms、第 9 次 1302 ms（**1.00×**）；12 个不同预设
+无黑帧、无增长队列；最坏一帧从 23 s 降到 1.3 s。
 
 ### 诊断开关
 
@@ -173,6 +217,11 @@ perpendicular、phoenix，需要更宽的参考梯）。
 | `webcore/build.mjs` | 镜像 + 补丁 + 编译流水线（默认用仓库内源码） |
 | `webcore/adapter.cpp` | C ABI：`mb_render`、`mb_view_*`、`mb_render_strip`、stats POD |
 | `webcore/sync-src.mjs` | 从桌面检出刷新 `webcore/src/` |
+| `formulacore/core.cpp`、`formulacore.wasm` | 独立的任意表达式 C++ 核心 + 第三阶段折叠族内核 |
+| `formulacore/env.js`、`familyenv.js` | jet 系数 / 任意精度参考阶梯 |
+| `js/formulacore.js`、`js/formulacore-worker.js` | 公式核心的 6 worker 横带池 |
+| `formulacore/family-test.mjs`、`tools/_family-page-check.mjs` | 折叠族的金标准与浏览器验收 |
+| `tools/_preset-lag-check.mjs` | 预设切换累积回归 |
 | `docs/` | README 用的截图 |
 | `tools/` | 发布、缓存版本、以及 CDP 驱动的检查脚本 |
 

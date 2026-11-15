@@ -2,30 +2,30 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=58';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=58';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=58';
-import { setLang, t, getLang } from './i18n.js?v=58';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=58';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=58';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=58';
-import { openCorePanel } from './corepanel.js?v=58';
-import { initGlassSelects } from './glass-select.js?v=58';
-import { composeTile } from './drawlib.js?v=58';
-import { SceneRenderer } from './glscene.js?v=58';
-import { MainGPU } from './wgpu/main.js?v=58';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=58';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=59';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=59';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=59';
+import { setLang, t, getLang } from './i18n.js?v=59';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=59';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=59';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=59';
+import { openCorePanel } from './corepanel.js?v=59';
+import { initGlassSelects } from './glass-select.js?v=59';
+import { composeTile } from './drawlib.js?v=59';
+import { SceneRenderer } from './glscene.js?v=59';
+import { MainGPU } from './wgpu/main.js?v=59';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=59';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=58';
-import { initJuliaView } from './juliaview.js?v=58';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=58';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=59';
+import { initJuliaView } from './juliaview.js?v=59';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=59';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=58';
-import { KINDS } from './formulas.js?v=58';
-import * as webcore from './webcore.js?v=58';
-import * as formulacore from './formulacore.js?v=58';
+         REF_MAX_PARAM } from './refpreset.js?v=59';
+import { KINDS } from './formulas.js?v=59';
+import * as webcore from './webcore.js?v=59';
+import * as formulacore from './formulacore.js?v=59';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=58';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=59';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1020,7 +1020,14 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
   const starved = cap > 0 && hi === 0 && (refLen | 0) >= cap - 1;
   if (starved) {
     if (!observedIter.repainted && observedIter.refine < ITER.maxRefine) {
-      const next = Math.min(ITER.safeCap, Math.max(cap + 1, ITER.starvedCap));
+      /* A flat 80000 is not a repair, it is a session-long tax: a shallow
+       * all-interior frame ALSO reports hi === 0 with refLen === cap, so the
+       * starved rule fired on it, and every later preset inherited that
+       * 80k ceiling.  Measured: switching 12 presets went from 1.3 s to a
+       * 23 s frame while `iter` stayed at 80000/80000.  Scale the jump to
+       * THIS view's own depth so a false positive costs one cheap repaint. */
+      const starvedCap = Math.min(ITER.starvedCap, Math.max(4000, autoIterNow() * 2));
+      const next = Math.min(ITER.safeCap, Math.max(cap + 1, starvedCap));
       if (next > observedIter.cap) {
         observedIter.cap = next;
         observedIter.refine++;
@@ -1116,6 +1123,14 @@ const mainQueue = [];
 const thumbQueue = [];
 let pending = 0;
 let envSeq = 0;
+/* A core frame (webcore / formulacore) owns its own worker pool.  Thumbnails
+ * must not be dispatched while one is in flight, or a deep preset card eats
+ * the CPU that the picture is waiting for. */
+let coreBusy = 0;
+/* Bumped whenever the preset grid is replaced.  A thumbnail job that was
+ * already handed to a worker cannot be interrupted, but its result is then
+ * stale and must not paint a detached canvas. */
+let thumbGen = 0;
 
 function initWorkers() {
   // The desktop shell computes in C++ and only needs one worker as a fallback
@@ -1130,7 +1145,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=58', { type: 'module' });
+    const w = new Worker('js/worker.js?v=59', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -1359,7 +1374,12 @@ function pump() {
    * flight (or queued behind an in-flight one), the preview grid waits.  A
    * settled frame must be produced by the core alone, not interleaved with
    * 249 preset previews grabbing workers mid-pass. */
-  while (thumbQueue.length && pending === 0 && !liveBusy) {
+  /* One card at a time, and only while the picture is settled.  `pending`
+   * counts the thumbnail we just dispatched, so the loop naturally stops
+   * after one; coreBusy additionally keeps the grid quiet during a core
+   * frame.  Without that, a 1e74 preset card (120k iterations x 62k pixels)
+   * sits on a worker for minutes and every later switch waits behind it. */
+  while (thumbQueue.length && pending === 0 && !liveBusy && coreBusy === 0) {
     if (!dispatch(thumbQueue.shift())) return;
   }
 }
@@ -1816,7 +1836,10 @@ let coreRetryAt = 0;
 function noteCoreDrop(why) {
   coreDrops++;
   coreDropWhy = why;
-  /* 'gen' is a frame superseded by a newer pass that is already running. */
+  /* 'gen' is a frame superseded by a newer pass that is already running;
+   * arming a retry here made the retry fight the next gesture and moved the
+   * stale-snapshot symptom from one case to the next.  A dropped 'stale'
+   * frame, on the other hand, has no pass on its way and must be replaced. */
   if (why !== 'stale') return;
   if (drag || pinch) return;              // the gesture end will render
   if (coreRetryAt || wheelTimer) return;  // a pass is already scheduled
@@ -3194,14 +3217,45 @@ const CORE_PREVIEW_SCALE = 0.34;
 let coreWhy = '';
 /* Which views the independent C++ formula core owns.  User-written
  * expressions (mode 'x') and multibrot powers are exact in that core: their
- * jet series is finite / the map is holomorphic.  The non-holomorphic built-in
- * families (tricorn, burning ship, celtic, perpendicular, phoenix) keep the
- * page kernel for now -- their jet is only first order and needs a wider
- * reference ladder before deep zoom is trustworthy. */
+ * jet series is finite / the map is holomorphic.  The five folded built-in
+ * families now own a dedicated C++ kernel too (exact piecewise-quadratic
+ * perturbation + a ladder of arbitrary-precision reference orbits), so they
+ * no longer have to fall back to the shallow page kernel at depth. */
+const FAMILY_CODE = {
+  tricorn: 1, burningship: 2, celtic: 3, perpendicular: 4, phoenix: 5,
+};
+const FAMILY_EXPR = {
+  tricorn: 'conj(z)^2+c',
+  burningship: '(abs(re(z))+i*abs(im(z)))^2+c',
+  celtic: 'abs(re(z^2))+i*im(z^2)+c',
+  perpendicular: 're(z^2)+i*abs(im(z^2))+c',
+};
+/* state.span is m * 2^e (BINARY exponent); zoom = 3/span. */
+function viewDecades() {
+  const s = state.span;
+  return Math.log10(3) - Math.log10(s.m) - s.e * Math.log10(2);
+}
+function familyCodeFor(spec) {
+  if (!spec || spec.mode === 'x' || spec.mode === 'n') return 0;
+  const code = FAMILY_CODE[spec.kind] || 0;
+  /* Shallow views stay on the page's own kernel, which is already exact and
+   * whose gesture/colour timing is settled.  The C++ family kernel is for the
+   * deep regime the page kernel cannot resolve; switching at the SAME 1e12
+   * threshold the worker uses keeps both sides in agreement. */
+  return code && viewDecades() >= 12 ? code : 0;
+}
 function formulaExprFor(spec) {
   if (!FORMULA_ENGINE || !spec) return '';
   if (spec.mode === 'x' && String(spec.customExpr || '').trim())
     return String(spec.customExpr).trim();
+  const fam = familyCodeFor(spec);
+  if (fam) {
+    if (fam === 5) {
+      const p = Number(spec.phoenixP);
+      return `z^2+c+${Number.isFinite(p) ? p : 0.5667}*zprev`;
+    }
+    return FAMILY_EXPR[spec.kind];
+  }
   if (spec.mode === 'm' && spec.kind === 'mandelbrot') {
     const p = spec.power | 0 || 2;
     if (p >= 3 && p <= 10) return `z^${p}+c`;
@@ -3223,8 +3277,8 @@ function coreCanDraw() {
     if (spec.mode === 'j') {
       if ((spec.power | 0 || 2) !== 2) return no('julia-power');   // z^2 + k only
     } else if (spec.mode === 'm') {
-      /* The core's z^2+c; tricorn, burning ship, celtic, perpendicular and
-       * phoenix are still the page kernel's own families. */
+      /* Without the formula core only z^2+c is available; the folded families
+       * now have their own expression and never reach this branch. */
       if (spec.kind !== 'mandelbrot') return no('kind:' + spec.kind);
       if ((spec.power | 0 || 2) !== 2) return no('power:' + spec.power);
     } else {
@@ -3265,6 +3319,11 @@ function coreJob(scale, maxiter) {
      * while it is in flight. */
     formula: formulaActive,
     expr: formulaExprFor(state.spec),
+    /* Folded built-in families carry their own C++ kernel + reference ladder;
+     * keep the code on the job so an in-flight preview cannot switch engine
+     * when the user changes family. */
+    family: familyCodeFor(state.spec),
+    phoenixP: state.spec.phoenixP == null ? 0.5667 : state.spec.phoenixP,
     customParams: state.spec.customParams || {},
   };
 }
@@ -3273,7 +3332,10 @@ function coreJob(scale, maxiter) {
  *  `aa` > 1 means the buffer is supersampled and the compositor box-reduces it. */
 function coreFrame(job, gen, final, aa = 1) {
   const engine = job.formula ? formulacore : webcore;
+  ++coreBusy;                      // keep the preset grid off the CPU meanwhile
+  const landed = () => { coreBusy = Math.max(0, coreBusy - 1); if (!coreBusy) pump(); };
   return engine.coreRender(job).then((msg) => {
+    landed();
     if (job.formula) lastFormulaEngine = msg.engine || 'jet';
     if (gen !== coreGen) { noteCoreDrop('gen', job); return false; }  // a newer view owns the canvas
     /* The view can also move without a new pass being dispatched (a gesture in
@@ -3354,6 +3416,9 @@ function coreFrame(job, gen, final, aa = 1) {
     takeSnapshot();
     previewScale = 1;
     return true;
+  }, (err) => {
+    landed();
+    throw err;
   });
 }
 
@@ -5039,10 +5104,24 @@ let modalKind = null;
  * the panel is replaced or closed; in-flight worker jobs finish into detached
  * canvases and are forgotten. */
 function clearThumbWork() {
+  ++thumbGen;                       // invalidate in-flight thumbnail results
   thumbQueue.length = 0;
   thumbJobs.length = 0;
   clearTimeout(thumbBackfill);
   if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
+}
+/** Drop queued thumbnails but keep the open grid alive: re-arm the observer
+ *  for the cards that are actually visible.  Called on every preset switch so
+ *  a long session cannot pile up grids' worth of stale jobs. */
+function refreshThumbWork() {
+  ++thumbGen;
+  thumbQueue.length = 0;
+  thumbJobs.length = 0;
+  if (modalKind !== 'presets') return;
+  const cards = document.querySelectorAll('.thumb');
+  cards.forEach((c) => { if (c.dataset.q === '1') c.dataset.q = ''; });
+  clearTimeout(thumbBackfill);
+  thumbBackfill = setTimeout(observeThumbs, 0);
 }
 function openModal(kind, title, sub, bodyHtml, footHtml, cls = '') {
   if (modalKind === 'presets') clearThumbWork();
@@ -5326,7 +5405,20 @@ function observeThumbs() {
   clearTimeout(thumbBackfill);
   thumbBackfill = setTimeout(() => {
     if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
-    document.querySelectorAll('.thumb').forEach(c => enqueueThumb(c));
+    /* Backfill only the cards the user can actually see.  Enqueueing the
+     * whole ~512-card library on every grid rebuild queued minutes of deep
+     * renders behind the main view and was the "gets slower every switch"
+     * accumulator.  Off-screen cards are rendered by the observer when they
+     * scroll into view. */
+    const root = $('modal-body');
+    const box = root ? root.getBoundingClientRect() : null;
+    document.querySelectorAll('.thumb').forEach((c) => {
+      if (box) {
+        const r = c.getBoundingClientRect();
+        if (r.bottom < box.top - 120 || r.top > box.bottom + 120) return;
+      }
+      enqueueThumb(c);
+    });
   }, 350);
 }
 
@@ -5353,6 +5445,7 @@ function enqueueThumb(cv) {
   const FW = W, FH = H;
   if (cv.dataset.q) return;
   cv.dataset.q = '1';
+  const gen = thumbGen;
   const id = cv.dataset.id;
   const it = id ? LIB.items.find(x => x.f === id) : null;
   if (!it) return;
@@ -5372,7 +5465,13 @@ function enqueueThumb(cv) {
    * salt-and-pepper noise while the main canvas is a clean scroll fan (both
    * measured on Mandelbrot 15).  Same formula, same cap as the main view. */
   const zoomLog = Math.log10(Math.max(1, Number(it.zo) || 1));
-  const maxIter = Math.min(120000, autoIterFor(zoomLog));
+  /* A card is a hint.  The full 120k-iteration budget of a 1e74 preset takes
+   * minutes on 62k pixels and used to pin 3 workers for the whole session:
+   * every preset switch then queued behind it, which is the "gets slower and
+   * slower, never recovers" report.  Cap the card's own budget hard; the main
+   * view still uses the full one when the card is opened. */
+  const THUMB_MAX_ITER = 12000;
+  const maxIter = Math.min(THUMB_MAX_ITER, autoIterFor(zoomLog));
   const palette = thumbPalette(it);
   const cycle = 12;
   const offset = 0;
@@ -5414,6 +5513,7 @@ function enqueueThumb(cv) {
   if (art) {
     const im = new Image();
     im.onload = () => {
+      if (gen !== thumbGen || !cv.isConnected) return;
       if (cv.dataset.q === 'own') return;   // a real render already replaced it
       const g = cv.getContext('2d');
       g.imageSmoothingQuality = 'high';
@@ -5430,7 +5530,7 @@ function enqueueThumb(cv) {
    * card's 2D canvas.  A per-card context would hit the browser's context
    * limit (~16), which is why there is exactly one. */
   if (gpuOk && NATIVE && !gpu.gl.isContextLost()) {
-    thumbJobs.push({ cv, patch, payload, fieldW: FW, fieldH: FH });
+    thumbJobs.push({ cv, patch, payload, fieldW: FW, fieldH: FH, gen });
     pumpThumbs();
     return;
   }
@@ -5438,6 +5538,7 @@ function enqueueThumb(cv) {
   dispatch({
     payload, thumb: true,
     onDone: (msg) => {
+      if (gen !== thumbGen || !cv.isConnected) return;
       if (!msg || msg.viewId !== THUMB_VIEW_ID || !msg.data) return;
       const g = cv.getContext('2d');
       const img = new ImageData(new Uint8ClampedArray(msg.data), msg.w, msg.h);
@@ -5468,12 +5569,13 @@ function pumpThumbs() {
   if (thumbBusy) return;
   const job = thumbJobs.shift();
   if (!job) return;
-  const { cv, patch, payload, fieldW, fieldH } = job;
+  const { cv, patch, payload, fieldW, fieldH, gen } = job;
   const r = thumbRenderer();
   if (!r.ok) { cv.dataset.q = ''; return; }
   thumbBusy = true;
   const ok = nativeField(payload, (msg) => {
     try {
+      if (gen !== thumbGen || !cv.isConnected) return;
       if (!msg || !msg.data) return;
       const W = msg.w, H = msg.h;
       const rec = resolveScheme(patch);
@@ -5842,6 +5944,10 @@ function applyRefPresetPatch(patch, file) {
    * and a view that starts moving on its own is not what "open a file" means. */
   try { stopAnimation(); syncAnimationButton(); }
   catch (e) { console.error('[preset] anim', e); }
+  /* The view changed: every queued card job belongs to the OLD grid and the
+   * old view.  Dropping them here is what makes repeated preset switching
+   * bounded instead of accumulating one grid of work per click. */
+  refreshThumbWork();
   viewId++;
   renderNow();
   toast(patch.name || patch.schemeName || t('saved'));
@@ -7483,24 +7589,40 @@ function resizeCanvas(render = true) {
   dpr = Math.max(1, dpr);
   const nextW = Math.max(320, Math.round(innerWidth * dpr));
   const nextH = Math.max(240, Math.round(innerHeight * dpr));
-  if ((canvas.width !== nextW || canvas.height !== nextH) &&
-      !nativeCanvasMode() && (pending > 0 || liveBusy)) {
-    cancelAll();
+  /* `applyDeepPixelCap()` calls this on EVERY renderNow() that crosses the
+   * depth threshold.  Assigning canvas.width (even to the same value) clears
+   * the whole surface, and the old code then painted it dark without restoring
+   * the snapshot: switching a deep preset produced a black canvas with one
+   * stale rectangle, and the in-flight pass was cancelled on top of it.  A
+   * no-op resize must be exactly that — no clear, no cancel, no lost frame. */
+  if (canvas.width !== nextW || canvas.height !== nextH) {
+    if (!nativeCanvasMode() && (pending > 0 || liveBusy)) cancelAll();
+    canvas.width = nextW;
+    canvas.height = nextH;
+    /* The shader's backing store is only sized inside sceneDraw(), so a view
+     * the shader declines leaves it at the *previous* window's dimensions.
+     * CSS then stretches that stale frame over the new viewport — a second
+     * source of misplaced blocks.  Keep both layers in lockstep; resizing a
+     * WebGL canvas clears its drawing buffer, so the 2D layer has to become
+     * visible. */
+    if (glCanvas.width !== nextW || glCanvas.height !== nextH) {
+      glCanvas.width = nextW;
+      glCanvas.height = nextH;
+      setGlSurface(false);
+    }
+    ctx.fillStyle = '#05060a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    /* Keep the previous picture on screen while the new pass is computed.
+     * onWindowResize() used to do this itself; doing it here also covers the
+     * deep-pixel-cap resize, which is the one the preset switch triggers. */
+    if (snap.width > 0) {
+      ctx.save();
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'medium';
+      ctx.drawImage(snap, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    }
   }
-  canvas.width = nextW;
-  canvas.height = nextH;
-  /* The shader's backing store is only sized inside sceneDraw(), so a view the
-   * shader declines leaves it at the *previous* window's dimensions.  CSS then
-   * stretches that stale frame over the new viewport — a second source of
-   * misplaced blocks.  Keep both layers in lockstep; resizing a WebGL canvas
-   * clears its drawing buffer, so the 2D layer has to become visible. */
-  if (glCanvas.width !== nextW || glCanvas.height !== nextH) {
-    glCanvas.width = nextW;
-    glCanvas.height = nextH;
-    setGlSurface(false);
-  }
-  ctx.fillStyle = '#05060a';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
   // One line in shell.log per resize: the only way to see the real viewport,
   // DPI and buffer size without a debugger attached to WebView2.
   try {
@@ -7529,13 +7651,9 @@ function onWindowResize() {
     // not recomputed until the next interaction asks for a new view.
     return;
   }
-  if (had) {
-    ctx.save();
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'medium';
-    ctx.drawImage(snap, 0, 0, canvas.width, canvas.height);
-    ctx.restore();
-  }
+  /* The snapshot blit now lives in resizeCanvas() itself, so the depth-cap
+   * resize keeps the picture too.  `had` is only used by the native branch. */
+  void had;
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => renderNow(), 150);
 }
@@ -7691,6 +7809,22 @@ function boot() {
   window.__mbgpu = mainGPU;
   window.__mb = { state, screenToPlane, screenToPlaneHi, planeToScreen, julia: juliaView,
                   paint: () => lastPaint, drops: () => ({ n: coreDrops, why: coreDropWhy }),
+                  /* Read-only queue probe: "switching presets gets slower every
+                   * time" is always an accumulator, so expose every counter a
+                   * regression run needs to name the one that grows. */
+                  queues: () => ({
+                    pending, liveBusy, main: mainQueue.length,
+                    thumb: thumbQueue.length, thumbJobs: thumbJobs.length, thumbBusy,
+                    remote: remoteQueue.length + remoteInflight,
+                    coreRetry: !!coreRetryAt, renderTimer: !!renderTimer,
+                    wheelTimer: !!wheelTimer, passTick: !!passTick,
+                    viewId, coreGen,
+                    workers: workers.length,
+                    ready: workers.filter((w) => w.ready).length,
+                    busy: workers.filter((w) => w.busy).length,
+                    formulaWorkers: formulacore.poolCount(),
+                    deepPixelCap,
+                  }),
                   formula: () => ({ active: formulaActive, loaded: formulaLoaded,
                                     engine: lastFormulaEngine,
                                     expr: formulaExprFor(state.spec) }),
@@ -7698,7 +7832,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=58')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=59')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

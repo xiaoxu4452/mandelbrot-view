@@ -27,6 +27,9 @@
     "bump": "node tools/_bump-cache.mjs",
     "publish": "node tools/_publish.mjs",
     "test:formula-align": "node formulacore/align-test.mjs",
+    "test:family": "node formulacore/family-test.mjs",
+    "test:family-page": "node tools/_family-page-check.mjs",
+    "test:preset-lag": "node tools/_preset-lag-check.mjs",
     "test:formula-ui": "node tools/_formula-ui-check.mjs",
     "test:formula-deep": "node tools/_formula-deep-check.mjs",
     "test:julia-fix": "node tools/_julia-fix-check.mjs"

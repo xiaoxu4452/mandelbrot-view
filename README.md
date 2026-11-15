@@ -189,9 +189,64 @@ escape range.  Those probes did NOT reproduce the exact "every pixel interior"
 view from the bug report, so a direct before/after screenshot of that one view
 is still worth taking with `?diag=1`.
 
-Still outstanding: extending the formula core to the non-holomorphic built-in
-families (tricorn, burning ship, celtic, perpendicular, phoenix), which need a
-wider reference ladder.
+### Stage 3: the five folded built-in families
+
+The non-holomorphic families (tricorn, burning ship, celtic, perpendicular,
+phoenix) are no longer limited to the shallow page kernel.  They are piecewise
+**quadratic** in the real and imaginary parts, so `formulacore/core.cpp` gets a
+dedicated kernel with an *exact* delta recurrence — no truncated Taylor series
+and therefore no first-order-jet error at a fold:
+
+```
+Dr = (2X+dr)dr - (2Y+di)di      Di = X di + Y dr + dr di
+tricorn       d' = Dr + dc_r + i(-2Di + dc_i)
+burning ship  d' = Dr + dc_r + i((sp-sB) Bq + 2 sp Di + dc_i)
+celtic        d' = ((sp-sA) Aq + sp Dr) + dc_r + i(2Di + dc_i)
+perpendicular d' = Dr + dc_r + i((sp-sB) Bq + 2 sp Di + dc_i)
+phoenix       d' = Dr + p dprev_r + dc_r + i(2Di + p dprev_i + dc_i)
+```
+
+`A = X^2-Y^2` and `B = 2XY` are formed by the arbitrary-precision BigInt
+orbit, not by subtracting two doubles; `sp` is the *pixel's* fold sign.  A
+ladder of four reference orbits from centres spread over the frame lets a
+glitched pixel re-anchor at the same iteration index.  Beyond `2^-900` the
+float-exp kernel takes over; inside that range a plain-double kernel stores
+delta in pixel units and is ~10x faster.
+
+Shallow views (below `1e12`) still use the page kernel, whose gesture and
+colour timing is settled.  Deep views switch to this engine.  The first deep
+budget is 1024 iterations and grows by 4x **only when the returned field is
+actually clipped** — a `1e20` frame escapes by iteration 112, so the page's
+14 600-iteration auto budget would otherwise take minutes.
+
+`node formulacore/family-test.mjs` compares all five families (M and Julia,
+shallow and `1e20`) against a per-pixel arbitrary-precision BigInt oracle:
+**0 numeric outliers**, exact band stitching, and agreement between a 4-orbit
+ladder and a single orbit.  `node tools/_family-page-check.mjs` verifies the
+same through the real browser worker pool.
+
+### Preset switching must not accumulate work
+
+Three independent accumulators were measured with
+`node tools/_preset-lag-check.mjs` (12 alternating preset switches in headless
+Edge) and removed:
+
+* `resizeCanvas()` cleared and dark-filled the canvas on **every**
+  `applyDeepPixelCap()` call, even when the dimensions did not change, and
+  cancelled in-flight passes.  A no-op resize is now a true no-op; a real
+  resize restores the snapshot.
+* The preset grid queued ~111 thumbnails with up to 120 000 iterations each;
+  three workers stayed pinned for the whole session and every later switch
+  waited behind them.  Thumbnails are now capped at 12 000 iterations, only
+  visible cards are backfilled, one runs at a time, and queued work is dropped
+  on every preset switch.
+* The "starved" iteration rule jumped to a flat 80 000 for *any* all-interior
+  frame, so a shallow view inherited that ceiling permanently.  The jump is
+  now scaled to the current view's own depth.
+
+Result: the same preset pair settles in 1298 ms at switch 0 and 1302 ms at
+switch 9 (**1.00x**); 12 different presets show no black frames and no growing
+queue; the worst case went from 23 s to 1.3 s.
 
 ### Diagnostics
 
@@ -218,6 +273,11 @@ markup with an old module: `node tools/_bump-cache.mjs <n>`, then
 | `webcore/build.mjs` | mirror + patch + compile pipeline (vendored sources by default) |
 | `webcore/adapter.cpp` | the C ABI: `mb_render`, `mb_view_*`, `mb_render_strip`, stats POD |
 | `webcore/sync-src.mjs` | refresh `webcore/src/` from a desktop checkout |
+| `formulacore/core.cpp`, `formulacore.wasm` | independent arbitrary-expression C++ core + stage-3 folded-family kernels |
+| `formulacore/env.js`, `familyenv.js` | jet coefficients / arbitrary-precision reference ladder |
+| `js/formulacore.js`, `js/formulacore-worker.js` | 6-worker band pool for the formula core |
+| `formulacore/family-test.mjs`, `tools/_family-page-check.mjs` | folded-family oracle and browser acceptance |
+| `tools/_preset-lag-check.mjs` | preset-switch accumulation regression |
 | `docs/` | screenshots used by this README |
 | `tools/` | publish, cache-bump and the CDP-driven checks (`_pngdiff`, `_publish`) |
 

@@ -12,7 +12,9 @@
  * and falls back to the page's JS kernel -- a formula should never disable the
  * Mandelbrot core for every later view.
  */
-const WORKER_URL = 'js/formulacore-worker.js?v=58';
+import { buildFamilyEnvironment, spanToZoom } from '../formulacore/familyenv.js?v=59';
+
+const WORKER_URL = 'js/formulacore-worker.js?v=59';
 const MAX_WORKERS = 6;
 const poolSize = (() => {
   const hc = (navigator.hardwareConcurrency || 4) | 0;
@@ -91,8 +93,8 @@ export function coreReady() {
   return booting;
 }
 
-export function coreRender(job) {
-  return coreReady().then(() => new Promise((resolve, reject) => {
+function renderOnce(job, familyEnv) {
+  return new Promise((resolve, reject) => {
     const id = ++seq;
     const n = Math.min(workers.length, job.h);
     const edges = [];
@@ -100,7 +102,51 @@ export function coreRender(job) {
       edges.push([Math.floor(i * job.h / n), Math.floor((i + 1) * job.h / n)]);
     jobs.set(id, { parts: [], want: n, resolve, reject, w: job.w, h: job.h });
     edges.forEach(([y0, y1], i) => {
-      workers[i].postMessage({ type: 'render', id, job: { ...job, y0, y1 } });
+      workers[i].postMessage({
+        type: 'render', id,
+        job: { ...job, y0, y1, familyEnv },
+      });
     });
-  }));
+  });
+}
+
+/** First budget for a deep family frame.  Measured at 1e20: escaping pixels
+ *  finish by iteration 112 while the page's auto budget is 14600 -- paying the
+ *  whole ceiling made a phoenix Julia take minutes.  A clipped frame is easy
+ *  to detect from the returned field, so grow it only when it really happens. */
+const FAMILY_FIRST_CAP = 1024;
+
+export async function coreRender(job) {
+  await coreReady();
+  let cap = job.maxiter;
+  let deep = false;
+  let zoomMant = 1, zoomExp10 = 0;
+  if (job.family) {
+    ({ zoomMant, zoomExp10 } = spanToZoom(job.span));
+    deep = zoomExp10 + Math.log10(zoomMant) >= 12;
+    if (deep) cap = Math.min(job.maxiter, FAMILY_FIRST_CAP);
+  }
+  for (let attempt = 0; ; ++attempt) {
+    const view = { ...job, maxiter: cap };
+    /* The folded families need R arbitrary-precision orbits.  Build the ladder
+     * ONCE here and hand it to every band: N workers would otherwise pay N
+     * times for the same BigInt work. */
+    let familyEnv = null;
+    if (job.family && deep) {
+      familyEnv = buildFamilyEnvironment({
+        kind: job.family,
+        mode: job.julia ? 1 : 0,
+        phoenixP: job.phoenixP != null ? job.phoenixP : 0.5667,
+        centerRe: job.re, centerIm: job.im,
+        juliaRe: job.juliaRe || '0', juliaIm: job.juliaIm || '0',
+        maxiter: cap, zoomMant, zoomExp10,
+        width: job.w, height: job.h,
+        ladders: 4,
+      });
+    }
+    const msg = await renderOnce(view, familyEnv);
+    if (!deep || attempt >= 3 || cap >= job.maxiter ||
+        !(msg.stats && msg.stats.maxEsc >= cap - 2)) return msg;
+    cap = Math.min(job.maxiter, cap * 4);
+  }
 }

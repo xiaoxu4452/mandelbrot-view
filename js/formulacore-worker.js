@@ -12,12 +12,12 @@
  * Output is the SAME single-channel f32 smooth-iteration field webcore's
  * worker returns (interior = -1), so shadeSmoothField() needs no changes.
  */
-import { buildFormulaEnvironment } from '../formulacore/env.js?v=58';
+import { buildFormulaEnvironment } from '../formulacore/env.js?v=59';
 
 /* deep.cpp: kEscape2 = 4.0.  Both cores must use the same bailout so their
  * smoothed iteration fields line up (see formulacore/align-test.mjs). */
 const BAIL2 = 4.0;
-const WASM_URL = new URL('../formulacore/formulacore.wasm', import.meta.url);
+const WASM_URL = new URL('../formulacore/formulacore.wasm?v=59', import.meta.url);
 
 let e = null;
 let allocs = [];
@@ -126,6 +126,38 @@ function render(job) {
   const rot = Number(job.rot) || 0;
   const rc = Math.cos(rot), rs = Math.sin(rot);
 
+  const decades = zoomExp10 + Math.log10(zoomMant);
+  const mode = job.julia ? 1 : 0;
+  const jr = ws(job.juliaRe || '0'), ji = ws(job.juliaIm || '0');
+
+  /* The folded built-in families own a dedicated C++ kernel: an EXACT
+   * piecewise-quadratic delta recurrence over a ladder of arbitrary-precision
+   * orbits.  Below 1e12 a direct double render is both exact and cheaper. */
+  if (job.family) {
+    let rc0, engine;
+    if (decades >= 12) {
+      const f = job.familyEnv;
+      if (!f) throw new Error('missing family reference ladder');
+      rc0 = e.fc_render_family(job.family, mode, job.w, job.h, job.maxiter,
+        BAIL2, f.R, f.stride,
+        put(f.zr), put(f.zi), put(f.foldA), put(f.foldB),
+        put(f.offX), put(f.offY),
+        f.dMant, f.dExp2, rc, rs, f.phoenixP,
+        y0, y1, 0);
+      engine = 'family';
+    } else {
+      rc0 = e.fc_render(prog, ws(job.re), ws(job.im), zoomMant, zoomExp10,
+        job.w, job.h, job.maxiter, mode, jr, ji, BAIL2,
+        nparam, put(params), rc, rs, y0, y1);
+      engine = 'direct';
+    }
+    if (rc0) throw new Error(engine + ' rc ' + rc0 + ' ' + cstr(e.fc_error()));
+    const full = new Float32Array(e.memory.buffer, e.fc_out_ptr(), job.w * job.h);
+    const field = full.slice(y0 * job.w, y1 * job.w);
+    return { w: job.w, h: job.h, y0, y1, field, stats: fieldStats(field), engine,
+             ms: 0, bits: job.familyEnv ? job.familyEnv.bits : 0 };
+  }
+
   const env = buildFormulaEnvironment({
     expr,
     centerRe: job.re, centerIm: job.im,
@@ -138,7 +170,7 @@ function render(job) {
    * deep enough for a truncated series to be cheap.  Shallow views are
    * rendered directly -- still entirely in C++ wasm. */
   if (env.useJet) {
-    const rc0 = e.fc_render_jet(prog, job.w, job.h, job.maxiter, 0, BAIL2,
+    const rc0 = e.fc_render_jet(prog, job.w, job.h, job.maxiter, mode, BAIL2,
       env.orbitLen, put(env.zr), put(env.zi), put(env.coefA), put(env.coefB),
       env.jetOrder, env.stride, env.dMant, env.dExp2, rc, rs,
       y0, y1, env.saSkip, put(env.saAt), 1);
@@ -149,7 +181,7 @@ function render(job) {
      * high-precision kernel is the right fallback for that view. */
     if (zoomExp10 > 12) throw new Error('reference orbit too short at this depth');
     const rc0 = e.fc_render(prog, ws(job.re), ws(job.im), zoomMant, zoomExp10,
-      job.w, job.h, job.maxiter, 0, ws('0'), ws('0'), BAIL2,
+      job.w, job.h, job.maxiter, mode, jr, ji, BAIL2,
       nparam, put(params), rc, rs, y0, y1);
     if (rc0) throw new Error('fc_render rc ' + rc0 + ' ' + cstr(e.fc_error()));
     engine = 'direct';

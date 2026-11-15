@@ -32,6 +32,12 @@ for (const f of fs.readdirSync(path.join(ROOT, 'css'))) {
 for (const f of fs.readdirSync(path.join(ROOT, 'js', 'wgpu'))) {
   if (f.endsWith('.js')) files.push(path.join(ROOT, 'js', 'wgpu', f));
 }
+/* env.js / familyenv.js are ES modules loaded by the formula worker too; they
+ * import page modules with the same version tags and must move in lockstep,
+ * otherwise the worker and main thread load two copies of bigfixed.js. */
+for (const f of fs.readdirSync(path.join(ROOT, 'formulacore'))) {
+  if (f.endsWith('.js')) files.push(path.join(ROOT, 'formulacore', f));
+}
 
 const seen = new Map();
 let touched = 0;

@@ -755,7 +755,400 @@ static int renderBand(int32_t w, int32_t h, int32_t maxiter,
     return 0;
 }
 
+/* ==========================================================================
+ * Stage 3: the five non-holomorphic built-in families.
+ *
+ * tricorn / burning ship / celtic / perpendicular / phoenix are NOT
+ * holomorphic in z, so jet.js can offer only a central-difference first-order
+ * derivative, and that derivative is meaningless at a fold boundary (abs /
+ * conj / sign).  They are, however, PIECEWISE QUADRATIC POLYNOMIALS in the
+ * real and imaginary parts:
+ *
+ *   tricorn        z' = (x^2-y^2) + i(-2xy) + c
+ *   burning ship   z' = (x^2-y^2) + i(2|x||y|) + c
+ *   celtic         z' = |x^2-y^2| + i(2xy) + c
+ *   perpendicular  z' = (x^2-y^2) + i|2xy| + c
+ *   phoenix        z' = z^2 + c + p z_{n-1}
+ *
+ * With z = Z + d, A = X^2-Y^2 and B = 2XY on the reference orbit,
+ *
+ *   Dr = (2X+dr)dr - (2Y+di)di   = (x^2-y^2) - A
+ *   Di = X di + Y dr + dr di     = xy - XY       (2Di = B_pix - B)
+ *
+ * every family's delta recurrence is an EXACT polynomial -- no truncated
+ * Taylor series, no O(d^2) error, valid at ANY |d|, hence at any depth:
+ *
+ *   tricorn        d' = Dr + dc_r + i(-2Di + dc_i)
+ *   burning ship   d' = Dr + dc_r + i((sp-sB)B + 2 sp Di + dc_i)
+ *   celtic         d' = ((sp-sA)A + sp Dr) + dc_r + i(2Di + dc_i)
+ *   perpendicular  d' = Dr + dc_r + i((sp-sB)B + 2 sp Di + dc_i)
+ *   phoenix        d' = Dr + p dprev_r + dc_r + i(2Di + p dprev_i + dc_i)
+ *
+ * sp is the PIXEL's fold sign (of A+Dr or B+2Di); sA/sB are the REFERENCE's
+ * signs, taken from the high-precision orbit as the exact values A and B
+ * rather than subtracting two doubles (which would lose them near zero).
+ * When sp != s the correction term is proportional to A (or B), which is
+ * itself O(d) at a sign crossing -- so no O(1) discontinuity ever appears.
+ *
+ * The "wider reference ladder": instead of ONE orbit, the host builds R
+ * arbitrary-precision orbits from centres spread over the frame.  A pixel
+ * whose Z+d cancels re-anchors at the SAME iteration index onto whichever
+ * orbit is closest; keeping the index fixed is what makes phoenix's z_{n-1}
+ * term well defined.  All orbits share the frame centre's c, so only dc has
+ * to be recomputed after a switch.
+ * ========================================================================== */
+
+static inline int fe_sgn(FE a) { return a.m < 0.0 ? -1 : (a.m > 0.0 ? 1 : 0); }
+
+static int renderFamilyBand(
+    int32_t kind, int32_t mode, int32_t w, int32_t h, int32_t maxiter,
+    double bail2, int32_t R, int32_t stride,
+    const double* Zr, const double* Zi,
+    const double* foldA, const double* foldB,
+    const double* offX, const double* offY,
+    double dMant, int32_t dExp2,
+    double rotCos, double rotSin, double phoenixP,
+    int32_t y0, int32_t y1, int32_t smoothBias) {
+    const size_t total = static_cast<size_t>(w) * h;
+    if (g_field.size() != total) g_field.assign(total, -1.0f);
+    const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
+    const double glitchEps = std::ldexp(1.0, -20);
+    const int N = std::min(maxiter, stride);
+
+    for (int y = y0; y < y1; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const FE X = fe_norm((static_cast<double>(x) + 0.5 - 0.5 * w) * dMant, dExp2);
+            const FE Y = fe_scale(fe_norm((static_cast<double>(y) + 0.5 - 0.5 * h) * dMant, dExp2), -1.0);
+            const FE u = fe_add(fe_scale(X, rotCos), fe_scale(Y, -rotSin));
+            const FE v = fe_add(fe_scale(X, rotSin), fe_scale(Y, rotCos));
+            const C2 base{u, v};                    // pixel offset from frame centre
+
+            auto epsOf = [&](int q) -> C2 {
+                return C2{fe_norm(offX[q] * dMant, dExp2),
+                          fe_norm(offY[q] * dMant, dExp2)};
+            };
+            /* Mandelbrot: z0 = 0 everywhere, c = centre + offset.
+             * Julia:      c is fixed, z0 = centre + offset.
+             * Either way d0 = offset - orbit_centre_offset. */
+            const C2 d0 = c2_sub(base, epsOf(0));
+            C2 dz = (mode == 1) ? d0 : c2_zero();
+            C2 dc = (mode == 1) ? c2_zero() : d0;
+            /* phoenix needs delta at step n-1.  It must be kept as a DELTA:
+             * reconstructing it as (Z_{n-1}+delta) - Z_{n-1} would subtract
+             * two O(1) doubles and throw away a 1e-20 delta entirely. */
+            C2 dzPrev = c2_zero();
+            int r = 0, n = 0, rebases = 0;
+            float value = -1.0f;
+            /* Interior pixels dominate a deep frame.  Without an early exit
+             * every one of them walks the FULL iteration budget (14k x 500k
+             * pixels = 7e9 steps, i.e. a frame that never lands).  The page's
+             * own kernel uses exactly this periodicity check; for phoenix the
+             * state is (z_n, delta_{n-1}), so compare both. */
+            double chkR = 0.0, chkI = 0.0, chkDR = 0.0, chkDI = 0.0;
+            bool chkOn = false;
+            int steps = 0;
+
+            while (n < N && ++steps <= N + 64) {
+                const double* ZR = Zr + static_cast<size_t>(r) * stride;
+                const double* ZI = Zi + static_cast<size_t>(r) * stride;
+                const double* FA = foldA + static_cast<size_t>(r) * stride;
+                const double* FB = foldB + static_cast<size_t>(r) * stride;
+                const C2 Z = c2_from(ZR[n], ZI[n]);
+                const C2 z = c2_add(Z, dz);
+                const double zr = fe_double(z.r), zi = fe_double(z.i);
+                const double z2 = zr * zr + zi * zi;
+                if (!(z2 <= bail2)) {
+                    const double logz = 0.5 * std::log(std::max(z2, 1e-300));
+                    double sm = static_cast<double>(n + smoothBias) + 1.0 -
+                                std::log2(logz / logBail);
+                    if (!(sm >= 0.0) || !std::isfinite(sm)) sm = 0.0;
+                    value = static_cast<float>(sm);
+                    break;
+                }
+                if (!std::isfinite(z2)) break;
+                if (n == 8) {
+                    chkR = zr; chkI = zi;
+                    chkDR = fe_double(dzPrev.r); chkDI = fe_double(dzPrev.i);
+                    chkOn = true;
+                } else if (chkOn && (n & 31) == 0) {
+                    const double q1 = zr - chkR, q2 = zi - chkI;
+                    const double q3 = fe_double(dzPrev.r) - chkDR;
+                    const double q4 = fe_double(dzPrev.i) - chkDI;
+                    if (q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4 < 1e-30)
+                        break;                       // periodic -> interior
+                }
+
+                const double aZ = std::hypot(ZR[n], ZI[n]);
+                const double ad = c2_abs(dz);
+                const double az = std::sqrt(z2);
+                if (az < glitchEps * std::max(aZ, ad)) {
+                    if (++rebases > 16) break;
+                    /* Re-anchor at the SAME iteration onto the closest orbit.
+                     * The host sorted the longest-lived orbit first, and all
+                     * orbits are padded to the full budget, so no index shift
+                     * is needed. */
+                    int best = -1;
+                    double bestD = ad;
+                    for (int q = 0; q < R; ++q) {
+                        if (q == r) continue;
+                        const double* QR = Zr + static_cast<size_t>(q) * stride;
+                        const double* QI = Zi + static_cast<size_t>(q) * stride;
+                        const double d = std::hypot(QR[n] - zr, QI[n] - zi);
+                        if (d < bestD) { bestD = d; best = q; }
+                    }
+                    if (best < 0) break;
+                    const double* QR = Zr + static_cast<size_t>(best) * stride;
+                    const double* QI = Zi + static_cast<size_t>(best) * stride;
+                    /* Re-express the history delta against the new orbit:
+                     * (Zold + dprev) - Znew = dprev + (Zold - Znew).  The
+                     * shift is formed BEFORE the subtraction of near-equal
+                     * values, so a 1e-20 delta survives. */
+                    if (n > 0) {
+                        const double* ORR = Zr + static_cast<size_t>(r) * stride;
+                        const double* ORI = Zi + static_cast<size_t>(r) * stride;
+                        dzPrev = c2_add(dzPrev,
+                            C2{fe_sub(fe_norm(ORR[n - 1], 0), fe_norm(QR[n - 1], 0)),
+                               fe_sub(fe_norm(ORI[n - 1], 0), fe_norm(QI[n - 1], 0))});
+                    }
+                    dz = c2_sub(z, c2_from(QR[n], QI[n]));
+                    r = best;
+                    if (mode == 0) dc = c2_sub(base, epsOf(r));
+                    continue;                       // same z, a closer Z
+                }
+                if (n + 1 >= N) break;
+
+                const FE FX = fe_norm(ZR[n], 0), FY = fe_norm(ZI[n], 0);
+                const FE t1 = fe_add(fe_scale(FX, 2.0), dz.r);
+                const FE t2 = fe_add(fe_scale(FY, 2.0), dz.i);
+                /* Dr = (x^2-y^2) - A ; Di = xy - XY */
+                const FE Dr = fe_sub(fe_mul(t1, dz.r), fe_mul(t2, dz.i));
+                const FE Di = fe_add(fe_add(fe_mul(FX, dz.i), fe_mul(FY, dz.r)),
+                                     fe_mul(dz.r, dz.i));
+                const FE D2i = fe_scale(Di, 2.0);
+                FE ndr, ndi;
+                if (kind == 1) {                    /* tricorn */
+                    ndr = fe_add(Dr, dc.r);
+                    ndi = fe_add(fe_scale(D2i, -1.0), dc.i);
+                } else if (kind == 2 || kind == 4) { /* burning ship / perpendicular */
+                    const double B = FB[n];
+                    const int sB = B < 0.0 ? -1 : 1;
+                    const FE Bp = fe_add(fe_norm(B, 0), D2i);
+                    const int sp = fe_sgn(Bp);
+                    ndr = fe_add(Dr, dc.r);
+                    ndi = fe_add(fe_add(fe_scale(D2i, static_cast<double>(sp)),
+                                        fe_scale(fe_norm(B, 0), static_cast<double>(sp - sB))),
+                                 dc.i);
+                } else if (kind == 3) {            /* celtic */
+                    const double A = FA[n];
+                    const int sA = A < 0.0 ? -1 : 1;
+                    const FE Ap = fe_add(fe_norm(A, 0), Dr);
+                    const int sp = fe_sgn(Ap);
+                    ndr = fe_add(fe_add(fe_scale(Dr, static_cast<double>(sp)),
+                                        fe_scale(fe_norm(A, 0), static_cast<double>(sp - sA))),
+                                 dc.r);
+                    ndi = fe_add(D2i, dc.i);
+                } else {                            /* phoenix */
+                    ndr = fe_add(fe_add(Dr, dc.r), fe_scale(dzPrev.r, phoenixP));
+                    ndi = fe_add(fe_add(D2i, dc.i), fe_scale(dzPrev.i, phoenixP));
+                }
+                dzPrev = dz;
+                dz = C2{ndr, ndi};
+                ++n;
+            }
+            g_field[static_cast<size_t>(y) * w + x] = value;
+        }
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Fast path: delta is stored in PIXEL UNITS (u = delta / ps), so every value
+ * is an ordinary double.  This is valid while ps = dMant*2^dExp2 is
+ * representable (dExp2 > -900, i.e. zoom up to ~1e270 -- every shipped preset
+ * is far inside that).  The FE path above stays as the arbitrary-depth
+ * fallback.
+ *
+ * In u units the quadratic terms gain a factor ps, and the fold arguments
+ * gain 1/ps:
+ *   Dr = (2X + ps*dr)dr - (2Y + ps*di)di      Di = X di + Y dr + ps dr di
+ *   Bq = B/ps,  Aq = A/ps,  sp = sign(Bq + 2Di) / sign(Aq + Dr)
+ *   d'_im = (sp-sB) Bq + 2 sp Di (+ dc)       d'_re = (sp-sA) Aq + sp Dr (+ dc)
+ * Dropping frexp/ldexp from the inner loop is ~10x at 1e20: a 300x200 phoenix
+ * frame went from 148 s to a couple of seconds.
+ * -------------------------------------------------------------------------- */
+static int renderFamilyBandScaled(
+    int32_t kind, int32_t mode, int32_t w, int32_t h, int32_t maxiter,
+    double bail2, int32_t R, int32_t stride,
+    const double* Zr, const double* Zi,
+    const double* foldA, const double* foldB,
+    const double* offX, const double* offY,
+    double dMant, int32_t dExp2,
+    double rotCos, double rotSin, double phoenixP,
+    int32_t y0, int32_t y1, int32_t smoothBias) {
+    const size_t total = static_cast<size_t>(w) * h;
+    if (g_field.size() != total) g_field.assign(total, -1.0f);
+    const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
+    const double glitchEps = std::ldexp(1.0, -20);
+    const double ps = std::ldexp(dMant, dExp2);
+    const double invPs = 1.0 / ps;
+    const int N = std::min(maxiter, stride);
+
+    for (int y = y0; y < y1; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const double ax = x + 0.5 - 0.5 * w;
+            const double ay = -(y + 0.5 - 0.5 * h);
+            const double u0r = ax * rotCos - ay * rotSin;
+            const double u0i = ax * rotSin + ay * rotCos;
+            const double q0r = u0r - offX[0], q0i = u0i - offY[0];
+            double dr = (mode == 1) ? q0r : 0.0;
+            double di = (mode == 1) ? q0i : 0.0;
+            double dcr = (mode == 1) ? 0.0 : q0r;
+            double dci = (mode == 1) ? 0.0 : q0i;
+            double dpr = 0.0, dpi = 0.0;
+            int r = 0, n = 0, rebases = 0;
+            float value = -1.0f;
+            double chkR = 0.0, chkI = 0.0, chkDR = 0.0, chkDI = 0.0;
+            bool chkOn = false;
+            int steps = 0;
+
+            while (n < N && ++steps <= N + 64) {
+                const double* ZR = Zr + static_cast<size_t>(r) * stride;
+                const double* ZI = Zi + static_cast<size_t>(r) * stride;
+                const double* FA = foldA + static_cast<size_t>(r) * stride;
+                const double* FB = foldB + static_cast<size_t>(r) * stride;
+                const double X = ZR[n], Y = ZI[n];
+                const double pdr = ps * dr, pdi = ps * di;
+                const double zr = X + pdr, zi = Y + pdi;
+                const double z2 = zr * zr + zi * zi;
+                if (!(z2 <= bail2)) {
+                    const double logz = 0.5 * std::log(std::max(z2, 1e-300));
+                    double sm = static_cast<double>(n + smoothBias) + 1.0 -
+                                std::log2(logz / logBail);
+                    if (!(sm >= 0.0) || !std::isfinite(sm)) sm = 0.0;
+                    value = static_cast<float>(sm);
+                    break;
+                }
+                if (!std::isfinite(z2)) break;
+                if (n == 8) {
+                    chkR = zr; chkI = zi; chkDR = ps * dpr; chkDI = ps * dpi;
+                    chkOn = true;
+                } else if (chkOn && (n & 31) == 0) {
+                    const double q1 = zr - chkR, q2 = zi - chkI;
+                    const double q3 = ps * dpr - chkDR, q4 = ps * dpi - chkDI;
+                    if (q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4 < 1e-30)
+                        break;                       // periodic -> interior
+                }
+                /* Squared magnitudes: three hypot/sqrt calls per iteration
+                 * used to dominate the whole kernel.  A glitch is
+                 * |z| << max(|Z|,|delta|), which is exactly the same test on
+                 * the squares. */
+                const double aZ2 = X * X + Y * Y;
+                const double ad2 = pdr * pdr + pdi * pdi;
+                if (z2 < glitchEps * glitchEps * std::max(aZ2, ad2)) {
+                    if (++rebases > 16) break;
+                    int best = -1;
+                    double bestD2 = ad2;
+                    for (int q = 0; q < R; ++q) {
+                        if (q == r) continue;
+                        const double* QR = Zr + static_cast<size_t>(q) * stride;
+                        const double* QI = Zi + static_cast<size_t>(q) * stride;
+                        const double ex = QR[n] - zr, ey = QI[n] - zi;
+                        const double d2 = ex * ex + ey * ey;
+                        if (d2 < bestD2) { bestD2 = d2; best = q; }
+                    }
+                    if (best < 0) break;
+                    const double* QR = Zr + static_cast<size_t>(best) * stride;
+                    const double* QI = Zi + static_cast<size_t>(best) * stride;
+                    if (n > 0) {
+                        const double* ORR = Zr + static_cast<size_t>(r) * stride;
+                        const double* ORI = Zi + static_cast<size_t>(r) * stride;
+                        dpr += (ORR[n - 1] - QR[n - 1]) * invPs;
+                        dpi += (ORI[n - 1] - QI[n - 1]) * invPs;
+                    }
+                    dr = (zr - QR[n]) * invPs;
+                    di = (zi - QI[n]) * invPs;
+                    r = best;
+                    if (mode == 0) {
+                        dcr = u0r - offX[r];
+                        dci = u0i - offY[r];
+                    }
+                    continue;
+                }
+                if (n + 1 >= N) break;
+
+                const double Dr = (2.0 * X + ps * dr) * dr -
+                                  (2.0 * Y + ps * di) * di;
+                const double Di = X * di + Y * dr + ps * dr * di;
+                const double D2i = 2.0 * Di;
+                double ndr, ndi;
+                if (kind == 1) {
+                    ndr = Dr + dcr;
+                    ndi = -D2i + dci;
+                } else if (kind == 2 || kind == 4) {
+                    const double Bq = FB[n] * invPs;
+                    const int sB = Bq < 0.0 ? -1 : 1;
+                    const double Bp = Bq + D2i;
+                    const int sp = Bp < 0.0 ? -1 : (Bp > 0.0 ? 1 : 0);
+                    ndr = Dr + dcr;
+                    ndi = static_cast<double>(sp - sB) * Bq +
+                          static_cast<double>(sp) * D2i + dci;
+                } else if (kind == 3) {
+                    const double Aq = FA[n] * invPs;
+                    const int sA = Aq < 0.0 ? -1 : 1;
+                    const double Ap = Aq + Dr;
+                    const int sp = Ap < 0.0 ? -1 : (Ap > 0.0 ? 1 : 0);
+                    ndr = static_cast<double>(sp - sA) * Aq +
+                          static_cast<double>(sp) * Dr + dcr;
+                    ndi = D2i + dci;
+                } else {
+                    ndr = Dr + dcr + phoenixP * dpr;
+                    ndi = D2i + dci + phoenixP * dpi;
+                }
+                dpr = dr; dpi = di;
+                dr = ndr; di = ndi;
+                ++n;
+            }
+            g_field[static_cast<size_t>(y) * w + x] = value;
+        }
+    }
+    return 0;
+}
+
 extern "C" {
+
+/** Render one horizontal band of a non-holomorphic built-in family against
+ *  a ladder of R arbitrary-precision reference orbits. */
+__attribute__((export_name("fc_render_family")))
+int32_t fc_render_family(
+    int32_t kind, int32_t mode, int32_t w, int32_t h, int32_t maxiter,
+    double bail2, int32_t R, int32_t stride,
+    const double* Zr, const double* Zi,
+    const double* foldA, const double* foldB,
+    const double* offX, const double* offY,
+    double dMant, int32_t dExp2,
+    double rotCos, double rotSin, double phoenixP,
+    int32_t y0, int32_t y1, int32_t smoothBias) {
+    g_error.clear();
+    if (kind < 1 || kind > 5 || mode < 0 || mode > 1) { g_error = "bad family/mode"; return 1; }
+    if (w < 1 || h < 1 || w > 8192 || h > 8192 || maxiter < 1) {
+        g_error = "bad frame dimensions"; return 2;
+    }
+    if (R < 1 || stride < maxiter + 1 || !Zr || !Zi || !foldA || !foldB ||
+        !offX || !offY) { g_error = "missing reference ladder"; return 3; }
+    if (y0 < 0 || y1 > h || y1 <= y0) { g_error = "bad band"; return 4; }
+    /* Plain doubles cover every shipped depth and are ~10x faster than the
+     * float-exp arithmetic.  Beyond 2^-900 the pixel scale underflows a
+     * double, so the FE kernel above takes over (arbitrary depth, slower). */
+    if (dExp2 > -900)
+        return renderFamilyBandScaled(kind, mode, w, h, maxiter, bail2, R, stride,
+                                      Zr, Zi, foldA, foldB, offX, offY,
+                                      dMant, dExp2, rotCos, rotSin, phoenixP,
+                                      y0, y1, smoothBias);
+    return renderFamilyBand(kind, mode, w, h, maxiter, bail2, R, stride,
+                            Zr, Zi, foldA, foldB, offX, offY,
+                            dMant, dExp2, rotCos, rotSin, phoenixP,
+                            y0, y1, smoothBias);
+}
 
 /** Legacy z^d+c entry point uses K = 4. */
 __attribute__((export_name("fc_jet_order")))
