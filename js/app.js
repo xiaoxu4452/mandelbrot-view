@@ -2,29 +2,29 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=30';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=30';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=30';
-import { setLang, t, getLang } from './i18n.js?v=30';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=30';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=30';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=30';
-import { openCorePanel } from './corepanel.js?v=30';
-import { initGlassSelects } from './glass-select.js?v=30';
-import { composeTile } from './drawlib.js?v=30';
-import { SceneRenderer } from './glscene.js?v=30';
-import { MainGPU } from './wgpu/main.js?v=30';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=30';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=31';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=31';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=31';
+import { setLang, t, getLang } from './i18n.js?v=31';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=31';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=31';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=31';
+import { openCorePanel } from './corepanel.js?v=31';
+import { initGlassSelects } from './glass-select.js?v=31';
+import { composeTile } from './drawlib.js?v=31';
+import { SceneRenderer } from './glscene.js?v=31';
+import { MainGPU } from './wgpu/main.js?v=31';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=31';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=30';
-import { initJuliaView } from './juliaview.js?v=30';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=30';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=31';
+import { initJuliaView } from './juliaview.js?v=31';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=31';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=30';
-import { KINDS } from './formulas.js?v=30';
-import * as webcore from './webcore.js?v=2';
+         REF_MAX_PARAM } from './refpreset.js?v=31';
+import { KINDS } from './formulas.js?v=31';
+import * as webcore from './webcore.js?v=3';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=30';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=31';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1083,7 +1083,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=30', { type: 'module' });
+    const w = new Worker('js/worker.js?v=31', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -3115,10 +3115,10 @@ function corePass() {
         .then(() => {
           coreLoaded = true;
           coreBooting = false;
-          if (coreCanDraw()) { renderNow(); return; }
-          /* A view the core cannot draw (a formula, a multibrot power): let the
-           * page's own pipeline have it, and stop claiming frames. */
-          coreOff = true;
+          /* A view the core cannot draw (a formula, a multibrot power) is the
+           * page's own pipeline's job — but only for *this* view.  Turning the
+           * core off for the session here would silently downgrade every later
+           * Mandelbrot view after a formula-first start. */
           renderNow();
         })
         .catch(() => { coreBooting = false; coreOff = true; renderNow(); });
@@ -7348,7 +7348,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=30')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=31')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

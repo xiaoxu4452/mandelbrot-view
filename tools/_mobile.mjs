@@ -9,7 +9,7 @@ import { attach, evaluate as ev, sleep } from './_cdp.mjs';
 
 const port = Number(process.argv[2] || 9347);
 const OUT = 'D:/mandelbrot view/evidence';
-const URL = 'http://127.0.0.1:8781/index.html';
+const URL = process.argv[3] || 'http://127.0.0.1:8781/index.html';
 const { page } = await attach(port);
 await page.send('Page.enable');
 await page.send('Runtime.enable');

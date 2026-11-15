@@ -11,10 +11,10 @@
  *     — so any custom formula can zoom deep while every pixel stays double precision.
  * ----------------------------------------------------------------*/
 
-import { contextFor } from './bigfixed.js?v=30';
-import { compileBig, makeBigContext } from './hpeval.js?v=30';
-import { compile as compileDouble } from './mathlib.js?v=30';
-import { compileJet, JET_ORDER } from './jet.js?v=30';
+import { contextFor } from './bigfixed.js?v=31';
+import { compileBig, makeBigContext } from './hpeval.js?v=31';
+import { compile as compileDouble } from './mathlib.js?v=31';
+import { compileJet, JET_ORDER } from './jet.js?v=31';
 
 const BAIL2 = 1e20;
 

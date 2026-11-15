@@ -19,7 +19,7 @@ let onReady = null;
 
 function ensure() {
   if (worker) return worker;
-  worker = new Worker('js/webcore-worker.js?v=3', { type: 'classic' });
+  worker = new Worker('js/webcore-worker.js?v=4', { type: 'classic' });
   worker.onmessage = (ev) => {
     const m = ev.data;
     if (m.type === 'ready') {
