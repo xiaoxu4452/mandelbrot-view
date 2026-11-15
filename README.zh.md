@@ -2,81 +2,69 @@
 
 交互式 Mandelbrot / Julia 观测器，渲染器是**编译成 WebAssembly 的桌面 C++
 核心**——与 [Meter-Mandelbrot-Desktop](https://github.com/xiaoxu4452/Meter-Mandelbrot-Desktop)
-使用同一批翻译单元（扰动引擎、级数近似、周期参考轨道、自研 BigFloat
-后端）。这里没有第二套算法：网页渲染的就是桌面渲染的画面，逐像素一致。
+使用同一批翻译单元（扰动、级数近似、周期参考轨道、glitch 修复、自研 BigFloat
+后端）。
 
-**在线地址**：<https://xiaoxu4452.github.io/mandelbrot-view/>
+**在线地址**：<https://xiaoxu4452.github.io/mandelbrot-view/> ·
 English: [README.md](README.md)
+
+界面用的是观测器原本那套成熟 UI，外观、工具栏、调色板、预设库、HUD、手势全部
+没有改动；换掉的只是底下那颗“大脑”——原来用 JavaScript 逐像素迭代的引擎被
+`core.wasm` 取代。界面不由核心生成，核心也不由页面重新实现。
 
 ---
 
-## 架构
+## 结构
 
 ```
-浏览器                      shell-worker.js           core.wasm（C++ → wasm32-wasi）
- ┌────────────┐  postMessage  ┌──────────────┐  mb_render()  ┌──────────────────┐
- │ shell.js   │ ────────────▶ │ 字符串 ABI    │ ────────────▶ │ 桌面核心：        │
- │ 画布/手势  │ ◀──────────── │ RGB → ImageData│ ◀──────────── │ deep / reference │
- │ HUD/面板   │   ImageData   │              │    RGB        │ / render / bigfloat│
- └────────────┘               └──────────────┘               └──────────────────┘
+page (js/app.js)            js/webcore-worker.js        core.wasm (C++ → wasm32-wasi)
+ ┌──────────────┐  postMessage ┌────────────────┐  mb_render()  ┌──────────────────────┐
+ │ canvas、HUD、│ ───────────▶ │ 全精度中心字符串│ ────────────▶ │ deep / reference /   │
+ │ 调色板、手势 │ ◀─────────── │ 十进制缩放、尺寸│ ◀──────────── │ render / bigfloat /  │
+ │              │  场 1×f32/px │ → field4       │  field4       │ viewport（桌面原件） │
+ └──────────────┘              └────────────────┘               └──────────────────────┘
 ```
 
-* **一个引擎、一个 worker。** 手势（滚轮 / 平移 / 捏合）期间用同一个核心
-  重画低分辨率整帧；提交帧永远是一次全分辨率渲染。没有 shader 迭代、
-  没有 WebGPU、没有渐进 tile 混合。
-* **中心坐标是全深度十进制字符串。** 每个手势用 BigInt 十进制运算叠加一个
-  小 double 增量，63 位中心上的 1e-600 平移不会丢一位。坐标以字符串直传
-  核心，与桌面 CLI 完全一致。
-* **精度**由核心自行规划：`digits = log10(zoom) + 50`、64 limb 对齐——与
-  桌面规则相同。
-* **滚轮**沿用桌面壳模型：一格约 1.522×、快照在光标下反馈、360 ms 防抖、
-  无滑行。
+* **画面归页面，数学归核心。** 一帧请求携带：全精度十进制中心字符串（从不经过
+  double）、画面的复平面宽度、像素尺寸、迭代预算。核心回四通道场
+  `[平滑迭代, 距离, 迭代数, 0]`，内部用负的平滑值标记；页面把它换算成颜色位置
+  （`smooth / cycle + offset`）再查自己的调色板表——所以配色、渐变、重着色缓存
+  的行为与过去完全一致。
+* **没有第二套算法。** 参考轨道选举、级数近似、rebase、glitch 修复（含 SA
+  重放）、精度规划（`digits = log10(zoom) + 50`）都是桌面源码，由
+  `webcore/build.mjs` 从桌面原件镜像并打断言补丁（`throw` → 错误标志、
+  `<thread>` 桩、GMP → BigFloat 桩 + 周期轨道补丁）后编译。`webcore/test.mjs`
+  与桌面 `mset.exe` 生成的 PNG 逐像素比对。
+* **一帧一条参考轨道。** 成帧是一次整幅渲染，没有瓦片接缝，也不会有两个引擎
+  抢同一块画布。深视点先出 0.34× 预览，再出整帧。
+* **核心不支持的公式自动回退**到页面自己的内核：multibrot 次幂、tricorn、
+  burning ship、celtic、perpendicular、phoenix、Newton、距离着色、trap、
+  自定义公式。HUD 会写明这一帧是哪个引擎画的（`CORE` / `WASM` / `GPU`）。
+* **为手机适配**：单指拖动平移，双指围绕移动中的中点捏合缩放，`touch-action:
+  none` 阻止浏览器抢手势；手机的像素预算降到桌面的三分之一，捏合不会卡死。
 
-## 核心构建（`webcore/`）
-
-`webcore/build.mjs` 从桌面源码树复制渲染链翻译单元
-（`C:\Users\harve\Desktop\mande\new\src`），应用三处有文档的机械构建期
-适配，用 zig 编译：
-
-1. `throw std::invalid_argument`（7 处，仅输入解析）→ 错误标志——zig 的
-   wasm32-wasi libc++ 不带异常展开器。
-2. `<thread>` → 单线程桩；壳层始终以 `threads = 1` 渲染，不会 spawn 任何
-   线程。
-3. `gmp_bridge.cpp` → `gmp_stub.cpp`：运行时后端选择器固定为自研
-   BigFloat 后端——与桌面在缺少 GMP DLL 时完全同数值，也正是 B2 oracle
-   测试验证过的后端。BigFloat 路径补上了周期参考探测（精确重复检测 +
-   平铺，镜像 `orbit_gmp`），使周期中心在任意深度保持精确。
-
-桌面原件一律不改；每个补丁都在 `webcore/build.mjs` 里断言数量，桌面侧
-变更不可能静默漂移进网页构建。
+## 构建与验证
 
 ```bash
-# 重新构建 core.wasm（需要 zig 0.16+）
-npm run build:core
-
-# 与桌面 mset.exe 逐像素对拍
-# （视点：首页、1e15.2、1e38、c=i @ 1e600、Julia）
-npm run test:core
-
-# 浏览器冒烟（Playwright，桌面 + 手机触屏）
-npm run page &      # 本地静态服务 :8777
-npm run smoke
+node webcore/build.mjs        # 桌面源码 → core.wasm（需要 zig）
+node webcore/test.mjs         # 与桌面 PNG 逐像素比对
+node webcore/test-view.mjs    # 核心 viewport 的缩放/平移/捏合往返
+node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 
-当前验收：五个参考视点对桌面金标准 **100.000% 逐像素一致（maxDelta = 0）**。
+`?engine=old` 仍可加载上一版纯 JavaScript 引擎做 A/B。
 
-## 文件
+## 目录
 
-| 路径 | 作用 |
+| 路径 | 内容 |
 | --- | --- |
-| `index.html`, `shell.css`, `shell.js` | 壳：画布、手势、HUD、面板 |
-| `shell-worker.js` | WASM 宿主：字符串 ABI、RGB → ImageData |
-| `core.wasm` | 编译好的桌面核心（供浏览器加载） |
-| `webcore/` | 核心的构建与逐像素对拍测试 |
-| `server/static-server.mjs` | 本地开发服务 |
-| `tools/` | 发布、历史重建、浏览器冒烟、PNG 读取 |
+| `index.html`、`css/`、`js/` | 观测器 UI（外观未改） |
+| `js/app.js` | 手势、调色板、HUD，以及 `corePass()` 派帧 |
+| `js/webcore.js`、`js/webcore-worker.js` | `core.wasm` 的薄 ABI 客户端 |
+| `core.wasm` | 编译后的桌面核心 |
+| `webcore/build.mjs` | 镜像 + 补丁 + 编译流水线 |
+| `webcore/adapter.cpp` | C ABI：`mb_render`、`mb_view_*`、stats POD |
 
-## 分享视点
+## 许可
 
-菜单 → **复制视点链接**，链接内含全精度中心、视窗宽度、迭代数与配色。
-旧网页引擎的链接（`#st=…` 旧格式）仍可解码。
+MIT — 见 [LICENSE](LICENSE)。

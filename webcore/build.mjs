@@ -28,6 +28,10 @@ const HEADERS = [
   'bigfloat.hpp', 'floatexp.hpp', 'reference.hpp', 'deep.hpp', 'render.hpp',
   'palette.hpp', 'dive.hpp', 'exact.hpp', 'image.hpp', 'port/port.hpp',
   'gmp_bridge.hpp',
+  /* The view layer.  Header-only, and the reason the web build needs it is the
+   * whole point of this file: point_at / zoom_by / pan_pixels live in the core
+   * on the desktop, and the page must not have a second implementation. */
+  'viewport.hpp',
 ];
 
 // ---- mechanical patches ----------------------------------------------------
