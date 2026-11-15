@@ -1,7 +1,7 @@
 /* bands.mjs — fan a frame out to N worker threads, one band each.
  *
  * The reference orbit and the jet coefficients are built ONCE by the host
- * (env.mjs) and copied into each worker's own wasm memory.  That is the whole
+ * (env.js) and copied into each worker's own wasm memory.  That is the whole
  * trick: precision cost is paid once, pixel cost is split N ways, and the
  * result is bit-identical to a single whole-frame render.
  */

@@ -95,6 +95,10 @@ try {
     const open = JSON.parse(await js(SNAP));
     console.log(`open   cap=${open.cap} ms=${open.ms} total=${open.total}`);
     const caps = [open.cap], waits = [], mss = [];
+    /* Drops are a cumulative diagnostic: boot / preset loading can drop a
+     * stale frame on purpose (v52 arms a retry for it).  What must be zero is
+     * the number of NEW drops during the gesture, not the session total. */
+    const drops0 = open.drops;
     let allMatch = open.match;
     for (let n = 1; n <= 5; n++) {
       const f = +(await js(`__mb.frames()`));
@@ -104,7 +108,7 @@ try {
       await sleep(350);
       const s = JSON.parse(await js(SNAP));
       caps.push(s.cap); waits.push(w); mss.push(s.ms);
-      allMatch = allMatch && s.match && s.drops === 0;
+      allMatch = allMatch && s.match && s.drops === drops0;
     }
     const growth = caps[caps.length - 1] / Math.max(1, caps[0]);
     const slowest = Math.max(...mss), longest = Math.max(...waits);
@@ -114,7 +118,8 @@ try {
       `growth ${growth.toFixed(2)}x (was 18.7x before the fix)`);
     check(`${id}: frames land fast`, slowest < 1500 && longest > 0 && longest < 3000,
       `slowest frame ${slowest} ms, longest wait ${longest} ms`);
-    check(`${id}: no stale frame`, allMatch, 'painted view == state, drops 0');
+    check(`${id}: no stale frame`, allMatch,
+      `painted view == state, no new drops (baseline ${drops0})`);
 
     /* 大幅度拖动 */
     const f = +(await js(`__mb.frames()`));

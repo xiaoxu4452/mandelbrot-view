@@ -26,7 +26,9 @@
     "smoke": "node tools/_shell-smoke.mjs",
     "bump": "node tools/_bump-cache.mjs",
     "publish": "node tools/_publish.mjs",
-    "test:formula-align": "node formulacore/align-test.mjs"
+    "test:formula-align": "node formulacore/align-test.mjs",
+    "test:formula-ui": "node tools/_formula-ui-check.mjs",
+    "test:formula-deep": "node tools/_formula-deep-check.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.65.0"

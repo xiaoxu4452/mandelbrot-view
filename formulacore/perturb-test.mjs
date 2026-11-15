@@ -79,7 +79,7 @@ const W = 120, H = 90, MAXIT = 1600, BAIL2 = 1e20;
 function direct(re, im, m, exp10) {
   const t0 = performance.now();
   const rc = e.fc_render(prog, ws(re), ws(im), m, exp10, W, H, MAXIT,
-    0, ws('0'), ws('0'), BAIL2, 0, 0, 1, 0);
+    0, ws('0'), ws('0'), BAIL2, 0, 0, 1, 0, 0, H);
   if (rc) throw new Error('direct rc ' + rc);
   return { f: readField(W, H), ms: performance.now() - t0 };
 }

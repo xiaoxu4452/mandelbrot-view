@@ -2,29 +2,30 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=55';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=55';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=55';
-import { setLang, t, getLang } from './i18n.js?v=55';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=55';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=55';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=55';
-import { openCorePanel } from './corepanel.js?v=55';
-import { initGlassSelects } from './glass-select.js?v=55';
-import { composeTile } from './drawlib.js?v=55';
-import { SceneRenderer } from './glscene.js?v=55';
-import { MainGPU } from './wgpu/main.js?v=55';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=55';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=57';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=57';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=57';
+import { setLang, t, getLang } from './i18n.js?v=57';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=57';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=57';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=57';
+import { openCorePanel } from './corepanel.js?v=57';
+import { initGlassSelects } from './glass-select.js?v=57';
+import { composeTile } from './drawlib.js?v=57';
+import { SceneRenderer } from './glscene.js?v=57';
+import { MainGPU } from './wgpu/main.js?v=57';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=57';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=55';
-import { initJuliaView } from './juliaview.js?v=55';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=55';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=57';
+import { initJuliaView } from './juliaview.js?v=57';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=57';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=55';
-import { KINDS } from './formulas.js?v=55';
-import * as webcore from './webcore.js?v=55';
+         REF_MAX_PARAM } from './refpreset.js?v=57';
+import { KINDS } from './formulas.js?v=57';
+import * as webcore from './webcore.js?v=57';
+import * as formulacore from './formulacore.js?v=57';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=55';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=57';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1129,7 +1130,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=55', { type: 'module' });
+    const w = new Worker('js/worker.js?v=57', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -3157,6 +3158,9 @@ function renderLive(plan) {
  * `?engine=old` keeps the previous JS pipleline for an A/B.
  */
 const CORE_ENGINE = !/[?&]engine=old/.test(location.search);
+/* The independent arbitrary-formula C++ core.  ?formula=0 keeps the old
+ * JS kernel for an A/B comparison. */
+const FORMULA_ENGINE = !/[?&]formula=0/.test(location.search);
 let coreOff = !CORE_ENGINE;
 let coreLoaded = false;
 let coreBooting = false;
@@ -3165,6 +3169,10 @@ let coreGen = 0;
  * not silently downgrade the session to the old kernel; three in a row is a
  * real incompatibility. */
 let coreFails = 0;
+let formulaActive = false;
+let formulaLoaded = false;
+let formulaBooting = false;
+let lastFormulaEngine = '';
 
 /* Pixel budget for one core frame.  The core is scalar wasm (no AVX2, no
  * threads), so cost is ~1.4 s per megapixel on a deep view: a 4.2 Mpx buffer is
@@ -3184,21 +3192,44 @@ const CORE_PREVIEW_SCALE = 0.34;
 /** Can the core draw this view at all?  Everything it cannot do stays on the
  * page's own pipeline rather than being silently wrong. */
 let coreWhy = '';
+/* Which views the independent C++ formula core owns.  User-written
+ * expressions (mode 'x') and multibrot powers are exact in that core: their
+ * jet series is finite / the map is holomorphic.  The non-holomorphic built-in
+ * families (tricorn, burning ship, celtic, perpendicular, phoenix) keep the
+ * page kernel for now -- their jet is only first order and needs a wider
+ * reference ladder before deep zoom is trustworthy. */
+function formulaExprFor(spec) {
+  if (!FORMULA_ENGINE || !spec) return '';
+  if (spec.mode === 'x' && String(spec.customExpr || '').trim())
+    return String(spec.customExpr).trim();
+  if (spec.mode === 'm' && spec.kind === 'mandelbrot') {
+    const p = spec.power | 0 || 2;
+    if (p >= 3 && p <= 10) return `z^${p}+c`;
+  }
+  return '';
+}
+
 function coreCanDraw() {
   const no = (why) => { coreWhy = why; return false; };
   if (coreOff) return no('off');
-  if (!coreLoaded) return no('loading');
   if (nativeCanvasMode()) return no('native');
   const spec = state.spec;
-  if (spec.mode === 'j') {
-    if ((spec.power | 0 || 2) !== 2) return no('julia-power');   // z^2 + k only
-  } else if (spec.mode === 'm') {
-    /* The core's z^2+c; multibrot powers, tricorn, burning ship, celtic,
-     * perpendicular and phoenix are the page kernel's own families. */
-    if (spec.kind !== 'mandelbrot') return no('kind:' + spec.kind);
-    if ((spec.power | 0 || 2) !== 2) return no('power:' + spec.power);
+  const fexpr = formulaExprFor(spec);
+  formulaActive = !!(fexpr && !formulacore.isBlacklisted(fexpr));
+  if (formulaActive) {
+    if (!formulaLoaded) return no('formula-loading');
   } else {
-    return no('mode:' + spec.mode);
+    if (!coreLoaded) return no('loading');
+    if (spec.mode === 'j') {
+      if ((spec.power | 0 || 2) !== 2) return no('julia-power');   // z^2 + k only
+    } else if (spec.mode === 'm') {
+      /* The core's z^2+c; tricorn, burning ship, celtic, perpendicular and
+       * phoenix are still the page kernel's own families. */
+      if (spec.kind !== 'mandelbrot') return no('kind:' + spec.kind);
+      if ((spec.power | 0 || 2) !== 2) return no('power:' + spec.power);
+    } else {
+      return no('mode:' + spec.mode);
+    }
   }
   if (state.traps > 0 || state.inverse) return no('traps');
   if (state.scheme === 'distance') return no('distance');
@@ -3229,13 +3260,21 @@ function coreJob(scale, maxiter) {
      * flag's note.  Passing the raw rotation here is what made a rotated card
      * zoom into a different place than it was drawn at. */
     rot: viewAngle(),
+    /* Only formula-core jobs use these.  `formula` is pinned to the JOB so a
+     * pending preview cannot switch engine if the user changes the formula
+     * while it is in flight. */
+    formula: formulaActive,
+    expr: formulaExprFor(state.spec),
+    customParams: state.spec.customParams || {},
   };
 }
 
 /** Render one stage and paint it.  `final` also publishes the frame's stats.
  *  `aa` > 1 means the buffer is supersampled and the compositor box-reduces it. */
 function coreFrame(job, gen, final, aa = 1) {
-  return webcore.coreRender(job).then((msg) => {
+  const engine = job.formula ? formulacore : webcore;
+  return engine.coreRender(job).then((msg) => {
+    if (job.formula) lastFormulaEngine = msg.engine || 'jet';
     if (gen !== coreGen) { noteCoreDrop('gen', job); return false; }  // a newer view owns the canvas
     /* The view can also move without a new pass being dispatched (a gesture in
      * progress); painting this frame then would fight the preview. */
@@ -3320,20 +3359,31 @@ function coreFrame(job, gen, final, aa = 1) {
 
 function corePass() {
   if (coreOff) return false;
-  if (!coreLoaded) {
-    if (!coreBooting) {
-      coreBooting = true;
-      webcore.coreReady()
+  const fexpr = formulaExprFor(state.spec);
+  const wantFormula = !!(fexpr && !formulacore.isBlacklisted(fexpr));
+  const loaded = wantFormula ? formulaLoaded : coreLoaded;
+  const isBooting = wantFormula ? formulaBooting : coreBooting;
+  if (!loaded) {
+    if (!isBooting) {
+      if (wantFormula) formulaBooting = true; else coreBooting = true;
+      const engine = wantFormula ? formulacore : webcore;
+      engine.coreReady()
         .then(() => {
-          coreLoaded = true;
-          coreBooting = false;
-          /* A view the core cannot draw (a formula, a multibrot power) is the
-           * page's own pipeline's job — but only for *this* view.  Turning the
-           * core off for the session here would silently downgrade every later
-           * Mandelbrot view after a formula-first start. */
+          if (wantFormula) { formulaLoaded = true; formulaBooting = false; }
+          else { coreLoaded = true; coreBooting = false; }
+          /* A view the core cannot draw is the page's own pipeline's job --
+           * but only for *this* view.  Turning the core off for the session
+           * here would silently downgrade every later Mandelbrot view. */
           renderNow();
         })
-        .catch(() => { coreBooting = false; coreOff = true; renderNow(); });
+        .catch(() => {
+          if (wantFormula) {
+            /* An unloadable formula must not disable the Mandelbrot core. */
+            formulaBooting = false;
+            formulacore.blacklistExpr(fexpr);
+          } else { coreBooting = false; coreOff = true; }
+          renderNow();
+        });
     }
     return true;            // the frame lands as soon as the core is up
   }
@@ -3343,7 +3393,11 @@ function corePass() {
   if (pending > 0 || liveBusy || mainQueue.length) cancelAll();
   const gen = ++coreGen;
   const W = canvas.width, H = canvas.height;
-  let scaleFinal = Math.min(1, Math.sqrt(CORE_MAX_PIXELS / Math.max(1, W * H)));
+  /* The formula core's band pool is newer than the Mandelbrot core's; give it
+   * a smaller backing store so a first custom-formula frame lands promptly.
+   * The compositor upscales it exactly as it does a preview. */
+  const pixelBudget = formulaActive ? 0.5e6 : CORE_MAX_PIXELS;
+  let scaleFinal = Math.min(1, Math.sqrt(pixelBudget / Math.max(1, W * H)));
   const it = frameIterCap;
   /* Antialiasing is supersampling: render k samples per pixel and box-reduce,
    * which is exactly what the tile compositor already does for the page's own
@@ -3355,8 +3409,13 @@ function corePass() {
          W * scaleFinal * (aa + 1) * (H * scaleFinal * (aa + 1)) <= CORE_MAX_PIXELS) aa++;
   const runFinal = () => {
     if (gen !== coreGen) return;
-    coreFrame(coreJob(scaleFinal * aa, it), gen, true, aa)
-      .catch(() => { coreFails++; if (coreFails >= 3) coreOff = true; renderNow(); });
+    const finalJob = coreJob(scaleFinal * aa, it);
+    coreFrame(finalJob, gen, true, aa)
+      .catch(() => {
+        if (finalJob.formula) formulacore.blacklistExpr(finalJob.expr);
+        else { coreFails++; if (coreFails >= 3) coreOff = true; }
+        renderNow();
+      });
   };
   /* A preview only pays for itself when the full frame is much larger than
    * one pass can answer quickly.  At 0.5 x budget a normal 0.95 Mpx window
@@ -7632,11 +7691,14 @@ function boot() {
   window.__mbgpu = mainGPU;
   window.__mb = { state, screenToPlane, screenToPlaneHi, planeToScreen, julia: juliaView,
                   paint: () => lastPaint, drops: () => ({ n: coreDrops, why: coreDropWhy }),
+                  formula: () => ({ active: formulaActive, loaded: formulaLoaded,
+                                    engine: lastFormulaEngine,
+                                    expr: formulaExprFor(state.spec) }),
                   render: renderNow, apply: applyRefPresetPatch,
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=55')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=57')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

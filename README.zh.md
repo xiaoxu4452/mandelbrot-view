@@ -91,14 +91,14 @@ Misiurewicz 点 c=i（任意深度都有结构）验证两个硬要求：
 1e300 / 1e10 耗时比 **0.98×**：精度成本只随那一条轨道增长，与像素数无关；
 浅景下扰动帧与逐点帧逐像素相同。
 
-第二阶段第二部分接上了**通用表达式机制**。`env.mjs` 直接复用页面已有库，不重复造轮子：
+第二阶段第二部分接上了**通用表达式机制**。`env.js` 直接复用页面已有库，不重复造轮子：
 `customenv.js` 用 `hpeval.js` 为任意表达式建**一条**任意精度 BigInt 参考轨道，
 `jet.js` 沿该轨道做 1..10 阶自动微分（全纯映射）或中心差分线性导数（非全纯
 `abs`/`conj`）；系数被重排成 C++ `fc_render_jet()` 的 `coefA`/`coefB`。新 ABI
 支持运行时 jet 阶数、`y0/y1` 横带、以及 singleref glitch **rebase**（抵消时
 重锚到与像素最接近的轨道点）。
 
-`env.mjs` 给出宿主必须遵守的 `usable` 契约，为 false 时**不得采用扰动帧**：
+`env.js` 给出宿主必须遵守的 `usable` 契约，为 false 时**不得采用扰动帧**：
 
 | 条件 | 扰动为何无效 | 宿主动作 |
 | --- | --- | --- |
@@ -120,9 +120,21 @@ Misiurewicz 点 c=i（任意深度都有结构）验证两个硬要求：
 **常数偏移为 0**、1e10..1e100 平均残差 0.002–0.006 迭代；10800 像素中仅 1 个
 边界像素的内外分类不同。
 
-要替换 JS 兜底还差：把 `fc_render_jet()` 接进 `coreCanDraw()`，以及根治
-`deep.cpp` 里 Julia 的 interior 兜底（需重编 `core.wasm`，必须单独与桌面 PNG
-逐像素验收）。
+**已接入页面。** `js/formulacore-worker.js` + `js/formulacore.js` 起 N 个 wasm
+实例各渲一条横带，`corePass()` / `coreFrame()` 把自定义公式（`spec.mode==='x'`）
+与 multibrot 高次幂交给它们。`env.js` 除 `usable` 外还给出 `useJet`：浅景用 C++
+wasm 逐点渲染（仍不是 JS 内核），深景走 jet 扰动。C++ 解析器编译不了的表达式会
+被本会话拉黑并回退页面内核，**不会连带关闭曼德勃罗核心**。`?formula=0` 可切回
+旧 JS 内核做 A/B。
+
+`node tools/_formula-ui-check.mjs` 与 `tools/_formula-deep-check.mjs` 在真实浏览器里
+验收：默认 M 集仍由 `core.wasm` 渲染；自定义 / 嵌套三角 / multibrot(3) 由 C++ wasm
+渲染；1e30 深视点 jet 引擎 **2.48 s** 落帧、29 档结构，而旧 JS 内核 5.78 s 且
+67% 画面仍是暗区。
+
+仍待完成：`deep.cpp` 里 Julia 的 interior 兜底根治（要重编 `core.wasm`，须单独与
+桌面 PNG 逐像素验收）；以及把公式核心扩展到非全纯内建族（tricorn、burning ship、
+celtic、perpendicular、phoenix，需要更宽的参考梯）。
 
 ### 诊断开关
 

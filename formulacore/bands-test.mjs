@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { buildFormulaEnvironment } from './env.mjs';
+import { buildFormulaEnvironment } from './env.js';
 import { renderBands } from './bands.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));

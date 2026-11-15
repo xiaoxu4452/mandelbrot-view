@@ -73,6 +73,8 @@ node tools/_families-check.mjs   # non-Mandelbrot families: zoom round-trip
 node tools/_preset-zoom-check.mjs # preset zoom: iteration budget must stay bounded
 node formulacore/general-test.mjs  # arbitrary-expression jet perturbation
 node formulacore/bands-test.mjs    # parallel bands vs one frame
+node tools/_formula-ui-check.mjs   # page wiring in a real browser
+node tools/_formula-deep-check.mjs # 1e30 jet frame vs JS kernel
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 
@@ -114,7 +116,7 @@ Cost ratio 1e300 / 1e10 = **0.98x**: precision cost grows only with the single
 orbit, never with the pixel count.  At shallow zoom the perturbed frame is
 pixel-identical to the direct one.
 
-Stage 2, part 2 connects the **general expression machinery**.  `env.mjs`
+Stage 2, part 2 connects the **general expression machinery**.  `env.js`
 reuses the page's own libraries instead of reimplementing them: `customenv.js`
 builds ONE arbitrary-precision BigInt reference orbit for any expression with
 `hpeval.js`, and `jet.js` produces 1..10th-order automatic-differentiation
@@ -124,7 +126,7 @@ C++ `coefA`/`coefB` arrays consumed by the new `fc_render_jet()` ABI, which
 also takes a runtime jet order, a `y0/y1` band and a singleref glitch
 **rebase** (re-anchor onto the orbit point closest to a cancelling pixel).
 
-`env.mjs` publishes a **host contract**, `usable`, and the host must not paint
+`env.js` publishes a **host contract**, `usable`, and the host must not paint
 a perturbed frame when it is false:
 
 | condition | why perturbation is invalid | what the host does |
@@ -151,10 +153,25 @@ smoothing convention, the jet field matches `core.wasm` with **zero constant
 offset** and a mean residual of 0.002-0.006 iterations at 1e10..1e100; one
 boundary pixel out of 10800 differs in interior/exterior classification.
 
-Still outstanding before this can replace the JS fallback: wiring
-`fc_render_jet()` into `coreCanDraw()`, and the `deep.cpp` Julia
-interior-default root fix (which recompiles `core.wasm` and must be verified
-against the desktop PNGs on its own).
+**Wired into the page.** `js/formulacore-worker.js` + `js/formulacore.js` run
+N wasm instances (one band each), and `corePass()` / `coreFrame()` route user
+expressions (`spec.mode === 'x'`) and multibrot powers to them.  `env.js`
+publishes `useJet` as well as `usable`: shallow views render directly in C++
+wasm (still not the JS kernel), deep views use jet perturbation.  A formula the
+C++ parser cannot compile is blacklisted for that session and falls back to the
+page kernel without ever disabling the Mandelbrot core.  `?formula=0` keeps the
+old JS kernel for an A/B.
+
+`node tools/_formula-ui-check.mjs` and `tools/_formula-deep-check.mjs` verify
+the wiring in a real browser: the default Mandelbrot view stays on `core.wasm`,
+custom / nested-trig / multibrot(3) expressions render in C++ wasm, and at
+1e30 the jet engine lands a 29-level structured frame in **2.48 s** while the
+old JS kernel takes 5.78 s and leaves 67% of the frame dark.
+
+Still outstanding: the `deep.cpp` Julia interior-default root fix (recompiles
+`core.wasm`, so it needs its own run against the desktop PNGs), and extending
+the formula core to the non-holomorphic built-in families (tricorn, burning
+ship, celtic, perpendicular, phoenix), which need a wider reference ladder.
 
 ### Diagnostics
 

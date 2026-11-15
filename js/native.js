@@ -9,7 +9,7 @@
  * The browser build keeps using the worker/WASM path: this module is inert
  * unless `window.chrome.webview` exists.
  * ----------------------------------------------------------------*/
-import { paletteLUT, paletteStops, paletteColors } from './palettes.js?v=55';
+import { paletteLUT, paletteStops, paletteColors } from './palettes.js?v=57';
 
 const bridge = (typeof window !== 'undefined' && window.chrome && window.chrome.webview) || null;
 

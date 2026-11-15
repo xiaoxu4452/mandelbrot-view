@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFormulaEnvironment } from './env.mjs';
+import { buildFormulaEnvironment } from './env.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CORE = path.join(ROOT, '..', 'webcore', 'core.wasm');

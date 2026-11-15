@@ -71,7 +71,7 @@ const render = (prog, o = {}) => {
     o.zoomMant ?? 1, o.zoomExp10 ?? 0,
     w, h, o.maxiter ?? 200,
     o.mode ?? 0, ws(o.jr ?? '0'), ws(o.ji ?? '0'),
-    o.bail2 ?? 1e20, 0, 0, 1, 0);
+    o.bail2 ?? 1e20, 0, 0, 1, 0, 0, h);
   if (rc) throw new Error('render ' + rc + ': ' + readStr(e.fc_error()));
   return { w, h, f: new Float32Array(e.memory.buffer, e.fc_out_ptr(), w * h).slice() };
 };

@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { buildFormulaEnvironment } from './env.mjs';
+import { buildFormulaEnvironment } from './env.js';
 import { compile as compilePage } from '../js/mathlib.js?v=55';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -77,7 +77,7 @@ function direct(expr, { cre, cim, zoomMant, zoomExp10, maxiter }) {
   const p = progOf(expr);
   const t0 = performance.now();
   const rc = e.fc_render(p, ws(cre), ws(cim), zoomMant, zoomExp10,
-    W, H, maxiter, 0, ws('0'), ws('0'), BAIL2, 0, 0, 1, 0);
+    W, H, maxiter, 0, ws('0'), ws('0'), BAIL2, 0, 0, 1, 0, 0, H);
   if (rc) throw new Error('direct rc ' + rc);
   return { f: readField(W, H), ms: performance.now() - t0 };
 }

@@ -476,7 +476,8 @@ int32_t fc_render(int32_t prog,
                   int32_t w, int32_t h, int32_t maxiter,
                   int32_t mode, const char* jrS, const char* jiS,
                   double bail2, int32_t nparam, const double* params,
-                  double rotCos, double rotSin) {
+                  double rotCos, double rotSin,
+                  int32_t y0, int32_t y1) {
     g_error.clear();
     if (prog < 0 || static_cast<size_t>(prog) >= g_programs.size()) {
         g_error = "bad program id"; return 1;
@@ -484,6 +485,7 @@ int32_t fc_render(int32_t prog,
     if (w < 1 || h < 1 || w > 8192 || h > 8192 || maxiter < 1 || maxiter > 2000000) {
         g_error = "bad frame dimensions"; return 2;
     }
+    if (y0 < 0 || y1 > h || y1 <= y0) { g_error = "bad band"; return 4; }
     const double zoom = zoomMant * std::pow(10.0, static_cast<double>(zoomExp10));
     if (!(zoom > 0) || !std::isfinite(zoom)) {
         g_error = "depth exceeds stage-1 (double) engine"; return 3;
@@ -495,9 +497,13 @@ int32_t fc_render(int32_t prog,
                 jiS ? std::strtod(jiS, nullptr) : 0.0};
     const double logBail = 0.5 * std::log(std::max(bail2, 1.0000001));
     const Program& P = g_programs[static_cast<size_t>(prog)];
-    g_field.assign(static_cast<size_t>(w) * h, -1.0f);
+    /* A band owns only its rows: N workers render disjoint strips into their
+     * own instances, and clearing the whole field here would erase the other
+     * bands' work in a shared instance. */
+    const size_t total = static_cast<size_t>(w) * h;
+    if (g_field.size() != total) g_field.assign(total, -1.0f);
 
-    for (int y = 0; y < h; ++y) {
+    for (int y = y0; y < y1; ++y) {
         const double py = (static_cast<double>(y) + 0.5 - 0.5 * h) * ps;
         for (int x = 0; x < w; ++x) {
             const double px = (static_cast<double>(x) + 0.5 - 0.5 * w) * ps;
