@@ -17,6 +17,7 @@
     "test:core": "node webcore/test.mjs",
     "test:view": "node webcore/test-view.mjs",
     "test:families": "node tools/_families-check.mjs",
+    "test:preset-zoom": "node tools/_preset-zoom-check.mjs",
     "smoke": "node tools/_shell-smoke.mjs",
     "bump": "node tools/_bump-cache.mjs",
     "publish": "node tools/_publish.mjs"

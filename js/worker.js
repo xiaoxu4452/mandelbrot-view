@@ -5,14 +5,14 @@
  *   · High-precision reference orbits (BigInt) are computed and cached on this thread
  * ----------------------------------------------------------------*/
 
-import { KERNEL_B64 } from './kernel-wasm.js?v=53';
-import { paletteLUT, registerCustomPalette } from './palettes.js?v=53';
-import { resolveBitsFromLog2, requiredBitsFromLog2, contextFor } from './bigfixed.js?v=53';
-import { renderTile, _internals } from './render.js?v=53';
-import { compile as compileMath } from './mathlib.js?v=53';
-import { buildSeries, chooseSkip } from './environment.js?v=53';
-import { buildCustomEnvironment } from './customenv.js?v=53';
-import { buildReferenceOrbit } from './formulas.js?v=53';
+import { KERNEL_B64 } from './kernel-wasm.js?v=54';
+import { paletteLUT, registerCustomPalette } from './palettes.js?v=54';
+import { resolveBitsFromLog2, requiredBitsFromLog2, contextFor } from './bigfixed.js?v=54';
+import { renderTile, _internals } from './render.js?v=54';
+import { compile as compileMath } from './mathlib.js?v=54';
+import { buildSeries, chooseSkip } from './environment.js?v=54';
+import { buildCustomEnvironment } from './customenv.js?v=54';
+import { buildReferenceOrbit } from './formulas.js?v=54';
 
 /* ---------- WASM memory layout ---------- */
 /* The module is built by zig as `wasm32-freestanding`, so its shadow stack is

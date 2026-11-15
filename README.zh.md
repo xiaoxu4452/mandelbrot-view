@@ -54,6 +54,8 @@ page (js/app.js)            js/webcore-worker.js        core.wasm (C++ → wasm3
 node webcore/build.mjs        # 核心源码 → core.wasm（需要 zig）
 node webcore/test.mjs         # 与桌面 PNG 逐像素比对
 node webcore/test-view.mjs    # 核心 viewport 的缩放/平移/捏合往返
+node tools/_families-check.mjs    # 非曼德勃罗族：缩放往返
+node tools/_preset-zoom-check.mjs # 预设放大：迭代预算不得失控
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 

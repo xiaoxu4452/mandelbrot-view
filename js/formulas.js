@@ -2,7 +2,7 @@
  * formulas.js — fractal family definitions, high-precision reference orbits, complex-plane helpers
  * ----------------------------------------------------------------*/
 
-import { contextFor } from './bigfixed.js?v=53';
+import { contextFor } from './bigfixed.js?v=54';
 
 /* "Polynomial core" of the escape-time families (z -> F(z) + c) */
 export const KINDS = {

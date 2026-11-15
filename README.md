@@ -69,6 +69,8 @@ page (js/app.js)            js/webcore-worker.js        core.wasm (C++ → wasm3
 node webcore/build.mjs        # core sources → core.wasm (needs zig)
 node webcore/test.mjs         # frames vs the desktop's own PNGs, pixel-exact
 node webcore/test-view.mjs    # zoom/pan/pinch round-trip in the core's viewport
+node tools/_families-check.mjs   # non-Mandelbrot families: zoom round-trip
+node tools/_preset-zoom-check.mjs # preset zoom: iteration budget must stay bounded
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 

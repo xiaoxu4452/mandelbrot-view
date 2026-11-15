@@ -2,29 +2,29 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=53';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=53';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=53';
-import { setLang, t, getLang } from './i18n.js?v=53';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=53';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=53';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=53';
-import { openCorePanel } from './corepanel.js?v=53';
-import { initGlassSelects } from './glass-select.js?v=53';
-import { composeTile } from './drawlib.js?v=53';
-import { SceneRenderer } from './glscene.js?v=53';
-import { MainGPU } from './wgpu/main.js?v=53';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=53';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=54';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=54';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=54';
+import { setLang, t, getLang } from './i18n.js?v=54';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=54';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=54';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=54';
+import { openCorePanel } from './corepanel.js?v=54';
+import { initGlassSelects } from './glass-select.js?v=54';
+import { composeTile } from './drawlib.js?v=54';
+import { SceneRenderer } from './glscene.js?v=54';
+import { MainGPU } from './wgpu/main.js?v=54';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=54';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=53';
-import { initJuliaView } from './juliaview.js?v=53';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=53';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=54';
+import { initJuliaView } from './juliaview.js?v=54';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=54';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=53';
-import { KINDS } from './formulas.js?v=53';
-import * as webcore from './webcore.js?v=53';
+         REF_MAX_PARAM } from './refpreset.js?v=54';
+import { KINDS } from './formulas.js?v=54';
+import * as webcore from './webcore.js?v=54';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=53';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=54';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1005,6 +1005,10 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
   if (key !== observedIter.key) {
     observedIter.key = key;
     observedIter.cap = 0;
+    /* The maximum escape belongs to a view, not to the session.  Carrying a
+     * 11000-iteration observation from a boundary view into the next preset
+     * made that preset start at a four-figure budget for no reason. */
+    observedIter.observedMax = 0;
     observedIter.refine = 0;
     observedIter.repainted = false;
   }
@@ -1028,9 +1032,17 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
   }
   if (!(hi > 0)) return;
   observedIter.observedMax = Math.max(observedIter.observedMax, hi | 0);
-  /* Keep the measurement across views: the next frame at this depth starts
-   * from what pixels actually did instead of the depth formula's guess. */
-  rememberObservedDepth(depthNow(), hi | 0);
+  /* A maximum escape AT the ceiling is not an observation: the iteration was
+   * cut off there, so the real escape time is unknown.  Near the Mandelbrot
+   * boundary those times are unbounded -- for ANY budget some pixel reaches
+   * it -- and storing it makes autoIterNow() raise the next budget by 30%,
+   * which produces another pixel at the new ceiling, forever.  Measured on a
+   * whole-set preset (highprecision-rainbow): 783 -> 4000 -> 5152 -> 6683 ->
+   * 8653 -> 11244 -> 14607 iterations, 0.32 s -> 7.4 s per frame, with the
+   * picture unchanged.  Only a frame that finished with headroom tells us
+   * what this depth actually needs. */
+  const truncated = cap > 0 && hi >= cap - 1;
+  if (!truncated) rememberObservedDepth(depthNow(), hi | 0);
   /* "Exhausted" means pixels stopped AT the ceiling.  A backend that reports a
    * max escape well above the ceiling is reporting a different quantity (the
    * reconstructed core counts interior steps too), not exhaustion; trusting it
@@ -1045,6 +1057,13 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
    * The `hi <= cap * 1.05` bound is what actually rejects a bogus high value,
    * and it does that on its own. */
   const atLimit = cap > 0 && hi >= cap - 1 && hi <= cap * 1.05;
+  /* A shallow frame (no reference orbit) with real interior pixels always has
+   * a boundary pixel sitting exactly at the ceiling.  Raising the budget here
+   * never reveals structure -- it repaints the same picture more slowly, and
+   * every new view gets to do it once more because `repainted` is per-view.
+   * A genuinely clipped frame either has no interior at all, or is a deep
+   * perturbation frame (refLen > 0), whose own orbit is the evidence. */
+  const shallowClip = (refLen | 0) === 0 && bounded > 0;
   /* ONE raise per view, exactly like the starved path above.
    *
    * `atLimit` cannot tell "clipped" from "a boundary pixel that genuinely ran
@@ -1053,7 +1072,8 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
    * fires again -- 500 -> 4000 -> 5164 -> 6622 -> 8597, ~30% a round.  The
    * picture never changed; only the wait did (a preset frame went 0.25 s ->
    * 2.6 s across four repaints of the same view). */
-  if (!atLimit || observedIter.repainted || observedIter.refine >= ITER.maxRefine) return;
+  if (!atLimit || shallowClip || observedIter.repainted ||
+      observedIter.refine >= ITER.maxRefine) return;
   const obs = observedIter.observedMax;
   const budget = Math.max(vertexIterBudget(obs, obs),
                           checkCanvasIterBudget(obs));
@@ -1109,7 +1129,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=53', { type: 'module' });
+    const w = new Worker('js/worker.js?v=54', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -2129,8 +2149,14 @@ function autoIterNow() {
    * is headroom for a neighbouring view being slightly harder; 0.35x of the
    * formula is the floor so a stale observation cannot starve a new view. */
   const seen = observedForDepth(d);
-  if (seen > 0) it = Math.max(seen * 1.3, it * 0.35);
-  else it *= FIRST_GUESS_SCALE;
+  if (seen > 0) {
+    /* The depth formula is itself a conservative upper bound.  A learned
+     * value can come from a different kind of view sharing a depth bucket, so
+     * it must not multiply this frame's cost without limit: two stale
+     * observations used to take a whole-set view from 587 to 14607
+     * iterations and 7 s per frame. */
+    it = clamp(Math.max(seen * 1.3, it * 0.35), it * 0.35, it * 2);
+  } else it *= FIRST_GUESS_SCALE;
   // Custom formulas take the JS path (high-precision environment + series perturbation); iterations cost far more, so tighten the cap
   if (state.spec.mode === 'x') it = Math.min(it, 6000);
   /* The rank scales the automatic budget: 100 is the full count, 1 is one per
@@ -3311,7 +3337,13 @@ function corePass() {
     coreFrame(coreJob(scaleFinal * aa, it), gen, true, aa)
       .catch(() => { coreFails++; if (coreFails >= 3) coreOff = true; renderNow(); });
   };
-  const wantPreview = W * H * scaleFinal * scaleFinal > CORE_MAX_PIXELS * 0.5;
+  /* A preview only pays for itself when the full frame is much larger than
+   * one pass can answer quickly.  At 0.5 x budget a normal 0.95 Mpx window
+   * ran a 0.34x preview AND the full frame with the SAME iteration budget --
+   * an extra pass and an extra composite for a frame that already lands in a
+   * third of a second.  Keep the preview for the oversized backing stores
+   * that actually had to be downscaled. */
+  const wantPreview = W * H * scaleFinal * scaleFinal > CORE_MAX_PIXELS * 0.9;
   if (wantPreview) {
     const pv = coreJob(scaleFinal * CORE_PREVIEW_SCALE, it);
     coreFrame(pv, gen, false).then(runFinal, runFinal);
@@ -3820,7 +3852,11 @@ canvas.addEventListener('pointerup', (e) => {
    * transform, and clearing it here would visibly snap the picture back for
    * the duration of the render. */
   liveReset();
-  renderNow();
+  /* Debounce the committed frame the same way a wheel notch or a commitPan
+   * does.  A run of drags (or a drag that immediately follows a wheel) used to
+   * dispatch one full pass per pointerup, each landing on a view the next
+   * gesture had already superseded -- the "large pan takes forever" report. */
+  scheduleZoomRender();
 });
 
 canvas.addEventListener('pointercancel', (e) => {
@@ -3837,7 +3873,9 @@ function finishPinch(m) {
   if (!p0 || !m) { pinch = null; return; }
   applyPinch(m);
   pinch = null;
-  renderNow();
+  /* One pass after the fingers stop moving, not one per pinch that ends a
+   * fraction of a second before the next gesture. */
+  scheduleZoomRender();
   if (state.autoIter) syncIterUi();
   updateHud();
 }
@@ -7576,7 +7614,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=53')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=54')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a
