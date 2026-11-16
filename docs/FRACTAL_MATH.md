@@ -578,3 +578,242 @@ Reading the HUD:
 | limb | fixed-width chunk of a big integer; here $10^9$ per limb |
 | pixel scale | plane distance per pixel, $p$ |
 | truncation | frame whose largest escape equals the iteration budget |
+
+---
+
+## Appendix A: Worked examples, step by step
+
+The main text states the rules. This appendix applies them to small numbers you
+can check with a pocket calculator. Every example is chosen so that the whole
+computation fits on one page.
+
+### Example A1 — Squaring a complex number by hand
+
+**Question.** Compute $(1+2i)^2$.
+
+**Step 1** — identify $x=1$, $y=2$.
+
+**Step 2** — apply $A=x^2-y^2$:
+
+$$A = 1^2-2^2 = 1-4 = -3$$
+
+**Step 3** — apply $B=2xy$:
+
+$$B = 2\cdot1\cdot2 = 4$$
+
+**Answer.** $(1+2i)^2 = -3+4i$.
+
+**Check by FOIL** (first, outer, inner, last):
+
+$$(1+2i)(1+2i)=1+2i+2i+4i^2=1+4i-4=-3+4i\quad\checkmark$$
+
+This is literally the first line of the pixel kernel: `A = x*x - y*y`,
+`B = 2*x*y`.
+
+---
+
+### Example A2 — An orbit that never escapes: $c=-1$
+
+Take $z_0=0$ and iterate $z_{n+1}=z_n^2-1$.
+
+| $n$ | calculation | $z_n$ | $\lvert z_n\rvert$ |
+| --- | --- | --- | --- |
+| 0 | given | $0$ | 0 |
+| 1 | $0^2-1$ | $-1$ | 1 |
+| 2 | $(-1)^2-1$ | $0$ | 0 |
+| 3 | $0^2-1$ | $-1$ | 1 |
+
+The orbit alternates $0,-1,0,-1,\dots$ forever. The modulus never exceeds 2, so
+this pixel is **interior**. The period is $p=2$; the program would detect it by
+comparing $z_2$ with $z_0$ and stop early.
+
+---
+
+### Example A3 — An orbit that escapes, and its smooth value: $c=1$
+
+| $n$ | calculation | $z_n$ | $\lvert z_n\rvert^2$ |
+| --- | --- | --- | --- |
+| 0 | given | $0$ | 0 |
+| 1 | $0^2+1$ | $1$ | 1 |
+| 2 | $1^2+1$ | $2$ | 4 |
+| 3 | $2^2+1$ | $5$ | 25 |
+
+The test is strict ($|z|>2$, i.e. $|z|^2>4$). At $n=2$ we have exactly 4, so the
+orbit does **not** escape yet. At $n=3$, $25>4$: the integer escape time is
+$n=3$.
+
+Smooth value with $R=2$:
+
+$$\nu = 3+1-\log_2\!\frac{\ln 5}{\ln 2}
+     = 4-\log_2(2.3219)
+     = 4-1.2153 = 2.7847$$
+
+A pixel that escaped at exactly step 3 with $|z_3|$ barely above 2 would get
+$\nu\approx3.0$; this one overshot far, so $\nu<3$ and its colour sits earlier
+in the ramp. That continuous offset is what removes the rings.
+
+---
+
+### Example A4 — How many digits does a 1e26 view need?
+
+**Given.** Viewing window $W=1920$ px, magnification $10^{26}$.
+
+**Step 1** — pixel scale:
+
+$$p=\frac{3}{1920\cdot10^{26}}=1.5625\times10^{-29}$$
+
+**Step 2** — a double carries about 16 decimal digits. At a centre of order 1
+its absolute rounding error is about $10^{-16}$. Compare with the pixel:
+
+$$\frac{10^{-16}}{1.56\times10^{-29}}\approx6.4\times10^{12}$$
+
+so a double cannot tell neighbouring pixels apart — by **twelve orders of
+magnitude**. This is why the picture is flat, not because the iteration is
+wrong.
+
+**Step 3** — required digits (with 6 guard digits):
+
+$$d+\log_{10}W+6 = 26+3.283+6 \approx 35.3 \Rightarrow 36\text{ digits}$$
+
+**Step 4** — the program uses $26+50=76$ digits $\approx252$ bit, which is why
+the HUD reads `256 bit`. The margin covers error growth along the orbit.
+
+---
+
+### Example A5 — One perturbation step, numerically
+
+Take the reference parameter $C=0.25$, reference orbit $Z_0=0$, $Z_1=0.25$,
+$Z_2=0.3125$. A pixel has $c=C+\delta c$ with $\delta c=10^{-10}$.
+
+**Reference:** $Z_{n+1}=Z_n^2+C$.
+
+**Pixel (direct):** $z_0=0$, $z_1=0.2500000001$, and
+
+$$z_2=z_1^2+c=(0.2500000001)^2+0.2500000001=0.31250000015$$
+
+**Perturbation:** $\delta_0=0$, $\delta_1=\delta c=10^{-10}$, then
+
+$$\delta_2=2Z_1\delta_1+\delta_1^2+\delta c
+=2(0.25)(10^{-10})+10^{-20}+10^{-10}=1.5\times10^{-10}+10^{-20}$$
+
+**Compare:** $z_2-Z_2=0.31250000015-0.3125=1.5\times10^{-10}$ (the $10^{-20}$
+term is below the printed digits). Both agree.
+
+**What was saved?** The pixel never multiplied a 76-digit number; it multiplied
+a double $Z_1$ by a double $\delta_1$. That is the whole reason 1e120 is
+affordable.
+
+---
+
+### Example A6 — The tricorn delta is exact, not an approximation
+
+Let $Z=0.5+0.2i$ and $\delta=0.01-0.01i$. The tricorn map is $F(z)=\bar z^{\,2}$.
+
+**Step 1** — conjugates:
+
+$$\bar Z=0.5-0.2i,\qquad \bar\delta=0.01+0.01i$$
+
+**Step 2** — linear term $2\bar Z\bar\delta$:
+
+$$(0.5-0.2i)(0.01+0.01i)=0.005+0.005i-0.002i+0.002=0.007+0.003i$$
+
+times 2 gives $0.014+0.006i$.
+
+**Step 3** — quadratic term:
+
+$$\bar\delta^{\,2}=(0.01+0.01i)^2=0.0001+0.0002i-0.0001=0.0002i$$
+
+**Step 4** — sum:
+
+$$F(Z+\delta)-F(Z)=0.014+0.0062i$$
+
+There is no remainder term: the map is a polynomial in $(z,\bar z)$, so the two
+terms are *all* the terms. A Taylor truncation would be an approximation here;
+the core's formula is exact.
+
+---
+
+### Example A7 — A jet for $\sin(z)c+z^2$ at a numeric point
+
+Take $Z=0.5$, $c=1$, $u=10^{-6}$, $\Delta c=2\times10^{-6}$, $p=1$.
+
+**Step 1** — evaluate the derivatives from the table in chapter 8:
+
+$$F_z=c\cos Z+2Z=0.877583+1=1.877583$$
+$$F_c=\sin Z=0.479426$$
+$$F_{zz}=-c\sin Z+2=1.520574,\qquad F_{zc}=\cos Z=0.877583$$
+
+**Step 2** — first-order contributions:
+
+$$F_zu=1.877583\times10^{-6},\qquad F_c\Delta c=0.958851\times10^{-6}$$
+
+**Step 3** — second-order contributions:
+
+$$F_{zz}u^2=1.52\times10^{-12},\qquad F_{zc}u\Delta c=1.755\times10^{-12}$$
+
+**Step 4** — add:
+
+$$u'\approx2.836434\times10^{-6}$$
+
+(The second-order terms are a millionth of the first here, but at 1e30 zoom
+the pixel scale is small enough that they dominate; dropping $F_{zc}$ was a
+real bug.)
+
+---
+
+### Example A8 — Newton finds a Misiurewicz point: $m=2,p=2$
+
+Claim: $c=i$ is a root of $F(c)=z_4(c)-z_2(c)$.
+
+**Step 1** — iterate exactly:
+
+$$z_0=0,\quad z_1=i,\quad z_2=i^2+i=-1+i$$
+$$z_3=(-1+i)^2+i=(1-2i-1)+i=-i,\quad z_4=(-i)^2+i=-1+i$$
+
+**Step 2** — residue:
+
+$$F(i)=z_4-z_2=(-1+i)-(-1+i)=0$$
+
+exactly. No Newton step is needed. Because the orbit repeats from $z_2$ with
+period 2, the reference can be tiled after the first 64 steps — that is the
+0.65 s result at $10^{60000}$.
+
+**Step 3** — why 220 digits matter: zooming to $10^{120}$ around this point
+requires about 124 correct digits of $c$. The solver prints 220, so even the
+last pixel at that depth has a well-defined coordinate.
+
+---
+
+### Example A9 — Reading a truncated frame from the HUD
+
+Two frames of the same view reported:
+
+```text
+CORE · julia · 256 bit · ref 801 · esc 780-800
+CORE · julia · 256 bit · ref 961 · esc 783-1146
+```
+
+**Step 1** — compare the escape upper end with the budget. The first frame's
+upper end (800) equals its budget (also 800): pixels were cut off. The second
+ends at 1146 with a budget around 1200: there is headroom.
+
+**Step 2** — check the precision. Both report 256 bit, so the coordinate was
+never the problem.
+
+**Step 3** — conclusion: the first picture is *the same engine with a smaller
+iteration ceiling*. The fix raises the ceiling and repaints before showing the
+truncated image, which is why you now see one correct frame instead of a black
+one followed by a correct one.
+
+---
+
+### Example A10 — Why a nucleus is a bad zoom target
+
+Let $c=0$, the centre of the period-1 hyperbolic component. Then $z_0=0$ and
+$z_{n+1}=0^2+0=0$ for every $n$: every pixel near it is bounded, so the whole
+frame is interior black. This is mathematically correct, not a rendering bug.
+
+To see structure at $10^{120}$, move the centre to the **boundary** of that
+component (a Misiurewicz point such as $c=i$) or to the boundary of a
+mini-Mandelbrot near a nucleus. `mset nucleus` and `mset family-point` exist to
+generate exactly those boundary coordinates at arbitrary precision.

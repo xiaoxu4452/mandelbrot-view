@@ -13,7 +13,7 @@
 <meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="css/app.css?v=65" />
+<link rel="stylesheet" href="css/app.css?v=66" />
 </head>
 <body class="booting">
 <canvas id="fractal"></canvas>
@@ -80,6 +80,7 @@
     </div>
     <button class="topbtn" id="btn-presets" title="预设库 / Preset library (P)"><span data-i18n="presets">预设</span><span class="badge" id="preset-badge" hidden></span></button>
     <button class="topbtn" id="btn-formula-top" title="公式编辑器 / Formula editor (F)"><span data-i18n="formula">公式</span></button>
+    <button class="topbtn" id="btn-theory-top" title="数学原理 / Mathematics theory"><span data-i18n="theory">原理</span></button>
   </nav>
 
   <div class="top-spacer"></div>
@@ -390,7 +391,7 @@
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=65"></script>
+<script type="module" src="js/app.js?v=66"></script>
 
 <!-- ==================================================================
      Bootstrap guard (classic script — runs even when ES modules fail).

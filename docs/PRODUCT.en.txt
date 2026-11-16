@@ -1,0 +1,167 @@
+Mandelbrot View 0.12  ·  Deep Zoom Fractal Engine
+=====================================================================
+
+This directory is the complete product built from C:\Users\harve\Desktop\mande\new.
+Both programs share one rendering core (src\deep.cpp + src\reference.cpp, plus
+the applied-mathematics library src\mathx\*).
+
+  Mandelbrot View.exe   Desktop program (Win32 + WebView2, the interface is the workbench)
+  mset.exe              Command-line engine (scriptable, verifiable, batchable)
+  libgmp-10.dll         High-precision reference-orbit runtime, must sit beside the exe
+
+Chinese edition: PRODUCT.zh.txt
+
+---------------------------------------------------------------------
+How to use
+---------------------------------------------------------------------
+Desktop: double-click Mandelbrot View.exe. Scroll wheel for point-centred zoom,
+drag to pan; the full frame is rendered after 360 ms of silence.
+
+Command line:
+  mset.exe info
+  mset.exe render --center-re -0.743643887037151 --center-im 0.13182590420533 \
+                  --zoom 1e12 --width 1200 --height 800 --maxiter 4000 --out deep.png
+  mset.exe nucleus --center-re X --center-im Y --digits 300
+                   Newton zoom: detect the atom-domain period, solve z_p(c)=0 to
+                   find the nucleus of the mini-Mandelbrot set
+  mset.exe misiurewicz --m 2 --p 2 --digits 300
+                   Solve z_{m+p}(c)-z_m(c)=0 for a Misiurewicz point
+                   (0+1i is m=2,p=2)
+  mset.exe family --kind tricorn --center-re <220 digits> --center-im 0 \
+                  --zoom 1e120 --width 800 --height 500 --out t.png
+  mset.exe family --kind formula --expr "sin(z)^2 + c" --zoom 1e30 --out f.png
+  mset.exe family-point --kind tricorn --preperiod 3 --period 1 --digits 220 \
+                  --guess-re -1.5437
+  mset.exe --help        All parameters
+
+Long coordinates (> 4000 digits) go through JSON:
+  mset.exe render --config view.json --out deep.png
+
+A/B switches (performance only, never the picture; for self-checks):
+  MB_GMP=0        Force the built-in BigFloat orbit instead of GMP
+  MB_PERIOD=0     Disable analytic reuse of a periodic reference orbit
+  MB_QUASI=1      Allow the "quasi-period" test (see Known limits)
+  MB_CENTER_REF=0 Anchor the reference at the centre pixel, not the exact centre
+  B2_SIMD=0       Force the scalar pixel kernel
+  B2_SA_REPLAY=0  Restore the old "rebuild an orbit with series coefficients"
+  B2_REFCAP=N     Fix the reference-orbit step ceiling
+  B2_TIME=1       Print per-pass/per-orbit timings and glitch distribution
+
+---------------------------------------------------------------------
+What it is
+---------------------------------------------------------------------
+· Reference orbit + normalised perturbation + series approximation. Per-pixel
+  arithmetic uses floatexp (double mantissa + integer exponent), so a pixel
+  offset as small as 1e-60000 does not underflow; below 1e-250 a plain double
+  fast path takes over.
+· The reference orbit uses GMP's mpf (libgmp-10.dll loaded at runtime, never
+  linked or embedded) at zoom digits + 50 guard digits. If the DLL is absent,
+  the engine falls back to its own base-10^9 BigFloat.
+· The orbit is built once to maxiter and the series coefficients are replayed
+  over the stored z_n sequence: one high-precision orbit per frame. Frame-local
+  probes build up to eight candidates in parallel and keep the longest-lived.
+· The pixel kernel is AVX2, four pixels at a time, byte-for-byte identical to
+  the scalar path.
+· Exact periodic-orbit reuse: a Misiurewicz critical orbit repeats exactly from
+  some step (c=i repeats from z_2 with period 2). After detecting the repeat
+  with mpf_cmp in the first 64 steps, later z_n values are tiled by period
+  instead of being squared at full precision. That is what turned 1e60000 from
+  "tens of minutes" into "under a second".
+· `mset nucleus` / `mset misiurewicz` generate deep coordinates to any number
+  of digits. The official examples reach only 1.54e73 (98 digits); anything
+  deeper needs correspondingly more coordinate digits.
+
+---------------------------------------------------------------------
+Verified
+---------------------------------------------------------------------
+· Orbit level: gmporbit compares GMP with BigFloat element by element at
+  80/120/250/500/900 digits, worst difference 4.4e-16 (one double ulp);
+  sareplay compares in-loop integration with post-hoc replay, bit for bit.
+· Precision: cmp uses a full-precision per-pixel oracle — 1e6 98.71%,
+  1e20 100%, 1e38 100%, zero unresolved. The perfect scores come from the
+  exact centre anchor (which removed a half-pixel reference offset).
+· Output consistency: GMP vs BigFloat, SIMD vs scalar, replay on/off and period
+  reuse on/off all produce byte-identical PNGs.
+· Julia sets: 1e6 / 1e12 / 1e20 / 1e38 match --exact pixel for pixel (the old
+  1e12 frame was wrong in 179/255 pixels).
+· 1e100 coordinate integrity: the parsewidth self-check proved the old parse
+  order lost 90 low-order digits; after the fix all 180 digits survive (this
+  was the "structure changes slightly at 1e100" report).
+· 1e60000: c=i, 160x100, maxiter 200000 in 0.65 s, escapes 159453..159488,
+  with self-similar filamentary boundary; the reference orbit cost 40.7 ms.
+· Deep Julia with an early-escaping reference now continues from the last
+  (Z_n, d_n) pair in double instead of painting the frame interior. The
+  desktop and WebAssembly cores share the same source.
+
+Timings (this machine, measured without concurrent work)
+  1e38    426x240   maxiter 3000        44 ms
+  1e73    640x400   maxiter 40000      475 ms
+  1e6000  c=i 320x200 maxiter 30000     84 ms   (was 4.10 s)
+  1e60000 c=i 160x100 maxiter 200000    0.65 s  (was 20 minutes, no frame)
+
+---------------------------------------------------------------------
+About "FFT-grade multiplication"
+---------------------------------------------------------------------
+Measured gmpbench (6000..120000 decimal digits, two big multiplies per step):
+
+  digits    6000    12000    24000    60000    120000
+  us/step   21.9    43.2     106      463      980
+
+The ratios are ~2.0 / 2.5 / 4.4 / 2.1: there is no slope break of the kind an
+FFT threshold would produce. GMP 6.3 still uses Toom-Cook at 200k bits because
+it is faster there (its threshold was chosen by measurement). The bottleneck
+is therefore not "the wrong multiplication algorithm" but the total of
+160000 steps x O(n^1.46). The useful lever is to reduce the number of steps
+that need full-precision multiplication: exact periodic-orbit reuse does that
+and is byte-identical to the full orbit. Pushing into deeper *generic*
+(non-periodic) views would need a backend with a lower FFT threshold (MPIR,
+FLINT) or a hand-written NTT, and the gain at 200k bits is not guaranteed.
+
+---------------------------------------------------------------------
+Known limits
+---------------------------------------------------------------------
+· Periodic reuse only switches on automatically for exactly known Misiurewicz
+  coordinates (c=i, c=-2, ...). Newton-computed coordinates carry a numerical
+  residual and mpf bit-for-bit comparison will not call them periodic, so they
+  still need the full orbit. MB_QUASI=1 relaxes the test to CFexp (53-bit
+  mantissa) and speeds those up, but is OFF by default: c=i+1e-6050 only
+  *looks* periodic, the true orbit diverges, and freezing z_n is wrong. Enable
+  it only when the centre really came from `mset misiurewicz` and the residual
+  is numerical noise in c.
+· A view wholly inside the set still has to run the full maxiter; that is the
+  algorithm's nature.
+· Automatic recursive Newton diving from 1e73 to 1e6000 is not implemented:
+  the nucleus-neighbourhood grid scan keeps returning the same period. Current
+  deep-coordinate sources are nucleus / misiurewicz / exact Misiurewicz points.
+· Zooming directly at a nucleus is necessarily all-interior (mathematically
+  correct); for structure put the centre on the boundary of a mini-Mandelbrot
+  near the nucleus, or use a Misiurewicz point such as c=i.
+· Shallow views (zoom < 1e8) iterate in double; a chaotic-boundary pixel can
+  differ from the BigFloat oracle by +/-1 iteration. That is a precision
+  trade-off, not a bug.
+
+---------------------------------------------------------------------
+How to rebuild
+---------------------------------------------------------------------
+Core sources: C:\Users\harve\Desktop\mande\new\src. Two commands build
+everything:
+  buildall.bat      -> build\mset.exe
+  buildapp.bat      -> build the desktop program and export to dist\ (here)
+  buildapp.bat --no-build    export only, do not recompile
+  b2.bat cmp / gmporbit / sareplay / parsewidth / gmpbench    self-checks
+
+gmp_bridge.cpp and dive.cpp must appear in all three source lists:
+buildall.bat, b2.bat and the desktop build.bat. buildall.bat must pass
+/arch:AVX2 or the SIMD block is compiled out entirely. CMake is unavailable
+on this machine (the security policy blocks reg.exe), so the scripts call cl
+directly; keep the .bat files pure ASCII.
+
+---------------------------------------------------------------------
+Reading the HUD
+---------------------------------------------------------------------
+  CORE / NATIVE   pixels came from the C++ kernel
+  julia / pert    Julia (fixed c, varied z0) / Mandelbrot perturbation (varied c)
+  256 bit         coordinate precision, about 77 decimal digits
+  reference 961   reference-orbit length; far below the budget means "short ref"
+  escape 783-1146 observed min/max escape count; an upper end equal to the
+                  budget means the frame was truncated and must be repainted
