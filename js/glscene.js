@@ -27,7 +27,7 @@
  * orbit in fp16 and the set dissolves.
  * ----------------------------------------------------------------*/
 
-import { paletteLUT } from './palettes.js?v=60';
+import { paletteLUT } from './palettes.js?v=61';
 
 const BAIL2 = 1e20;                        // drawlib.BAIL2
 const LOG_BAIL = 23.025850929940457;       // ln(1e10), drawlib.LOG_BAIL

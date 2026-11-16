@@ -2,30 +2,30 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=60';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=60';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=60';
-import { setLang, t, getLang } from './i18n.js?v=60';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=60';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=60';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=60';
-import { openCorePanel } from './corepanel.js?v=60';
-import { initGlassSelects } from './glass-select.js?v=60';
-import { composeTile } from './drawlib.js?v=60';
-import { SceneRenderer } from './glscene.js?v=60';
-import { MainGPU } from './wgpu/main.js?v=60';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=60';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=61';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=61';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=61';
+import { setLang, t, getLang } from './i18n.js?v=61';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=61';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=61';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=61';
+import { openCorePanel } from './corepanel.js?v=61';
+import { initGlassSelects } from './glass-select.js?v=61';
+import { composeTile } from './drawlib.js?v=61';
+import { SceneRenderer } from './glscene.js?v=61';
+import { MainGPU } from './wgpu/main.js?v=61';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=61';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=60';
-import { initJuliaView } from './juliaview.js?v=60';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=60';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=61';
+import { initJuliaView } from './juliaview.js?v=61';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=61';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=60';
-import { KINDS } from './formulas.js?v=60';
-import * as webcore from './webcore.js?v=60';
-import * as formulacore from './formulacore.js?v=60';
+         REF_MAX_PARAM } from './refpreset.js?v=61';
+import { KINDS } from './formulas.js?v=61';
+import * as webcore from './webcore.js?v=61';
+import * as formulacore from './formulacore.js?v=61';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=60';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=61';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -132,7 +132,7 @@ const state = {
   stops: null,
   /* Tone stage.  Identity values reproduce the palette exactly, so the
    * default view is untouched by any of this. */
-  tone: { bri: 1, gr: 1, gg: 1, gb: 1 },
+  tone: { bri: 1, con: 1, gam: 1, sat: 1, gr: 1, gg: 1, gb: 1 },
   /* Render resolution as a multiple of CSS pixels, independent of the device's
    * own scale factor: 1 = CSS (fastest), 1.5, 2 = device pixels on this screen.
    * The gesture cadence already renders well below this (livePlan), so a lower
@@ -1145,7 +1145,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=60', { type: 'module' });
+    const w = new Worker('js/worker.js?v=61', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -1467,9 +1467,16 @@ function stopsPayload() {
   const src = list.length > 32
     ? Array.from({ length: 32 }, (_, i) => list[Math.round(i * (list.length - 1) / 31)])
     : list;
+  const T = state.tone;
+  const grade = gradeActive(T) ? (c) => gradeRgb(c, T) : null;
+  const gR = +T.gr || 1, gG = +T.gg || 1, gB = +T.gb || 1;
   const out = [];
   for (const s of src) {
-    out.push(+s.pos.toFixed(5), +s.r.toFixed(5), +s.g.toFixed(5), +s.b.toFixed(5));
+    const c = grade ? grade([s.r, s.g, s.b]) : [s.r, s.g, s.b];
+    out.push(+s.pos.toFixed(5),
+      +clamp(c[0] * gR, 0, 1).toFixed(5),
+      +clamp(c[1] * gG, 0, 1).toFixed(5),
+      +clamp(c[2] * gB, 0, 1).toFixed(5));
   }
   return out;
 }
@@ -1786,6 +1793,8 @@ function syncColorUi() {
   syncTrapUi();
   const toneRows = [
     ['rng-bri', 'val-bri', 'bri'],
+    ['rng-con', 'val-con', 'con'], ['rng-gam', 'val-gam', 'gam'],
+    ['rng-sat', 'val-sat', 'sat'],
     ['rng-gr', 'val-gr', 'gr'], ['rng-gg', 'val-gg', 'gg'], ['rng-gb', 'val-gb', 'gb']
   ];
   for (const [id, vid, key] of toneRows) {
@@ -2330,11 +2339,33 @@ function shadeField(data, w, h, lut) {
 }
 
 /** The 512-entry table the CPU path would use for the current colours. */
+/* Colour table for the 2-D re-shade path.  The palette registry keeps the
+ * colours the user typed (the editor keeps editing those); grading happens on
+ * the way out, so a tone change is still one table lookup per pixel. */
+let lutGradeKey = '';
+let lutGradeCache = null;
 function currentLut() {
   const stops = customPaletteStops(state.palette) ||
     (Array.isArray(state.stops) ? resampleStops(state.stops, 64) : null);
   if (stops) registerCustomPalette(state.palette, stops);
-  return paletteLUT(state.palette);
+  const base = paletteLUT(state.palette);
+  const T = state.tone;
+  if (!gradeActive(T)) return base;
+  const gR = +T.gr || 1, gG = +T.gg || 1, gB = +T.gb || 1;
+  const key = [state.palette, T.con, T.gam, T.sat, T.hue, gR, gG, gB].join('|');
+  if (key === lutGradeKey && lutGradeCache && lutGradeCache.length === base.length)
+    return lutGradeCache;
+  const out = new Uint8Array(base.length);
+  for (let i = 0; i < base.length; i += 4) {
+    const q = gradeRgb([base[i] / 255, base[i + 1] / 255, base[i + 2] / 255], T);
+    out[i] = Math.round(clamp(q[0] * gR, 0, 1) * 255);
+    out[i + 1] = Math.round(clamp(q[1] * gG, 0, 1) * 255);
+    out[i + 2] = Math.round(clamp(q[2] * gB, 0, 1) * 255);
+    out[i + 3] = 255;
+  }
+  lutGradeKey = key;
+  lutGradeCache = out;
+  return out;
 }
 
 /** Re-shade the cached field with the current palette.  False = render. */
@@ -2660,21 +2691,30 @@ function gpuPass(vId, plan, done, planList) {
                          : (terms.briFinite != null ? terms.briFinite : 1);
     const briI = glslActive ? state.schemeBri.infinite
                          : (terms.briInfinite != null ? terms.briInfinite : 1);
-    /* Brightness and the per-channel gains are the only console controls with
-     * a counterpart in the reference (brightnessfinite/infinite and the
-     * UniformsColor table).  Contrast, gamma, saturation and hue were removed
-     * rather than left inert. */
+    /* Brightness and the per-channel gains have a counterpart in the reference
+     * (brightnessfinite/infinite and the UniformsColor table) and keep their
+     * own wiring.  Hue, contrast, gamma and saturation are table transforms:
+     * rewriting the ramp and the colour table grades every colour the renderer
+     * can emit, in one place, for every backend. */
     const T = state.tone;
     const gR = +T.gr || 1, gG = +T.gg || 1, gB = +T.gb || 1;
     const toneBri = T.bri == null ? 1 : +T.bri;
+    const grade = gradeActive(T) ? (c) => gradeRgb(c, T) : null;
+    if (grade) {
+      for (const c of colors) {
+        const q = grade([c.r, c.g, c.b]);
+        c.r = q[0]; c.g = q[1]; c.b = q[2];
+      }
+    }
     if (gR !== 1 || gG !== 1 || gB !== 1) {
       for (const c of colors) { c.r *= gR; c.g *= gG; c.b *= gB; }
     }
     const drawOpts = {
       colors,
-      stops: rampShade ? stopList.map(s => ({
-        pos: s.pos, r: s.r * gR, g: s.g * gG, b: s.b * gB
-      })) : [],
+      stops: rampShade ? stopList.map(s => {
+        const q = grade ? grade([s.r, s.g, s.b]) : [s.r, s.g, s.b];
+        return { pos: s.pos, r: q[0] * gR, g: q[1] * gG, b: q[2] * gB };
+      }) : [],
       briFinite: briF * toneBri,
       briInfinite: briI * toneBri,
       briFactor: glslActive ? state.schemeBri.factor : 1,
@@ -4469,6 +4509,71 @@ function fillSelects() {
   $('sel-palette').value = state.schemeId || state.palette;
 }
 
+/* ---------------- Tone stage ----------------
+ * The console grades the picture, not the geometry: every colour the renderer
+ * can possibly emit is produced from a ramp stop or from a scheme's
+ * UniformsColor table, so transforming those tables is a complete tone
+ * stage — the field, the LUT, the native shell and the GLSL path all inherit
+ * it without a second implementation.
+ *
+ * Order follows the panel top to bottom: hue -> brightness -> contrast ->
+ * gamma -> saturation -> per-channel gain.  Contrast pivots around mid grey,
+ * gamma is a plain power curve, saturation mixes toward Rec.709 luma and the
+ * hue rotation is the luminance-preserving matrix browsers use for
+ * `feColorMatrix type="hueRotate"`.
+ * -------------------------------------------------*/
+const TONE_NEUTRAL = { bri: 1, con: 1, gam: 1, sat: 1, gr: 1, gg: 1, gb: 1 };
+
+/** Does the tone stage change anything at all?  Brightness and the channel
+ *  gains are deliberately excluded: they have their own path (the palette's
+ *  brightness pair and the table multipliers), so grading must not repeat
+ *  them. */
+function gradeActive(T) {
+  if (!T) return false;
+  const near = (v) => Math.abs((v == null ? 1 : +v) - 1) <= 1e-6;
+  return Math.abs(+(T.hue || 0)) > 1e-6 ||
+         !near(T.con) || !near(T.gam) || !near(T.sat);
+}
+
+function gradeRgb(rgb, T) {
+  let r = clamp(+rgb[0] || 0, 0, 1);
+  let g = clamp(+rgb[1] || 0, 0, 1);
+  let b = clamp(+rgb[2] || 0, 0, 1);
+  const hue = +(T.hue || 0);
+  if (hue) {
+    const a = hue * Math.PI * 2;
+    const c = Math.cos(a), s = Math.sin(a);
+    const nr = r * (0.213 + c * 0.787 - s * 0.213) +
+               g * (0.715 - c * 0.715 - s * 0.715) +
+               b * (0.072 - c * 0.072 + s * 0.928);
+    const ng = r * (0.213 - c * 0.213 + s * 0.143) +
+               g * (0.715 + c * 0.285 + s * 0.140) +
+               b * (0.072 - c * 0.072 - s * 0.283);
+    const nb = r * (0.213 - c * 0.213 - s * 0.787) +
+               g * (0.715 - c * 0.715 + s * 0.715) +
+               b * (0.072 + c * 0.928 + s * 0.072);
+    r = nr; g = ng; b = nb;
+  }
+  const con = T.con == null ? 1 : +T.con;
+  if (con !== 1) {
+    r = (r - 0.5) * con + 0.5; g = (g - 0.5) * con + 0.5; b = (b - 0.5) * con + 0.5;
+  }
+  const gam = T.gam == null ? 1 : +T.gam;
+  if (gam !== 1) {
+    r = Math.pow(Math.max(0, r), gam);
+    g = Math.pow(Math.max(0, g), gam);
+    b = Math.pow(Math.max(0, b), gam);
+  }
+  const sat = T.sat == null ? 1 : +T.sat;
+  if (sat !== 1) {
+    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    r = luma + (r - luma) * sat;
+    g = luma + (g - luma) * sat;
+    b = luma + (b - luma) * sat;
+  }
+  return [clamp(r, 0, 1), clamp(g, 0, 1), clamp(b, 0, 1)];
+}
+
 /* ---------------- Gradient editor ----------------
  * A ramp widget, Photoshop's colour-stop bar reduced to what a palette needs:
  * click the bar to add a handle, drag a handle to move it, double-click to
@@ -4478,30 +4583,66 @@ function fillSelects() {
  * registry to keep in sync.
  * -------------------------------------------------*/
 let gradSel = 0;
-/* The ramp is three stacked bars, each one third of the palette drawn at full
- * width.  Zone 1 = [0,1/3), zone 2 = [1/3,2/3), zone 3 = [2/3,1]. */
-const ZONE_SPAN = 1 / 3;
-function laneRange(z) {
-  const a = (z - 1) * ZONE_SPAN;
-  return [a, a + ZONE_SPAN];
+/* The ramp is drawn as a stack of full-width bars, each showing one equal
+ * slice of the palette.  Three bars is the reference console's minimum, and a
+ * bar that fills up with 15 handles grows another one below it — a 60-stop
+ * ramp otherwise becomes a row of handles too dense to grab.  The colour-set
+ * editor uses the same machinery with a wider ruler (25 per row).
+ */
+const LANE_MIN = 3;
+const LANE_CAP = 15;
+const PAL_LANE_CAP = 25;
+const LANE_MAX = 12;
+/* True while a handle is being dragged: rebuilding the lane stack mid-drag
+ * would detach the element holding the pointer capture. */
+let gradDragging = false;
+
+/** How many bars this ramp needs: at least `min`, and enough that no single
+ *  slice carries more than `cap` handles.  Bucket by position, grow by one,
+ *  repeat — a stop sitting on a boundary belongs to the bar on its right,
+ *  which is the half-open convention the handles use too. */
+function laneCountFor(list, cap, min = LANE_MIN) {
+  const lanes = Math.max(min, Math.ceil((list.length || 0) / cap));
+  return Math.min(LANE_MAX, lanes);
+}
+
+/** Bars carry their own row count, so the console's 3-row ruler and the
+ *  palette editor's 1-row ruler can live in the same document. */
+function laneSpanOf(el) {
+  const n = +(el && el.dataset.span);
+  return n >= 1 ? n : LANE_MIN;
+}
+
+function laneRange(z, span = LANE_MIN) {
+  const w = 1 / Math.max(1, span);
+  const a = (z - 1) * w;
+  return [a, a + w];
+}
+
+function laneTag(z, span) {
+  if (span <= 1) return t('zoneAll');
+  if (span === 3) return z === 1 ? t('zoneLeft') : z === 2 ? t('zoneMid') : t('zoneRight');
+  return `${z}/${span}`;
 }
 function laneBars() {
   /* Both the console's gradient editor and the presets panel draw the same
    * ramp, so this deliberately matches every bar in the document: whichever
-   * surface is open repaints, and so does the other one when it comes back. */
-  return Array.from(document.querySelectorAll('.grad-bar'));
+   * surface is open repaints, and so does the other one when it comes back.
+   * Bars marked `data-draft` belong to the colour-set editor, which edits its
+   * own copy of the ramp and paints itself. */
+  return Array.from(document.querySelectorAll('.grad-bar:not([data-draft])'));
 }
 /* Pointer x -> ramp position.  `free` lets a drag continue past the lane's
- * edges into a neighbouring third; a click always stays inside its own lane. */
-function barToT(clientX, rect, zone, free = false) {
+ * edges into a neighbouring slice; a click always stays inside its own lane. */
+function barToT(clientX, rect, zone, span, free = false) {
   let f = (clientX - rect.left) / Math.max(1, rect.width);
   if (!free) f = clamp(f, 0, 1);
-  const [a, b] = laneRange(zone);
+  const [a, b] = laneRange(zone, span);
   return clamp(a + f * (b - a), 0, 1);
 }
 /* Ramp position -> offset within one lane, in percent. */
-function tToPct(t, zone) {
-  const [a, b] = laneRange(zone);
+function tToPct(t, zone, span) {
+  const [a, b] = laneRange(zone, span);
   return clamp((t - a) / Math.max(1e-9, b - a), 0, 1) * 100;
 }
 
@@ -4527,25 +4668,33 @@ function syncPaletteStrip() {
   const list = effectiveStops();
   if (gradSel > list.length - 1) gradSel = list.length - 1;
   const css = stopListGradientCSS(list);
+  ensureLanes($('grad-stack'), list, LANE_CAP, LANE_MIN);
   for (const bar of laneBars()) {
+    const span = laneSpanOf(bar);
     const zone = +bar.dataset.zone;
-    const [a, b] = laneRange(zone);
+    const [a, b] = laneRange(zone, span);
     const fill = bar.querySelector('.grad-fill');
-    /* Only the image changes; background-size (300%) and the pan position are
-     * fixed in CSS, so each lane automatically shows its own third. */
-    if (fill) fill.style.backgroundImage = css;
+    /* Only the image changes; the size and the pan position place this bar's
+     * own slice of the full ramp, so a 4th bar automatically shows a quarter
+     * instead of a third. */
+    if (fill) {
+      fill.style.backgroundImage = css;
+      fill.style.backgroundSize = (span * 100) + '% 100%';
+      fill.style.backgroundPosition =
+        (span <= 1 ? 0 : ((zone - 1) / (span - 1)) * 100) + '% 0';
+    }
     const box = bar.querySelector('.grad-handles');
     if (!box) continue;
     box.innerHTML = '';
     list.forEach((s, i) => {
-      /* Half-open thirds: a stop on a boundary belongs to the lane on its
+      /* Half-open slices: a stop on a boundary belongs to the lane on its
        * right, so no handle is drawn twice.  The last lane owns t = 1. */
       const inside = s.pos >= a - 1e-9 &&
-                     (s.pos < b - 1e-9 || (zone === 3 && s.pos <= 1 + 1e-9));
+                     (s.pos < b - 1e-9 || (zone === span && s.pos <= 1 + 1e-9));
       if (!inside) return;
       const h = document.createElement('div');
       h.className = 'grad-handle' + (i === gradSel ? ' sel' : '');
-      h.style.left = tToPct(s.pos, zone) + '%';
+      h.style.left = tToPct(s.pos, zone, span) + '%';
       h.style.background = `rgb(${Math.round(s.r * 255)},${Math.round(s.g * 255)},${Math.round(s.b * 255)})`;
       h.dataset.i = String(i);
       box.appendChild(h);
@@ -4570,10 +4719,11 @@ function bindGradientEditor() {
   stack.addEventListener('pointerdown', (e) => {
     if (e.button !== 0) return;
     const bar = e.target.closest('.grad-bar');
-    if (!bar) return;
+    if (!bar || bar.hasAttribute('data-draft')) return;
     const zone = +bar.dataset.zone;
+    const span = laneSpanOf(bar);
     const rect = bar.getBoundingClientRect();
-    const t = barToT(e.clientX, rect, zone);
+    const t = barToT(e.clientX, rect, zone, span);
     const handle = e.target.closest('.grad-handle');
 
     if (!handle) {                       // empty stretch of bar: insert there
@@ -4592,19 +4742,24 @@ function bindGradientEditor() {
     /* Capture on the bar, not the handle: syncPaletteStrip() has just replaced
      * the handle DOM, so the pointer must belong to something that survives. */
     bar.setPointerCapture(e.pointerId);
+    gradDragging = true;
 
     const move = (ev) => {
       const list = editorStops();
       const lo = idx > 0 ? list[idx - 1].pos + 0.002 : 0;
       const hi = idx < list.length - 1 ? list[idx + 1].pos - 0.002 : 1;
-      const tt = clamp(barToT(ev.clientX, rect, zone, true), lo, hi);
+      const tt = clamp(barToT(ev.clientX, rect, zone, span, true), lo, hi);
       list[idx].pos = tt;
       commitStops(list, false);
     };
     const up = () => {
+      gradDragging = false;
       bar.removeEventListener('pointermove', move);
       bar.removeEventListener('pointerup', up);
       bar.removeEventListener('pointercancel', up);
+      /* A finished drag re-balances the stack: a handle pushed across a
+       * boundary can leave a bar over its cap. */
+      syncPaletteStrip();
     };
     bar.addEventListener('pointermove', move);
     bar.addEventListener('pointerup', up);
@@ -4637,9 +4792,16 @@ function bindGradientEditor() {
   };
 
   $('grad-add').onclick = () => {
+    /* Insert in the middle of the widest gap, not next to the selection.  A
+     * repeated "+" used to walk the new stop rightwards until it stuck at 1.0,
+     * which piled dozens of handles onto the last bar. */
     const list = editorStops();
-    const sel = list[gradSel] || list[0];
-    const pos = sel ? Math.min(1, sel.pos + 0.1) : 0.5;
+    let best = 1, gap = -1;
+    for (let i = 1; i < list.length; ++i) {
+      const d = list[i].pos - list[i - 1].pos;
+      if (d > gap) { gap = d; best = i; }
+    }
+    const pos = list.length > 1 ? list[best - 1].pos + gap / 2 : 0.5;
     const c = sampleStopList(list, pos);
     list.push({ pos, r: c[0], g: c[1], b: c[2] });
     list.sort((a, b) => a.pos - b.pos);
@@ -4716,9 +4878,9 @@ function openPaletteEditor() {
 
   const body = `
     <div class="pal-edit">
-      <div class="pal-preview" id="pal-preview">
-        <div class="grad-handles" id="pal-handles"></div>
-      </div>
+      <!-- The ruler grows with the ramp: 25 handles per row, one row minimum,
+           a new row below as soon as a row fills up. -->
+      <div class="grad-stack pal-stack" id="pal-lanes"></div>
       <div class="row"><label>${t('paletteName')}</label><input class="ctl" id="pal-name"/></div>
       <div class="pal-stops" id="pal-stops"></div>
       <div class="btnrow">
@@ -4752,45 +4914,84 @@ function openPaletteEditor() {
     return [0, 1, 2].map(c => hs[i][c] + (hs[j][c] - hs[i][c]) * f);
   }
 
-  function paintHandles() {
-    const box = $('pal-handles');
-    if (!box) return;
-    box.innerHTML = draft.stops.map((h, i) =>
-      `<div class="grad-handle" data-i="${i}" style="left:${(draft.pos[i] * 100).toFixed(2)}%;background:${h}"></div>`)
-      .join('');
-    for (const el of box.querySelectorAll('.grad-handle')) {
-      el.addEventListener('pointerdown', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const bar = $('pal-preview');
-        const rect = bar.getBoundingClientRect();
-        const idx = +el.dataset.i;
-        el.setPointerCapture(e.pointerId);
-        el.classList.add('sel');
-        const move = (ev) => {
-          const lo = idx > 0 ? draft.pos[idx - 1] + 0.005 : 0;
-          const hi = idx < draft.pos.length - 1 ? draft.pos[idx + 1] - 0.005 : 1;
-          const t = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), lo, hi);
-          draft.pos[idx] = t;
-          el.style.left = (t * 100).toFixed(2) + '%';
-          $('pal-preview').style.background = gradientOf(draft.stops, draft.pos);
-        };
-        const up = () => {
-          el.removeEventListener('pointermove', move);
-          el.removeEventListener('pointerup', up);
-          el.removeEventListener('pointercancel', up);
-          el.classList.remove('sel');
-        };
-        el.addEventListener('pointermove', move);
-        el.addEventListener('pointerup', up);
-        el.addEventListener('pointercancel', up);
-      });
+  /* One ruler row per 25 handles.  The row count is derived from the draft's
+   * own positions, so the moment a row is full another one appears below it
+   * — the same rule the console's ramp uses with 15. */
+  function palSpan() {
+    return laneCountFor(draft.pos.map((v) => ({ pos: v })), PAL_LANE_CAP, 1);
+  }
+
+  function paintLanes(rebuild) {
+    const host = $('pal-lanes');
+    if (!host) return;
+    const span = palSpan();
+    if (rebuild || +host.dataset.span !== span) {
+      host.dataset.span = String(span);
+      let out = '';
+      for (let z = 1; z <= span; ++z) {
+        out += `<div class="grad-lane" data-zone="${z}">
+          <div class="grad-bar" data-zone="${z}" data-span="${span}" data-draft="1">
+            <div class="grad-fill"></div>
+            <span class="grad-lane-tag">${laneTag(z, span)}</span>
+            <div class="grad-handles"></div>
+          </div>
+        </div>`;
+      }
+      host.innerHTML = out;
+    }
+    const css = gradientOf(draft.stops, draft.pos);
+    for (const bar of host.querySelectorAll('.grad-bar')) {
+      const spanB = laneSpanOf(bar);
+      const zone = +bar.dataset.zone;
+      const fill = bar.querySelector('.grad-fill');
+      if (fill) {
+        fill.style.backgroundImage = css;
+        fill.style.backgroundSize = (spanB * 100) + '% 100%';
+        fill.style.backgroundPosition =
+          (spanB <= 1 ? 0 : ((zone - 1) / (spanB - 1)) * 100) + '% 0';
+      }
+      const box = bar.querySelector('.grad-handles');
+      if (!box) continue;
+      box.innerHTML = draft.stops.map((h, i) => {
+        const [a, b] = laneRange(zone, spanB);
+        const inside = draft.pos[i] >= a - 1e-9 &&
+                       (draft.pos[i] < b - 1e-9 || (zone === spanB && draft.pos[i] <= 1 + 1e-9));
+        if (!inside) return '';
+        return `<div class="grad-handle" data-i="${i}" style="left:${tToPct(draft.pos[i], zone, spanB).toFixed(2)}%;background:${h}"></div>`;
+      }).join('');
+      for (const el of box.querySelectorAll('.grad-handle')) {
+        el.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const rect = bar.getBoundingClientRect();
+          const idx = +el.dataset.i;
+          el.setPointerCapture(e.pointerId);
+          el.classList.add('sel');
+          const move = (ev) => {
+            const lo = idx > 0 ? draft.pos[idx - 1] + 0.005 : 0;
+            const hi = idx < draft.pos.length - 1 ? draft.pos[idx + 1] - 0.005 : 1;
+            const t = clamp(barToT(ev.clientX, rect, zone, spanB, true), lo, hi);
+            draft.pos[idx] = t;
+            el.style.left = tToPct(t, zone, spanB).toFixed(2) + '%';
+            if (fill) fill.style.backgroundImage = gradientOf(draft.stops, draft.pos);
+          };
+          const up = () => {
+            el.removeEventListener('pointermove', move);
+            el.removeEventListener('pointerup', up);
+            el.removeEventListener('pointercancel', up);
+            el.classList.remove('sel');
+            paintLanes(true);          /* a move can fill a row: re-balance now */
+          };
+          el.addEventListener('pointermove', move);
+          el.addEventListener('pointerup', up);
+          el.addEventListener('pointercancel', up);
+        });
+      }
     }
   }
 
   function repaint() {
-    $('pal-preview').style.background = gradientOf(draft.stops, draft.pos);
-    paintHandles();
+    paintLanes(false);
   }
 
   function renderStops() {
@@ -4832,7 +5033,9 @@ function openPaletteEditor() {
       if (d > gap) { gap = d; best = i; }
     }
     const at = draft.pos[best - 1] + gap / 2;
-    draft.stops.splice(best, 0, draft.stops[best - 1] || '#ffffff');
+    /* Sample the ramp at the new position: copying the left neighbour's colour
+     * left two identical swatches next to each other in the stop list. */
+    draft.stops.splice(best, 0, rgb01ToHex(sampleDraft(at)));
     draft.pos.splice(best, 0, at);
     renderStops();
   };
@@ -5179,15 +5382,33 @@ function rgbRowHtml() {
   return `<div class="pce-rgb">${rows}</div>`;
 }
 
-function gradLanesHtml(prefix) {
-  return [1, 2, 3].map(z => `
+/** One lane stack, `span` bars tall.  Every bar declares how many bars share
+ *  the ramp, which is what lets the console's three-row ruler and the colour
+ *  set's wider one coexist. */
+function gradLanesHtml(span = LANE_MIN) {
+  let out = '';
+  for (let z = 1; z <= span; ++z) {
+    out += `
       <div class="grad-lane" data-zone="${z}">
-        <div class="grad-bar" data-zone="${z}" title="${t('gradHint')}">
+        <div class="grad-bar" data-zone="${z}" data-span="${span}" title="${t('gradHint')}">
           <div class="grad-fill"></div>
-          <span class="grad-lane-tag">${z === 1 ? t('zoneLeft') : z === 2 ? t('zoneMid') : t('zoneRight')}</span>
+          <span class="grad-lane-tag">${laneTag(z, span)}</span>
           <div class="grad-handles"></div>
         </div>
-      </div>`).join('');
+      </div>`;
+  }
+  return out;
+}
+
+/** Keep a lane host in step with the ramp: a bar that fills up with `cap`
+ *  handles grows another one below it.  A no-op when the count already fits,
+ *  and suspended while a handle is under the pointer. */
+function ensureLanes(host, list, cap, min) {
+  if (!host || gradDragging) return;
+  const want = laneCountFor(list, cap, min);
+  if (+host.dataset.span === want) return;
+  host.dataset.span = String(want);
+  host.innerHTML = gradLanesHtml(want);
 }
 
 function bindRgbSliders(root) {
@@ -5605,7 +5826,7 @@ function pumpThumbs() {
         juliaRe: patch.julia ? Number(patch.julia.re) : 0,
         juliaIm: patch.julia ? Number(patch.julia.im) : 0,
         inverse: !!patch.inverse,
-        tone: { bri: 1, gr: 1, gg: 1, gb: 1 }
+        tone: { ...TONE_NEUTRAL }
       });
       cv.getContext('2d').imageSmoothingQuality = 'high';
       cv.getContext('2d').drawImage(thumbGpuCv, 0, 0, cv.width, cv.height);
@@ -5843,7 +6064,7 @@ function applyRefPresetPatch(patch, file) {
    * last view put them tinted every preset opened afterwards — the file's
    * measured palette then looked "wrong" while the preset's own numbers were
    * fine.  Neutral here, and syncColorUi() pushes it into the controls. */
-  state.tone = { bri: 1, gr: 1, gg: 1, gb: 1 };
+  state.tone = { ...TONE_NEUTRAL };
   state.offset = 0;
   state.shade = 0;
   state.bands = 0;              // the file's own frequencies, never a fitted band count
@@ -7175,6 +7396,8 @@ function bindUi() {
    * quiet period, so dragging shows the effect continuously. */
   const toneMap = [
     ['rng-bri', 'val-bri', 'bri'],
+    ['rng-con', 'val-con', 'con'], ['rng-gam', 'val-gam', 'gam'],
+    ['rng-sat', 'val-sat', 'sat'],
     ['rng-gr', 'val-gr', 'gr'], ['rng-gg', 'val-gg', 'gg'], ['rng-gb', 'val-gb', 'gb']
   ];
   for (const [id, vid, key] of toneMap) {
@@ -7189,7 +7412,7 @@ function bindUi() {
   const toneReset = $('btn-tone-reset');
   if (toneReset) {
     toneReset.onclick = () => {
-      state.tone = { bri: 1, gr: 1, gg: 1, gb: 1 };
+      state.tone = { ...TONE_NEUTRAL };
       for (const [id, vid, key] of toneMap) {
         if ($(id)) $(id).value = state.tone[key];
         if ($(vid)) $(vid).textContent = state.tone[key].toFixed(2);
@@ -7497,9 +7720,10 @@ function encodeState() {
     /* Colour set: band density, period, tone stage and the edited ramp.  A
      * link that dropped these would open with somebody else's colours. */
     bd: state.bands, ca: state.cycleAuto,
-    /* Only the four live tone keys travel.  An older link that still carries
-     * con/gam/sat/hue is read as if those keys were absent (see decodeState). */
-    tn: { bri: state.tone.bri, gr: state.tone.gr,
+    /* The whole tone stage travels with the link: a shared view that dropped
+     * it would open with somebody else's colours. */
+    tn: { bri: state.tone.bri, con: state.tone.con, gam: state.tone.gam,
+          sat: state.tone.sat, gr: state.tone.gr,
           gg: state.tone.gg, gb: state.tone.gb },
     st: state.stops,
     /* An official GLSL recipe: the library id is enough for embedded schemes
@@ -7524,11 +7748,13 @@ function decodeState() {
       scheme: o.sh === 'bands' ? 'bands' : 'distance',
       bands: o.bd != null ? o.bd : state.bands,
       cycleAuto: o.ca !== false,
-      /* Only the four live keys are read.  A link saved before the console lost
-       * contrast/gamma/saturation/hue still carries those keys; they are
-       * dropped here, so the state never grows fields no control owns. */
+      /* Every key falls back to neutral, so a link saved before the tone stage
+       * grew contrast/gamma/saturation still opens unchanged. */
       tone: {
         bri: Number.isFinite(+(o.tn && o.tn.bri)) ? +o.tn.bri : 1,
+        con: Number.isFinite(+(o.tn && o.tn.con)) ? +o.tn.con : 1,
+        gam: Number.isFinite(+(o.tn && o.tn.gam)) ? +o.tn.gam : 1,
+        sat: Number.isFinite(+(o.tn && o.tn.sat)) ? +o.tn.sat : 1,
         gr: Number.isFinite(+(o.tn && o.tn.gr)) ? +o.tn.gr : 1,
         gg: Number.isFinite(+(o.tn && o.tn.gg)) ? +o.tn.gg : 1,
         gb: Number.isFinite(+(o.tn && o.tn.gb)) ? +o.tn.gb : 1
@@ -7855,7 +8081,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=60')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=61')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

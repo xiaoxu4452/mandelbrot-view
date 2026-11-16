@@ -5,7 +5,7 @@
  * queued one and invalidate the running build, so a burst of wheel notches
  * cannot queue up minutes of stale MPFR work.
  */
-import { DeepRenderer } from './renderer.js?v=60';
+import { DeepRenderer } from './renderer.js?v=61';
 
 export class MainGPU {
   constructor(canvas, hooks = {}) {

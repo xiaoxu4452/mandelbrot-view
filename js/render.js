@@ -5,15 +5,15 @@
  *   hp       fully high-precision direct evaluation (Newton sets / families without perturbation support)
  * ----------------------------------------------------------------*/
 
-import { paletteLUT } from './palettes.js?v=60';
-import { buildReferenceOrbit } from './formulas.js?v=60';
-import { ddAdd, ddSub, ddMul } from './dd.js?v=60';
-import { contextFor, resolveBits, requiredBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=60';
-import { buildSeries, chooseSkip } from './environment.js?v=60';
-import { makeBigContext, compileBig } from './hpeval.js?v=60';
-import { compile as compileDouble } from './mathlib.js?v=60';
+import { paletteLUT } from './palettes.js?v=61';
+import { buildReferenceOrbit } from './formulas.js?v=61';
+import { ddAdd, ddSub, ddMul } from './dd.js?v=61';
+import { contextFor, resolveBits, requiredBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=61';
+import { buildSeries, chooseSkip } from './environment.js?v=61';
+import { makeBigContext, compileBig } from './hpeval.js?v=61';
+import { compile as compileDouble } from './mathlib.js?v=61';
 
-import { BAIL2, LOG_BAIL, putColor as writeColor, smoothIter as smoothOf } from './drawlib.js?v=60';
+import { BAIL2, LOG_BAIL, putColor as writeColor, smoothIter as smoothOf } from './drawlib.js?v=61';
 const INTERIOR = [5, 6, 9];
 
 const KIND_CODE = {

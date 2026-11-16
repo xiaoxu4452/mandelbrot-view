@@ -230,6 +230,28 @@ shallow and `1e20`) against a per-pixel arbitrary-precision BigInt oracle:
 ladder and a single orbit.  `node tools/_family-page-check.mjs` verifies the
 same through the real browser worker pool.
 
+### Colour: a real tone stage and a ramp that grows
+
+The console's colour block is a grading stage, not a set of independent knobs.
+Every colour the renderer can emit comes from a ramp stop or from a scheme's
+`UniformsColor` table, so hue, brightness, contrast, gamma and saturation are
+applied to those tables once — and the field, the LUT the 2-D re-shade path
+uses, the flat stop payload the native shell parses and the GLSL path all
+inherit the same grade.  Order follows the panel: hue → brightness → contrast →
+gamma → saturation → per-channel gain.  Contrast pivots on mid grey, gamma is a
+plain power curve, saturation mixes toward Rec.709 luma, and the hue rotation is
+the luminance-preserving matrix browsers use for `feColorMatrix hue-rotate`.
+Neutral values are exactly 1, so an untouched console renders the palette
+unchanged.
+
+The ramp editor's bars grow with the ramp.  Three bars is the floor; each bar
+shows one equal slice of the palette at full width, and a bar that fills up with
+15 handles grows another one below it.  The colour-set editor uses the same
+machinery with a wider ruler — 25 handles per row, one row minimum — so its
+preview turns into a second row instead of a picket fence.  The "+ add stop"
+button inserts into the widest gap, so repeated clicks spread the ramp instead
+of piling handles at the right edge.
+
 ### Preset switching must not accumulate work
 
 Three independent accumulators were measured with

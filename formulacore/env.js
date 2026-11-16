@@ -23,9 +23,9 @@
  * core's radtest collapses to this linear rule here.
  */
 
-import { buildCustomEnvironment } from '../js/customenv.js?v=60';
-import { PRECISION_TIERS } from '../js/bigfixed.js?v=60';
-import { compile as compilePage } from '../js/mathlib.js?v=60';
+import { buildCustomEnvironment } from '../js/customenv.js?v=61';
+import { PRECISION_TIERS } from '../js/bigfixed.js?v=61';
+import { compile as compilePage } from '../js/mathlib.js?v=61';
 
 const JET_MAX = 10;
 

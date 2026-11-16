@@ -13,7 +13,7 @@
 <meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="css/app.css?v=60" />
+<link rel="stylesheet" href="css/app.css?v=61" />
 </head>
 <body class="booting">
 <canvas id="fractal"></canvas>
@@ -287,29 +287,13 @@
         </button>
       </div>
       <div class="grad-ed" id="grad-ed">
-        <!-- Three full-width ramps stacked vertically: each one is one third of
-             the palette stretched to the full width, so a stop can be placed
-             three times more precisely than on a single bar. -->
-        <div class="grad-stack" id="grad-stack">
-          <div class="grad-lane" data-zone="1">
-            <div class="grad-bar" data-zone="1" title="点击空白处添加色标，拖动色标改变位置，双击删除">
-              <div class="grad-fill"></div>
-              <div class="grad-handles"></div>
-            </div>
-          </div>
-          <div class="grad-lane" data-zone="2">
-            <div class="grad-bar" data-zone="2" title="点击空白处添加色标，拖动色标改变位置，双击删除">
-              <div class="grad-fill"></div>
-              <div class="grad-handles"></div>
-            </div>
-          </div>
-          <div class="grad-lane" data-zone="3">
-            <div class="grad-bar" data-zone="3" title="点击空白处添加色标，拖动色标改变位置，双击删除">
-              <div class="grad-fill"></div>
-              <div class="grad-handles"></div>
-            </div>
-          </div>
-        </div>
+        <!-- Full-width ramps stacked vertically, each showing one equal slice
+             of the palette stretched to the full width so a stop can be placed
+             far more precisely than on a single bar.  Three bars is the floor;
+             a bar that fills up with 15 handles grows another one below it,
+             which is why this stack is built by the script (gradLanesHtml) and
+             not written out here. -->
+        <div class="grad-stack" id="grad-stack"></div>
         <div class="grad-row">
           <input type="color" id="grad-color" class="grad-color" value="#ffffff"/>
           <input class="ctl mono num" id="grad-pos" type="number" min="0" max="1" step="0.001" value="0"/>
@@ -370,6 +354,15 @@
         <div class="row tight"><label data-i18n="brightness">亮度</label>
           <input type="range" id="rng-bri" min="0.2" max="2" step="0.01" value="1"/>
           <span class="val mono" id="val-bri">1.00</span></div>
+        <div class="row tight"><label data-i18n="contrast">对比</label>
+          <input type="range" id="rng-con" min="0.5" max="2" step="0.01" value="1"/>
+          <span class="val mono" id="val-con">1.00</span></div>
+        <div class="row tight"><label data-i18n="gamma">伽马</label>
+          <input type="range" id="rng-gam" min="0.4" max="2.5" step="0.01" value="1"/>
+          <span class="val mono" id="val-gam">1.00</span></div>
+        <div class="row tight"><label data-i18n="saturation">饱和</label>
+          <input type="range" id="rng-sat" min="0" max="2" step="0.01" value="1"/>
+          <span class="val mono" id="val-sat">1.00</span></div>
         <div class="row tight gain"><label class="gain-lab">R</label>
           <input type="range" id="rng-gr" min="0.5" max="1.5" step="0.01" value="1"/>
           <span class="val mono" id="val-gr">1.00</span></div>
@@ -430,7 +423,7 @@
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=60"></script>
+<script type="module" src="js/app.js?v=61"></script>
 
 <!-- ==================================================================
      Bootstrap guard (classic script — runs even when ES modules fail).
