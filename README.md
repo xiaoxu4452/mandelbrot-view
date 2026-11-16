@@ -9,6 +9,9 @@ a self-contained BigFloat backend.
 **Open**: <https://xiaoxu4452.github.io/mandelbrot-view/> ·
 **中文说明**: [README.zh.md](README.zh.md)
 
+**Mathematics tutorial** (nanny-level formulas, diagrams and derivations):
+[English](docs/FRACTAL_MATH.md) · [中文](docs/FRACTAL_MATH.zh.md)
+
 The interface is the explorer's own mature UI, unchanged: same toolbar, palette
 panel, preset library, HUD and gestures.  What changed is underneath — the
 JavaScript engine that used to iterate pixels was replaced by `core.wasm`.

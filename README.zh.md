@@ -8,6 +8,9 @@
 **在线地址**：<https://xiaoxu4452.github.io/mandelbrot-view/> ·
 English: [README.md](README.md)
 
+**保姆级数学原理讲解**（公式、图解、完整推导）：
+[中文](docs/FRACTAL_MATH.zh.md) · [English](docs/FRACTAL_MATH.md)
+
 界面用的是观测器原本那套成熟 UI，外观、工具栏、调色板、预设库、HUD、手势全部
 没有改动；换掉的只是底下那颗“大脑”——原来用 JavaScript 逐像素迭代的引擎被
 `core.wasm` 取代。界面不由核心生成，核心也不由页面重新实现。
