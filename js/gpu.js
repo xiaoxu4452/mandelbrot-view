@@ -1,4 +1,4 @@
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=62';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=63';
 
 /* ------------------------------------------------------------------
  * gpu.js — the shading half of the renderer.

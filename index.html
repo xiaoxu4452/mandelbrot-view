@@ -13,7 +13,7 @@
 <meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="css/app.css?v=62" />
+<link rel="stylesheet" href="css/app.css?v=63" />
 </head>
 <body class="booting">
 <canvas id="fractal"></canvas>
@@ -311,40 +311,7 @@
           <option value="distance" data-i18n="schemeDistance">轮廓（Distance）</option>
         </select>
       </div>
-      <!-- Orbit traps.  Everything above colours by the escape count; these
-           colour by where the orbit *went*, which is what draws filigree that
-           keeps its structure at any zoom.  The statistic is accumulated by
-           the same iteration pass, so this costs no extra render. -->
-      <div class="row">
-        <label data-i18n="trap">花纹</label>
-        <select id="sel-trap" class="ctl">
-          <option value="0" data-i18n="trapOff">关闭</option>
-          <option value="1" data-i18n="trapPoint">点陷阱</option>
-          <option value="2" data-i18n="trapLine">线陷阱</option>
-          <option value="3" data-i18n="trapCircle">圆陷阱</option>
-          <option value="4" data-i18n="trapTia">三角平均（TIA）</option>
-        </select>
-      </div>
-      <!-- Trap density.  Both knobs live only in the fragment shader, so
-           moving them repaints the field that is already on the GPU: no
-           iteration pass, no sampling, one draw call. -->
-      <div id="trap-params" hidden>
-        <div class="row tight">
-          <label data-i18n="trapGain">收紧</label>
-          <input type="range" id="rng-trapgain" min="0.02" max="1" step="0.005" value="0.45"/>
-          <span class="val mono" id="val-trapgain">0.45</span>
-        </div>
-        <div class="row tight">
-          <label data-i18n="trapRings">环数</label>
-          <input type="range" id="rng-traprings" min="0" max="1" step="0.005" value="0.40"/>
-          <span class="val mono" id="val-traprings">0.40</span>
-        </div>
-      </div>
-      <!-- Official GLSL schemes declare `nparam` sliders in their JSON.
-           Those params.param[] controls are generated here, exactly one row
-           each.  Changing one re-shades the cached iteration field, so it
-           costs no re-iteration. -->
-      <div id="scheme-params" class="scheme-params" hidden></div>
+      
       <div class="row">
         <label data-i18n="phase">相位</label>
         <input type="range" id="rng-offset" min="0" max="1" step="0.005" value="0"/>
@@ -423,7 +390,7 @@
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=62"></script>
+<script type="module" src="js/app.js?v=63"></script>
 
 <!-- ==================================================================
      Bootstrap guard (classic script — runs even when ES modules fail).
