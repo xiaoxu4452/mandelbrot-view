@@ -12,12 +12,12 @@
  * Output is the SAME single-channel f32 smooth-iteration field webcore's
  * worker returns (interior = -1), so shadeSmoothField() needs no changes.
  */
-import { buildFormulaEnvironment } from '../formulacore/env.js?v=65';
+import { buildFormulaEnvironment } from '../formulacore/env.js?v=66';
 
 /* deep.cpp: kEscape2 = 4.0.  Both cores must use the same bailout so their
  * smoothed iteration fields line up (see formulacore/align-test.mjs). */
 const BAIL2 = 4.0;
-const WASM_URL = new URL('../formulacore/formulacore.wasm?v=65', import.meta.url);
+const WASM_URL = new URL('../formulacore/formulacore.wasm?v=66', import.meta.url);
 
 let e = null;
 let allocs = [];

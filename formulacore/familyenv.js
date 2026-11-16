@@ -24,7 +24,7 @@
  * centre + offset, for Julia its z0 is centre + offset and c is the fixed Julia
  * seed.  The host therefore only has to recompute delta_c after a re-anchor.
  */
-import { contextFor, PRECISION_TIERS } from '../js/bigfixed.js?v=65';
+import { contextFor, PRECISION_TIERS } from '../js/bigfixed.js?v=66';
 
 export const FAMILY_KIND = {
   tricorn: 1, burningship: 2, celtic: 3, perpendicular: 4, phoenix: 5,

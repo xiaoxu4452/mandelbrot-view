@@ -2,30 +2,31 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=65';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=65';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=65';
-import { setLang, t, getLang } from './i18n.js?v=65';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=65';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=65';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=65';
-import { openCorePanel } from './corepanel.js?v=65';
-import { initGlassSelects } from './glass-select.js?v=65';
-import { composeTile } from './drawlib.js?v=65';
-import { SceneRenderer } from './glscene.js?v=65';
-import { MainGPU } from './wgpu/main.js?v=65';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=65';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=66';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=66';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=66';
+import { setLang, t, getLang } from './i18n.js?v=66';
+import { renderMarkdown } from './docview.js?v=66';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=66';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=66';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=66';
+import { openCorePanel } from './corepanel.js?v=66';
+import { initGlassSelects } from './glass-select.js?v=66';
+import { composeTile } from './drawlib.js?v=66';
+import { SceneRenderer } from './glscene.js?v=66';
+import { MainGPU } from './wgpu/main.js?v=66';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=66';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=65';
-import { initJuliaView } from './juliaview.js?v=65';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=65';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=66';
+import { initJuliaView } from './juliaview.js?v=66';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=66';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=65';
-import { KINDS } from './formulas.js?v=65';
-import * as webcore from './webcore.js?v=65';
-import * as formulacore from './formulacore.js?v=65';
+         REF_MAX_PARAM } from './refpreset.js?v=66';
+import { KINDS } from './formulas.js?v=66';
+import * as webcore from './webcore.js?v=66';
+import * as formulacore from './formulacore.js?v=66';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=65';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=66';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1152,7 +1153,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=65', { type: 'module' });
+    const w = new Worker('js/worker.js?v=66', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -5409,6 +5410,40 @@ function refreshThumbWork() {
   clearTimeout(thumbBackfill);
   thumbBackfill = setTimeout(observeThumbs, 0);
 }
+/** Open the built-in mathematics guide in a full-page sheet.
+ *
+ * The guide is a plain Markdown document in docs/ so it reads equally well on
+ * GitHub and in the app.  One renderer, one source file per language; the
+ * modal is deliberately not a second copy of the text. */
+const theoryCache = new Map();
+async function openTheory() {
+  const zh = getLang() === 'zh';
+  const file = zh ? 'docs/FRACTAL_MATH.zh.md' : 'docs/FRACTAL_MATH.md';
+  const title = zh ? '分形数学原理' : 'Fractal Mathematics';
+  const sub = zh
+    ? '从复数运算到 10^120：公式、图解与逐步演算'
+    : 'From complex numbers to 10^120: formulas, diagrams, worked examples';
+  openModal('theory', title, sub,
+    `<div class="doc-md doc-loading">${zh ? '正在载入讲解…' : 'Loading the guide…'}</div>`,
+    '', 'doc');
+  try {
+    let md = theoryCache.get(file);
+    if (!md) {
+      const tag = (document.querySelector('script[src*="app.js"]')?.src.match(/v=(\d+)/) || [])[1] || '';
+      const r = await fetch(`${file}?v=${tag}`, { cache: 'no-cache' });
+      if (!r.ok) throw new Error(String(r.status));
+      md = await r.text();
+      theoryCache.set(file, md);
+    }
+    if (modalKind === 'theory')
+      $('modal-body').innerHTML = `<article class="doc-md">${renderMarkdown(md)}</article>`;
+  } catch (err) {
+    if (modalKind === 'theory')
+      $('modal-body').innerHTML = `<div class="doc-md">${zh
+        ? '讲解文件未能载入：' : 'Could not load the guide: '}${String(err && err.message || err)}</div>`;
+  }
+}
+
 function openModal(kind, title, sub, bodyHtml, footHtml, cls = '') {
   if (modalKind === 'presets') clearThumbWork();
   modalKind = kind;
@@ -7273,6 +7308,7 @@ function bindUi() {
   document.addEventListener('click', () => { closeMenus(); });
 
   $('btn-presets').onclick = openPresets;
+  $('btn-theory-top').onclick = () => { closeMenus(); openTheory(); };
   /* Same editor as the side-panel entry — one code path, one state. */
   const topFormula = $('btn-formula-top');
   if (topFormula) topFormula.onclick = () => openFormula();
@@ -8153,7 +8189,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=65')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=66')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a
