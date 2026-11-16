@@ -18,16 +18,17 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 /* Where the core sources come from.
  *
- * This build compiles the *desktop* core, which normally lives in the desktop
- * project's tree; that tree is not part of this repository, so a clone could
- * not rebuild core.wasm.  `webcore/src/` is therefore a vendored copy of
- * exactly the TUs and headers below (refreshed by `node webcore/sync-src.mjs`),
- * and it is the default.  Point MB_SRC at a desktop checkout to build against
- * the live sources instead — that is what the author's machine does, and the
- * patches are asserted against either. */
+ * This build compiles the desktop core.  A fresh clone has two complete,
+ * committed sources for it: `core/` (the full desktop src/ tree, including
+ * mathx) and `webcore/src/` (a vendored copy of exactly the TUs and headers
+ * below, refreshed by `node webcore/sync-src.mjs`).  `core/` comes first so a
+ * clone rebuilds from the same tree the desktop application uses.  MB_SRC can
+ * still point at a live desktop checkout; every mechanical patch below is
+ * asserted against whichever tree is chosen. */
 const DESKTOP_SRC = (() => {
   const candidates = [
     process.env.MB_SRC,
+    path.join(ROOT, '..', 'core'),
     'C:/Users/harve/Desktop/mande/new/src',
     path.join(ROOT, 'src'),
   ];

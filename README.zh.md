@@ -17,6 +17,10 @@ English: [README.md](README.md)
 
 ![核心渲染的海马螺旋](docs/hero-deep.jpg)
 
+**源码**：完整的桌面 C++ 核心（含任意精度公式引擎 `src/mathx`）已随仓库放在
+[`core/`](core/README.md)。clone 后直接 `node webcore/build.mjs` 即可重建
+`core.wasm`，不需要桌面工程目录。
+
 ---
 
 ## 结构
@@ -63,7 +67,8 @@ node tools/_preset-zoom-check.mjs # 预设放大：迭代预算不得失控
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 
-**C++ 核心源码就在本仓库里**：`webcore/src/` 是 wasm 构建实际编译的那批翻译单元与
+**C++ 核心源码就在本仓库里**：[`core/`](core/README.md) 是**完整**的桌面 `src/`
+（含任意精度公式引擎 `mathx/`），`webcore/src/` 则是 wasm 实际编译的那批翻译单元与
 头文件，所以只 clone 本仓库就能重建 `core.wasm`，不需要别的检出。
 `node webcore/sync-src.mjs <路径>` 从桌面工程刷新这份副本；`MB_SRC=<路径>` 可以
 直接对桌面工作树编译（作者本机就是这么做的；两者产出的 `core.wasm` 逐字节相同）。
@@ -235,7 +240,8 @@ worker 池。
 | `js/app.js` | 手势、调色板、HUD，以及 `corePass()` 派帧 |
 | `js/webcore.js`、`js/webcore-worker.js` | `core.wasm` 的薄 ABI 客户端 |
 | `core.wasm` | 编译后的桌面核心 |
-| `webcore/src/` | **C++ 核心源码**：bigfloat、参考轨道、扰动、render、palette、viewport |
+| `core/` | **完整 C++ 核心源码**：桌面 `src/` 全量副本，含 `mathx/` |
+| `webcore/src/` | wasm 实际编译的核心子集：bigfloat、参考轨道、扰动、render、palette、viewport |
 | `webcore/build.mjs` | 镜像 + 补丁 + 编译流水线（默认用仓库内源码） |
 | `webcore/adapter.cpp` | C ABI：`mb_render`、`mb_view_*`、`mb_render_strip`、stats POD |
 | `webcore/sync-src.mjs` | 从桌面检出刷新 `webcore/src/` |

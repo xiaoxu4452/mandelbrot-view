@@ -12,9 +12,9 @@
  * and falls back to the page's JS kernel -- a formula should never disable the
  * Mandelbrot core for every later view.
  */
-import { buildFamilyEnvironment, spanToZoom } from '../formulacore/familyenv.js?v=64';
+import { buildFamilyEnvironment, spanToZoom } from '../formulacore/familyenv.js?v=65';
 
-const WORKER_URL = 'js/formulacore-worker.js?v=64';
+const WORKER_URL = 'js/formulacore-worker.js?v=65';
 const MAX_WORKERS = 6;
 const poolSize = (() => {
   const hc = (navigator.hardwareConcurrency || 4) | 0;

@@ -20,6 +20,11 @@ reimplemented by the page.
 
 ![The core rendering a seahorse spiral](docs/hero-deep.jpg)
 
+**Source**: the complete desktop C++ core (including `src/mathx`, the
+arbitrary-precision formula engine) is committed in [`core/`](core/README.md).
+A clone can rebuild `core.wasm` with `node webcore/build.mjs`; no desktop
+checkout is required.
+
 ---
 
 ## Architecture
@@ -83,12 +88,13 @@ node tools/_julia-fix-check.mjs    # short-reference Julia views
 node server/static-server.mjs # http://127.0.0.1:8777/index.html
 ```
 
-The C++ core lives in this repository: `webcore/src/` holds the exact
-translation units and headers the wasm build compiles, so a fresh clone can
-rebuild `core.wasm` with no other checkout.  `node webcore/sync-src.mjs <path>`
-refreshes that copy from the desktop project, and `MB_SRC=<path>` builds against
-a desktop tree directly (which is what the author's machine does — the two
-produce byte-identical `core.wasm`).
+The C++ core lives in this repository twice, on purpose: [`core/`](core/README.md)
+is the **complete** desktop `src/` tree (including `mathx/`, the arbitrary-precision
+formula engine), while `webcore/src/` holds just the translation units and headers
+the wasm build actually compiles.  `webcore/build.mjs` prefers `core/`, so a fresh
+clone rebuilds `core.wasm` with no other checkout.  `node webcore/sync-src.mjs <path>`
+refreshes the smaller copy from a desktop project, and `MB_SRC=<path>` builds against
+any tree directly.
 
 ### Experimental: the arbitrary-formula core
 
