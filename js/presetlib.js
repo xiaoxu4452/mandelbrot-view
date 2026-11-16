@@ -20,11 +20,11 @@
  * only non-reference key we add is `ramp` (a hand-edited gradient), which the
  * reference program ignores.
  * ------------------------------------------------------------------ */
-import { PRESET_LIB } from './presets-data.js?v=61';
-import { MORE_LIB, SET_LIB } from './sets-data.js?v=61';
+import { PRESET_LIB } from './presets-data.js?v=62';
+import { MORE_LIB, SET_LIB } from './sets-data.js?v=62';
 import { importRefPreset, exportRefPreset, defaultRefColors,
-         readColors, readGlobals } from './refpreset.js?v=61';
-import { registerAdditivePalette } from './palettes.js?v=61';
+         readColors, readGlobals } from './refpreset.js?v=62';
+import { registerAdditivePalette } from './palettes.js?v=62';
 
 const USER_KEY = 'mb.userPresets.v1';
 

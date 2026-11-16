@@ -2,30 +2,30 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=61';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=61';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=61';
-import { setLang, t, getLang } from './i18n.js?v=61';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=61';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=61';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=61';
-import { openCorePanel } from './corepanel.js?v=61';
-import { initGlassSelects } from './glass-select.js?v=61';
-import { composeTile } from './drawlib.js?v=61';
-import { SceneRenderer } from './glscene.js?v=61';
-import { MainGPU } from './wgpu/main.js?v=61';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=61';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=62';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=62';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=62';
+import { setLang, t, getLang } from './i18n.js?v=62';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=62';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=62';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=62';
+import { openCorePanel } from './corepanel.js?v=62';
+import { initGlassSelects } from './glass-select.js?v=62';
+import { composeTile } from './drawlib.js?v=62';
+import { SceneRenderer } from './glscene.js?v=62';
+import { MainGPU } from './wgpu/main.js?v=62';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=62';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=61';
-import { initJuliaView } from './juliaview.js?v=61';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=61';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=62';
+import { initJuliaView } from './juliaview.js?v=62';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=62';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=61';
-import { KINDS } from './formulas.js?v=61';
-import * as webcore from './webcore.js?v=61';
-import * as formulacore from './formulacore.js?v=61';
+         REF_MAX_PARAM } from './refpreset.js?v=62';
+import { KINDS } from './formulas.js?v=62';
+import * as webcore from './webcore.js?v=62';
+import * as formulacore from './formulacore.js?v=62';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=61';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=62';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1145,7 +1145,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=61', { type: 'module' });
+    const w = new Worker('js/worker.js?v=62', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -4554,22 +4554,27 @@ function gradeRgb(rgb, T) {
                b * (0.072 + c * 0.928 + s * 0.072);
     r = nr; g = ng; b = nb;
   }
-  const con = T.con == null ? 1 : +T.con;
-  if (con !== 1) {
-    r = (r - 0.5) * con + 0.5; g = (g - 0.5) * con + 0.5; b = (b - 0.5) * con + 0.5;
-  }
-  const gam = T.gam == null ? 1 : +T.gam;
-  if (gam !== 1) {
-    r = Math.pow(Math.max(0, r), gam);
-    g = Math.pow(Math.max(0, g), gam);
-    b = Math.pow(Math.max(0, b), gam);
-  }
+  /* Same order and same conventions as the desktop core's tonePrep()
+   * (core/mb_palette.cpp): saturation -> contrast -> gamma, then gain.  Gamma
+   * is a display exponent, so the curve is c^(1/gamma) -- gamma 2.5 brightens,
+   * 0.4 darkens, exactly as on the desktop. */
   const sat = T.sat == null ? 1 : +T.sat;
   if (sat !== 1) {
     const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     r = luma + (r - luma) * sat;
     g = luma + (g - luma) * sat;
     b = luma + (b - luma) * sat;
+  }
+  const con = T.con == null ? 1 : +T.con;
+  if (con !== 1) {
+    r = (r - 0.5) * con + 0.5; g = (g - 0.5) * con + 0.5; b = (b - 0.5) * con + 0.5;
+  }
+  const gam = T.gam == null ? 1 : +T.gam;
+  if (gam !== 1) {
+    const ig = 1 / Math.max(0.01, gam);
+    r = Math.pow(Math.max(0, r), ig);
+    g = Math.pow(Math.max(0, g), ig);
+    b = Math.pow(Math.max(0, b), ig);
   }
   return [clamp(r, 0, 1), clamp(g, 0, 1), clamp(b, 0, 1)];
 }
@@ -4602,7 +4607,24 @@ let gradDragging = false;
  *  repeat — a stop sitting on a boundary belongs to the bar on its right,
  *  which is the half-open convention the handles use too. */
 function laneCountFor(list, cap, min = LANE_MIN) {
-  const lanes = Math.max(min, Math.ceil((list.length || 0) / cap));
+  let lanes = Math.max(min, Math.ceil((list.length || 0) / cap));
+  /* Capacity first, then one safety step: a bar that has grown visibly full
+   * of handles (a third more than its share) still splits, so a ramp whose
+   * stops were dragged into one corner does not turn into a picket fence.
+   * The ceiling stops a pathological pile-up (dozens of handles at exactly
+   * 1.0) from stacking up a dozen empty bars. */
+  for (let guard = 0; guard < 4 && lanes < LANE_MAX; ++guard) {
+    const buckets = new Array(lanes).fill(0);
+    let worst = 0;
+    for (const st of list) {
+      let k = Math.floor(clamp(st.pos, 0, 1) * lanes);
+      if (k >= lanes) k = lanes - 1;
+      if (k < 0) k = 0;
+      if (++buckets[k] > worst) worst = buckets[k];
+    }
+    if (worst <= Math.ceil(cap * 1.2)) break;
+    ++lanes;
+  }
   return Math.min(LANE_MAX, lanes);
 }
 
@@ -4619,10 +4641,14 @@ function laneRange(z, span = LANE_MIN) {
   return [a, a + w];
 }
 
-function laneTag(z, span) {
-  if (span <= 1) return t('zoneAll');
-  if (span === 3) return z === 1 ? t('zoneLeft') : z === 2 ? t('zoneMid') : t('zoneRight');
-  return `${z}/${span}`;
+function laneTag(z, span, count) {
+  const base = span <= 1 ? t('zoneAll')
+    : span === 3 ? (z === 1 ? t('zoneLeft') : z === 2 ? t('zoneMid') : t('zoneRight'))
+    : `${z}/${span}`;
+  /* "how full is this bar" is the number that makes the growth rule legible:
+   * a bar tightens up until it holds 15 handles, then another one appears
+   * below it. */
+  return count == null ? base : `${base} · ${count}`;
 }
 function laneBars() {
   /* Both the console's gradient editor and the presets panel draw the same
@@ -4686,12 +4712,14 @@ function syncPaletteStrip() {
     const box = bar.querySelector('.grad-handles');
     if (!box) continue;
     box.innerHTML = '';
+    let inThisLane = 0;
     list.forEach((s, i) => {
       /* Half-open slices: a stop on a boundary belongs to the lane on its
        * right, so no handle is drawn twice.  The last lane owns t = 1. */
       const inside = s.pos >= a - 1e-9 &&
                      (s.pos < b - 1e-9 || (zone === span && s.pos <= 1 + 1e-9));
       if (!inside) return;
+      ++inThisLane;
       const h = document.createElement('div');
       h.className = 'grad-handle' + (i === gradSel ? ' sel' : '');
       h.style.left = tToPct(s.pos, zone, span) + '%';
@@ -4699,6 +4727,8 @@ function syncPaletteStrip() {
       h.dataset.i = String(i);
       box.appendChild(h);
     });
+    const tagEl = bar.querySelector('.grad-lane-tag');
+    if (tagEl) tagEl.textContent = laneTag(zone, span, inThisLane);
   }
   const sel = list[clamp(gradSel, 0, list.length - 1)];
   if (sel) {
@@ -4940,9 +4970,18 @@ function openPaletteEditor() {
       host.innerHTML = out;
     }
     const css = gradientOf(draft.stops, draft.pos);
+    const counts = new Array(span).fill(0);
+    for (const v of draft.pos) {
+      let k = Math.floor(clamp(v, 0, 1) * span);
+      if (k >= span) k = span - 1;
+      if (k < 0) k = 0;
+      ++counts[k];
+    }
     for (const bar of host.querySelectorAll('.grad-bar')) {
       const spanB = laneSpanOf(bar);
       const zone = +bar.dataset.zone;
+      const tagEl = bar.querySelector('.grad-lane-tag');
+      if (tagEl) tagEl.textContent = laneTag(zone, spanB, counts[zone - 1] || 0);
       const fill = bar.querySelector('.grad-fill');
       if (fill) {
         fill.style.backgroundImage = css;
@@ -8081,7 +8120,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=61')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=62')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

@@ -668,9 +668,12 @@ body.julia-picking #fractal { cursor: crosshair; }
   width: 34px; padding-left: 10px; font-family: var(--mono); font-weight: 700;
   font-size: 11.5px;
 }
-.tone-grid .row.gain:nth-of-type(2) > label.gain-lab { color: #e8746f; }
-.tone-grid .row.gain:nth-of-type(3) > label.gain-lab { color: #79c98a; }
-.tone-grid .row.gain:nth-of-type(4) > label.gain-lab { color: #6ea8fe; }
+/* Named classes, not :nth-of-type: the tone grid gained rows (contrast,
+ * gamma, saturation) and positional selectors silently painted them red,
+ * green and blue while R/G/B fell back to the body colour. */
+.tone-grid .row.gain > label.gain-r { color: #e8746f; }
+.tone-grid .row.gain > label.gain-g { color: #79c98a; }
+.tone-grid .row.gain > label.gain-b { color: #6ea8fe; }
 .tone-grid > .btn { grid-column: 1 / -1; margin-top: 2px; }
 
 /* Rows the active scheme cannot consume are shown dimmed and non-interactive

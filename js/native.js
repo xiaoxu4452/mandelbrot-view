@@ -9,7 +9,7 @@
  * The browser build keeps using the worker/WASM path: this module is inert
  * unless `window.chrome.webview` exists.
  * ----------------------------------------------------------------*/
-import { paletteLUT, paletteStops, paletteColors } from './palettes.js?v=61';
+import { paletteLUT, paletteStops, paletteColors } from './palettes.js?v=62';
 
 const bridge = (typeof window !== 'undefined' && window.chrome && window.chrome.webview) || null;
 
@@ -393,8 +393,13 @@ function buildMsg(payload, seq) {
     briFinite: pal.briFinite,
     briInfinite: pal.briInfinite,
     bri: tone.bri != null ? tone.bri : 1,
-    /* contrast / gamma / saturation are gone from the console (the reference
-     * has no such stage); the shell keeps its own neutral defaults. */
+    /* The shell owns the same tone stage as the page (core/mb_palette.cpp
+     * tonePrep: saturation -> contrast -> gamma -> gain), so the three middle
+     * sliders have to travel with every job -- without them the desktop's
+     * ramp-based kernels ignored contrast/gamma/saturation entirely. */
+    con: tone.con != null ? tone.con : 1,
+    gam: tone.gam != null ? tone.gam : 1,
+    sat: tone.sat != null ? tone.sat : 1,
     gainR: tone.gr != null ? tone.gr : 1,
     gainG: tone.gg != null ? tone.gg : 1,
     gainB: tone.gb != null ? tone.gb : 1,

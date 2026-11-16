@@ -13,7 +13,7 @@
 <meta property="og:description" content="High-precision fractal explorer — perturbation + series approximation + WebAssembly." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='9' cy='12' r='7' fill='none' stroke='%236ea8fe' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='12' r='4' fill='%236ea8fe'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="css/app.css?v=61" />
+<link rel="stylesheet" href="css/app.css?v=62" />
 </head>
 <body class="booting">
 <canvas id="fractal"></canvas>
@@ -363,13 +363,13 @@
         <div class="row tight"><label data-i18n="saturation">饱和</label>
           <input type="range" id="rng-sat" min="0" max="2" step="0.01" value="1"/>
           <span class="val mono" id="val-sat">1.00</span></div>
-        <div class="row tight gain"><label class="gain-lab">R</label>
+        <div class="row tight gain"><label class="gain-lab gain-r">R</label>
           <input type="range" id="rng-gr" min="0.5" max="1.5" step="0.01" value="1"/>
           <span class="val mono" id="val-gr">1.00</span></div>
-        <div class="row tight gain"><label class="gain-lab">G</label>
+        <div class="row tight gain"><label class="gain-lab gain-g">G</label>
           <input type="range" id="rng-gg" min="0.5" max="1.5" step="0.01" value="1"/>
           <span class="val mono" id="val-gg">1.00</span></div>
-        <div class="row tight gain"><label class="gain-lab">B</label>
+        <div class="row tight gain"><label class="gain-lab gain-b">B</label>
           <input type="range" id="rng-gb" min="0.5" max="1.5" step="0.01" value="1"/>
           <span class="val mono" id="val-gb">1.00</span></div>
         <button class="btn tiny" id="btn-tone-reset" data-i18n="toneReset">重置色调</button>
@@ -423,7 +423,7 @@
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=61"></script>
+<script type="module" src="js/app.js?v=62"></script>
 
 <!-- ==================================================================
      Bootstrap guard (classic script — runs even when ES modules fail).
