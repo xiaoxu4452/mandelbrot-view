@@ -2,30 +2,30 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=63';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=63';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=63';
-import { setLang, t, getLang } from './i18n.js?v=63';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=63';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=63';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=63';
-import { openCorePanel } from './corepanel.js?v=63';
-import { initGlassSelects } from './glass-select.js?v=63';
-import { composeTile } from './drawlib.js?v=63';
-import { SceneRenderer } from './glscene.js?v=63';
-import { MainGPU } from './wgpu/main.js?v=63';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=63';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=64';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=64';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=64';
+import { setLang, t, getLang } from './i18n.js?v=64';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=64';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=64';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=64';
+import { openCorePanel } from './corepanel.js?v=64';
+import { initGlassSelects } from './glass-select.js?v=64';
+import { composeTile } from './drawlib.js?v=64';
+import { SceneRenderer } from './glscene.js?v=64';
+import { MainGPU } from './wgpu/main.js?v=64';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=64';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=63';
-import { initJuliaView } from './juliaview.js?v=63';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=63';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=64';
+import { initJuliaView } from './juliaview.js?v=64';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=64';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=63';
-import { KINDS } from './formulas.js?v=63';
-import * as webcore from './webcore.js?v=63';
-import * as formulacore from './formulacore.js?v=63';
+         REF_MAX_PARAM } from './refpreset.js?v=64';
+import { KINDS } from './formulas.js?v=64';
+import * as webcore from './webcore.js?v=64';
+import * as formulacore from './formulacore.js?v=64';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=63';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=64';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1094,6 +1094,13 @@ function noteFrameObservation(cap, hi, bounded, refLen) {
   observedIter.refine++;
   observedIter.repainted = true;
   nativeLog(`[iter] observed ${hi | 0}/${cap} -> ${next} (refine ${observedIter.refine})`);
+  /* The desktop build has done this since 0.10; the web build raised the
+   * ceiling but left the truncated frame on screen until the user moved
+   * again.  That is the "one black frame, then a correct one" report: both
+   * pictures came from the SAME core, the first one simply stopped at the
+   * old ceiling.  Repaint once with the new budget.  `repainted` and
+   * `refine` are set above, so this cannot cascade. */
+  if (!drag && !pinch && !coreRetryAt && !wheelTimer) scheduleRender(140);
 }
 
 function fmtDepth(d) {
@@ -1145,7 +1152,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=63', { type: 'module' });
+    const w = new Worker('js/worker.js?v=64', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -3417,17 +3424,28 @@ function coreFrame(job, gen, final, aa = 1) {
     const suspectShortRef = !!(final && capNow > 0 && (st0.maxEsc | 0) === 0 &&
       (st0.bounded | 0) > msg.w * msg.h * 0.98 &&
       refNow > 0 && refNow < capNow * 0.5);
+    /* A deep frame whose escapes all stop at the ceiling and whose pixels are
+     * mostly interior is not a picture yet -- it is a truncated frame, the
+     * "big black blob" that turns detailed after the next interaction.  The
+     * observation below raises the budget for this view; keep the previous
+     * exact frame on the canvas until that repaint lands.  Shallow frames have
+     * no reference orbit and always contain pixels at the ceiling, so they are
+     * excluded, as are boundary views where most pixels really do escape. */
+    const truncatedInterior = !!(final && capNow > 0 &&
+      (st0.maxEsc | 0) >= capNow - 1 && refNow > 0 &&
+      (st0.bounded | 0) > msg.w * msg.h * 0.5);
+    const suspect = suspectShortRef || truncatedInterior;
     const cycle = coreCycleFor(st0.minEsc, st0.maxEsc);
     const rgba = shadeSmoothField(msg.field, msg.w, msg.h, cycle,
       state.offset || 0, currentLut());
-    if (final && !suspectShortRef) {
+    if (final && !suspect) {
       /* Cache the smooth iterations, not the colours: a palette change, a
        * palette phase or a re-banding is then a table lookup over the same
        * frame instead of another 1.4 s render. */
       fieldCache = { kind: 'smooth', key: fieldKeyNow(false), w: msg.w, h: msg.h,
         data: msg.field, escMin: st0.minEsc | 0, escMax: st0.maxEsc | 0 };
     }
-    if (!suspectShortRef)
+    if (!suspect)
       paintFrame({ w: msg.w, h: msg.h, data: rgba }, msg.w / canvas.width);
     /* Diagnostics for the "picture is a strip / lands offset" reports: one
      * record per painted pass with the sizes the frame was written at, so a
@@ -3460,8 +3478,8 @@ function coreFrame(job, gen, final, aa = 1) {
     /* A truncated frame must not satisfy the "no structure"/"all interior"
      * banner predicates either: the picture on the canvas is the previous
      * view, not this one. */
-    if (suspectShortRef) lastMeta.suspect = true;
-    passStats = suspectShortRef
+    if (suspect) lastMeta.suspect = true;
+    passStats = suspect
       ? { escMin: -1, escMax: -1, bounded: 0 }
       : { escMin: lastMeta.escMin, escMax: lastMeta.escMax,
           bounded: lastMeta.bounded };
@@ -8135,7 +8153,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=63')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=64')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a
