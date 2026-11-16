@@ -16,7 +16,7 @@ legacy/
 
 # Machine-local projects (never part of the web repo)
 desktop/
-core/
+# core/ is committed: the complete C++ engine needed to rebuild core.wasm
 Meter Mandelbrot/
 .staging/
 evidence/
