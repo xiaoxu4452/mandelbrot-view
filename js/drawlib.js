@@ -95,9 +95,21 @@ export function composeTile(ctx, scratch, msg, scale) {
     ctx.putImageData(new ImageData(new Uint8ClampedArray(data), iw, ih), msg.x / k, msg.y / k);
     return;
   }
-  scratch.width = msg.w;
-  scratch.height = msg.h;
-  scratch.ctx.putImageData(new ImageData(new Uint8ClampedArray(msg.data), msg.w, msg.h), 0, 0);
+  /* Resize the REAL scratch canvas, not the wrapper object that carries it.
+   * `scratch.width = ...` on `{ canvas, ctx }` only set a dead property, so the
+   * canvas kept its default 300x150 bitmap.  putImageData() then clipped the
+   * tile to 300x150 and drawImage() adjusted the destination rect to the
+   * visible source — every pass drawn at scale < 1 (the 0.34x preview, and the
+   * formula core's 0.5 Mpx buffer inside a larger window) landed as a small
+   * rectangle in the top-left corner while the rest of the canvas kept the
+   * previous picture.  That is the "formula fractal does not load" and the
+   * "old picture in a small rectangle" report. */
+  const scv = scratch.canvas || scratch;
+  const sctx = scratch.ctx || scv.getContext('2d');
+  if (scv.width !== msg.w) scv.width = msg.w;
+  if (scv.height !== msg.h) scv.height = msg.h;
+  sctx.clearRect(0, 0, msg.w, msg.h);
+  sctx.putImageData(new ImageData(new Uint8ClampedArray(msg.data), msg.w, msg.h), 0, 0);
   /* Snap the tile's scaled rect to whole pixels *as a pair*, so neighbouring
    * tiles share their edge exactly.  Rounding each coordinate independently
    * (or drawing at fractional positions) leaves 1px gaps/overlaps between
@@ -107,5 +119,5 @@ export function composeTile(ctx, scratch, msg, scale) {
   const x1 = Math.round((msg.x + msg.w) / scale), y1 = Math.round((msg.y + msg.h) / scale);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(scratch.canvas, 0, 0, msg.w, msg.h, x0, y0, x1 - x0, y1 - y0);
+  ctx.drawImage(scv, 0, 0, msg.w, msg.h, x0, y0, x1 - x0, y1 - y0);
 }

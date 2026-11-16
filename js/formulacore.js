@@ -12,9 +12,9 @@
  * and falls back to the page's JS kernel -- a formula should never disable the
  * Mandelbrot core for every later view.
  */
-import { buildFamilyEnvironment, spanToZoom } from '../formulacore/familyenv.js?v=59';
+import { buildFamilyEnvironment, spanToZoom } from '../formulacore/familyenv.js?v=60';
 
-const WORKER_URL = 'js/formulacore-worker.js?v=59';
+const WORKER_URL = 'js/formulacore-worker.js?v=60';
 const MAX_WORKERS = 6;
 const poolSize = (() => {
   const hc = (navigator.hardwareConcurrency || 4) | 0;
@@ -119,12 +119,15 @@ const FAMILY_FIRST_CAP = 1024;
 export async function coreRender(job) {
   await coreReady();
   let cap = job.maxiter;
-  let deep = false;
   let zoomMant = 1, zoomExp10 = 0;
   if (job.family) {
     ({ zoomMant, zoomExp10 } = spanToZoom(job.span));
-    deep = zoomExp10 + Math.log10(zoomMant) >= 12;
-    if (deep) cap = Math.min(job.maxiter, FAMILY_FIRST_CAP);
+    /* A shallow family frame is no cheaper with a direct double render: the
+     * folded maps have no series acceleration, so the pixel cost is the same
+     * iteration count either way, and only the KERNEL differs.  Always take
+     * the reference-ladder path so one engine draws the family at every
+     * depth (a threshold crossing used to shift the picture by a band). */
+    cap = Math.min(job.maxiter, FAMILY_FIRST_CAP);
   }
   for (let attempt = 0; ; ++attempt) {
     const view = { ...job, maxiter: cap };
@@ -132,7 +135,7 @@ export async function coreRender(job) {
      * ONCE here and hand it to every band: N workers would otherwise pay N
      * times for the same BigInt work. */
     let familyEnv = null;
-    if (job.family && deep) {
+    if (job.family) {
       familyEnv = buildFamilyEnvironment({
         kind: job.family,
         mode: job.julia ? 1 : 0,
@@ -143,9 +146,16 @@ export async function coreRender(job) {
         width: job.w, height: job.h,
         ladders: 4,
       });
+      /* A ladder whose best orbit dies before the budget (an all-exterior
+       * frame inside a filament) cannot carry the few pixels that outlive it;
+       * those come back as interior.  Measured on a deliberately pathological
+       * celtic centre: ~5% of the pixels.  Deliberately NOT retried as a
+       * direct double render -- 1.5 Mpx x 1000 iterations is ~90 s, worse than
+       * the artefact the retry removes.  The 9-candidate probe above (keep the
+       * best 4) is what keeps this rare. */
     }
     const msg = await renderOnce(view, familyEnv);
-    if (!deep || attempt >= 3 || cap >= job.maxiter ||
+    if (!job.family || attempt >= 3 || cap >= job.maxiter ||
         !(msg.stats && msg.stats.maxEsc >= cap - 2)) return msg;
     cap = Math.min(job.maxiter, cap * 4);
   }

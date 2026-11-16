@@ -12,12 +12,12 @@
  * Output is the SAME single-channel f32 smooth-iteration field webcore's
  * worker returns (interior = -1), so shadeSmoothField() needs no changes.
  */
-import { buildFormulaEnvironment } from '../formulacore/env.js?v=59';
+import { buildFormulaEnvironment } from '../formulacore/env.js?v=60';
 
 /* deep.cpp: kEscape2 = 4.0.  Both cores must use the same bailout so their
  * smoothed iteration fields line up (see formulacore/align-test.mjs). */
 const BAIL2 = 4.0;
-const WASM_URL = new URL('../formulacore/formulacore.wasm?v=59', import.meta.url);
+const WASM_URL = new URL('../formulacore/formulacore.wasm?v=60', import.meta.url);
 
 let e = null;
 let allocs = [];
@@ -126,18 +126,19 @@ function render(job) {
   const rot = Number(job.rot) || 0;
   const rc = Math.cos(rot), rs = Math.sin(rot);
 
-  const decades = zoomExp10 + Math.log10(zoomMant);
   const mode = job.julia ? 1 : 0;
   const jr = ws(job.juliaRe || '0'), ji = ws(job.juliaIm || '0');
 
   /* The folded built-in families own a dedicated C++ kernel: an EXACT
    * piecewise-quadratic delta recurrence over a ladder of arbitrary-precision
-   * orbits.  Below 1e12 a direct double render is both exact and cheaper. */
+   * orbits.  That is used at every depth -- the ladder is as cheap as a direct
+   * double render here (both pay the same iteration count) and it stays exact
+   * where a double pixel offset would collapse.  `fc_render` is only the
+   * fallback for a job that arrived without a ladder. */
   if (job.family) {
     let rc0, engine;
-    if (decades >= 12) {
+    if (job.familyEnv) {
       const f = job.familyEnv;
-      if (!f) throw new Error('missing family reference ladder');
       rc0 = e.fc_render_family(job.family, mode, job.w, job.h, job.maxiter,
         BAIL2, f.R, f.stride,
         put(f.zr), put(f.zi), put(f.foldA), put(f.foldB),

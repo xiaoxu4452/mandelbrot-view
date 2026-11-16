@@ -68,6 +68,7 @@ try {
 
   for (const kind of FAMILIES) {
     for (const deep of [false, true]) {
+      const before = +(await ev(page, '__mb.frames()'));
       const re = kind === 'phoenix' ? PHOENIX_RE : '0.6';
       const span = deep ? '3e-20' : '1.6';
       const e = deep ? 0 : 1;
@@ -85,15 +86,20 @@ try {
         __mb.render(); return 1;
       })()`);
       let f = null;
-      for (let i = 0; i < 60; ++i) {
+      for (let i = 0; i < 80; ++i) {
         await sleep(300);
         f = JSON.parse(await ev(page, 'JSON.stringify(__mb.formula())'));
-        if (deep ? f.engine === 'family' : !f.active) break;
+        const fr = +(await ev(page, '__mb.frames()'));
+        if (fr > before && f.engine === 'family') break;   // this view landed
       }
+      await sleep(400);
       const p = await shot(page, `fam-${kind}-${deep ? 'deep' : 'shallow'}`);
-      /* Shallow views deliberately stay on the page kernel (formulaActive
-       * false); deep views must be owned by the C++ family engine. */
-      const ok = f && (deep ? (f.active && f.engine === 'family') : !f.active) &&
+      /* Both depths are owned by the C++ family engine.  Shallow views used to
+       * stay on the page kernel (a 192-bit BigInt direct render) because the
+       * ladder was only trusted past 1e12 -- that left 1e8..1e12 rendered by a
+       * kernel that took 22-34 s and never finished, which is the "special
+       * families only zoom to 1e8" report. */
+      const ok = f && f.active && f.engine === 'family' &&
                  p.levels > 4 && p.darkPct < 90;
       check(ok, `${kind} ${deep ? '1e20 deep' : 'shallow'}`,
         `active=${f && f.active} engine=${f && f.engine} expr=${f && f.expr} ` +

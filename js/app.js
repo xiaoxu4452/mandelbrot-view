@@ -2,30 +2,30 @@
  * app.js — main controller: view state / tile scheduling / interaction / UI
  * ----------------------------------------------------------------*/
 
-import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=59';
-import { SCHEME_LIB, findScheme } from './schemes-data.js?v=59';
-import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=59';
-import { setLang, t, getLang } from './i18n.js?v=59';
-import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=59';
-import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=59';
-import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=59';
-import { openCorePanel } from './corepanel.js?v=59';
-import { initGlassSelects } from './glass-select.js?v=59';
-import { composeTile } from './drawlib.js?v=59';
-import { SceneRenderer } from './glscene.js?v=59';
-import { MainGPU } from './wgpu/main.js?v=59';
-import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=59';
+import { PALETTE_LIST, paletteGradientCSS, paletteStops, paletteStopList, stopListGradientCSS, sampleStopList, resampleStops, registerCustomPalette, registerAdditivePalette, isCustomPalette, customPaletteStops, paletteColors, paletteRaw, paletteCycle, shaderTerms, REF_DEFAULT_LOG_FREQ, paletteLUT } from './palettes.js?v=60';
+import { SCHEME_LIB, findScheme } from './schemes-data.js?v=60';
+import { REFERENCE_COLORSCHEMES } from './colorschemes-data.js?v=60';
+import { setLang, t, getLang } from './i18n.js?v=60';
+import { contextFor, requiredBits, spanToNumber, resolveBits, resolveBitsFromLog2, requiredBitsFromLog2 } from './bigfixed.js?v=60';
+import { compile as compileMath, toLatex, EXAMPLES } from './mathlib.js?v=60';
+import { probeRemote, resetRemote, remoteEnabled, disableRemote, remoteRender, remoteStatus } from './remote.js?v=60';
+import { openCorePanel } from './corepanel.js?v=60';
+import { initGlassSelects } from './glass-select.js?v=60';
+import { composeTile } from './drawlib.js?v=60';
+import { SceneRenderer } from './glscene.js?v=60';
+import { MainGPU } from './wgpu/main.js?v=60';
+import { NATIVE, nativeUsable, nativeCapable, nativeRender, nativeCancel, nativeSetPaused, nativeThreads, nativeFrameReady, nativeFrameBegin, nativeFrameFlush, nativeCanvasMode, nativeCanvasPreview, nativeCanvasSetPreview, nativeCanvasExport, nativeGLOwned, nativeGLPresented, nativeSurfaceLive, nativeCanvasOwns, nativePreviewTarget, nativeLog, nativeField, nativePaletteTerms, nativeImportPreset, nativeExportPreset, nativeConfig, viewOp } from './native.js?v=60';
 import { FieldRenderer, BUILTIN as GLSL_BUILTIN, CHANNEL, inferChannels,
-         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=59';
-import { initJuliaView } from './juliaview.js?v=59';
-import { PRESET_THUMBS } from './preset-thumbs.js?v=59';
+         readColorschemes, writeColorschemes, newColorscheme } from './gpu.js?v=60';
+import { initJuliaView } from './juliaview.js?v=60';
+import { PRESET_THUMBS } from './preset-thumbs.js?v=60';
 import { importRefPreset, glslToHlsl, classifyRefJson, readRefSettings,
-         REF_MAX_PARAM } from './refpreset.js?v=59';
-import { KINDS } from './formulas.js?v=59';
-import * as webcore from './webcore.js?v=59';
-import * as formulacore from './formulacore.js?v=59';
+         REF_MAX_PARAM } from './refpreset.js?v=60';
+import { KINDS } from './formulas.js?v=60';
+import * as webcore from './webcore.js?v=60';
+import * as formulacore from './formulacore.js?v=60';
 import { LIB, onLibrary, loadPatch, patchOf, thumbPalette,
-         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=59';
+         savePreset, deletePreset, buildObject, sampleAnimation } from './presetlib.js?v=60';
 
 /* Any uncaught exception inside a pass callback aborts the progressive chain
  * silently: the canvas keeps showing the coarse pass and never reaches the
@@ -1145,7 +1145,7 @@ function initWorkers() {
    * own orbit heaps; four keeps every core busy without swapping. */
   const n = NATIVE ? 1 : clamp(cores - 1, 2, TOUCH_UI ? 4 : 32);
   for (let i = 0; i < n; i++) {
-    const w = new Worker('js/worker.js?v=59', { type: 'module' });
+    const w = new Worker('js/worker.js?v=60', { type: 'module' });
     const rec = { w, busy: false, ready: false, id: i };
     w.onmessage = (e) => onWorkerMessage(rec, e.data);
     w.onerror = (e) => console.warn('worker error', e.message);
@@ -3237,12 +3237,16 @@ function viewDecades() {
 }
 function familyCodeFor(spec) {
   if (!spec || spec.mode === 'x' || spec.mode === 'n') return 0;
-  const code = FAMILY_CODE[spec.kind] || 0;
-  /* Shallow views stay on the page's own kernel, which is already exact and
-   * whose gesture/colour timing is settled.  The C++ family kernel is for the
-   * deep regime the page kernel cannot resolve; switching at the SAME 1e12
-   * threshold the worker uses keeps both sides in agreement. */
-  return code && viewDecades() >= 12 ? code : 0;
+  /* Every depth, not just the deep regime.  The page kernel has no reference
+   * orbit for these maps, so it fell back to a BigInt direct render: 1.2 s at
+   * zoom 1e2 and 22-34 s at 1e8/1e9, which is the "special families only zoom
+   * to 1e8" report -- past that the worker never finished.  The C++ family
+   * kernel renders the same view from an arbitrary-precision reference ladder
+   * in ~0.3 s at 1e6 and is exact at any depth (family-test: 0 outliers vs a
+   * per-pixel BigInt oracle at 1e2/1e3/1e4/1e6/1e9/1e20).  Using it for the
+   * shallow views too keeps ONE engine for the family, so crossing a depth
+   * threshold cannot shift the picture by a band. */
+  return FAMILY_CODE[spec.kind] || 0;
 }
 function formulaExprFor(spec) {
   if (!FORMULA_ENGINE || !spec) return '';
@@ -3460,8 +3464,11 @@ function corePass() {
   const W = canvas.width, H = canvas.height;
   /* The formula core's band pool is newer than the Mandelbrot core's; give it
    * a smaller backing store so a first custom-formula frame lands promptly.
-   * The compositor upscales it exactly as it does a preview. */
-  const pixelBudget = formulaActive ? 0.5e6 : CORE_MAX_PIXELS;
+   * The folded families are a separate kernel and are fast, so they keep the
+   * full budget -- downscaling them made a 0.5 Mpx buffer look soft for no
+   * reason. */
+  const pixelBudget = (formulaActive && !familyCodeFor(state.spec))
+    ? 0.5e6 : CORE_MAX_PIXELS;
   let scaleFinal = Math.min(1, Math.sqrt(pixelBudget / Math.max(1, W * H)));
   const it = frameIterCap;
   /* Antialiasing is supersampling: render k samples per pixel and box-reduce,
@@ -3487,8 +3494,12 @@ function corePass() {
    * ran a 0.34x preview AND the full frame with the SAME iteration budget --
    * an extra pass and an extra composite for a frame that already lands in a
    * third of a second.  Keep the preview for the oversized backing stores
-   * that actually had to be downscaled. */
-  const wantPreview = W * H * scaleFinal * scaleFinal > CORE_MAX_PIXELS * 0.9;
+   * that actually had to be downscaled, and for custom formulas: a
+   * transcendental map (exp(z)+c) costs ~6 s per 0.5 Mpx frame in wasm, so
+   * without the preview the canvas sits on the previous picture long enough
+   * to read as "the formula did not load". */
+  const wantPreview = (formulaActive && !familyCodeFor(state.spec)) ||
+    W * H * scaleFinal * scaleFinal > CORE_MAX_PIXELS * 0.9;
   if (wantPreview) {
     const pv = coreJob(scaleFinal * CORE_PREVIEW_SCALE, it);
     coreFrame(pv, gen, false).then(runFinal, runFinal);
@@ -6711,6 +6722,18 @@ function openFormula() {
             return;
           }
         }
+        /* Still flat after every retry: this formula has no legible deep
+         * structure around the picked branch.  Hide the card instead of
+         * painting a black rectangle -- a blank inset reads as "the formula
+         * did not load", which is exactly how the exponential map's preview
+         * was reported. */
+        if (st.sd < 8 && st.edge < 2.0) {
+          box.hidden = true;
+          if (cap) cap.textContent = '';
+          const el = $('fx-branch-info');
+          if (el) el.textContent = t('pickNone');
+          return;
+        }
         c2.getContext('2d').putImageData(
           new ImageData(new Uint8ClampedArray(pxIn), msg.w, msg.h), 0, 0);
         if (cap) {
@@ -7832,7 +7855,7 @@ function boot() {
                   /* Export the gmp-wasm (MPFR) reference orbit for the desktop
                    * Boost bridge, see tools/bridge-crosscheck.mjs. */
                   exportOrbitJson: async (o) =>
-                    (await import('./wgpu/ref-orbit.js?v=59')).exportReferenceOrbitJson(o),
+                    (await import('./wgpu/ref-orbit.js?v=60')).exportReferenceOrbitJson(o),
                   load: loadPatch, resolveScheme,
                   /* Install a scheme by id from the library, exactly as the
                    * colour panel does, so a verification run can switch to a

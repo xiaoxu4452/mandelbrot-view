@@ -53,11 +53,12 @@ page (js/app.js)            js/webcore-worker.js        core.wasm (C++ → wasm3
   so the bands are bit-identical to a single-band render (`?bands=N` pins the
   split, `?bands=1` forces the serial path).  A quarter-width preview lands
   first on deep views, then the full pass.
-* **Views the core does not implement keep the page's own kernel**: multibrot
-  powers, tricorn, burning ship, celtic, perpendicular, phoenix, Newton,
-  distance shading, traps and custom formulas fall back to `js/worker.js`
-  automatically — the HUD says which engine drew the frame (`CORE`, `WASM`,
-  `GPU`).
+* **Views neither core implements keep the page's own kernel**: Newton sets,
+  distance shading, traps, and formulas the C++ parser rejects fall back to
+  `js/worker.js` automatically.  Multibrot powers and the five folded families
+  (tricorn, burning ship, celtic, perpendicular, phoenix) are drawn by the
+  formula core at every depth.  The HUD says which engine drew the frame
+  (`CORE`, `WASM`, `GPU`).
 * **Mobile first**: one finger pans, two fingers pinch about the moving
   midpoint, `touch-action: none` keeps the browser from hijacking the gesture,
   and the pixel budget drops to a third on a phone so a pinch stays
@@ -213,8 +214,12 @@ glitched pixel re-anchor at the same iteration index.  Beyond `2^-900` the
 float-exp kernel takes over; inside that range a plain-double kernel stores
 delta in pixel units and is ~10x faster.
 
-Shallow views (below `1e12`) still use the page kernel, whose gesture and
-colour timing is settled.  Deep views switch to this engine.  The first deep
+This engine owns the family at **every** depth, not just the deep regime.  The
+page kernel has no reference orbit for these maps, so it fell back to a BigInt
+direct render: 1.2 s at `1e2`, 22 s at `1e8`, 34 s at `1e9` and never finished
+at `1e10` — which is why the special families looked stuck at `1e8`.  Crossing
+a depth threshold also changed the engine (and shifted the picture by a band),
+so one engine for the whole family is both faster and steadier.  The first
 budget is 1024 iterations and grows by 4x **only when the returned field is
 actually clipped** — a `1e20` frame escapes by iteration 112, so the page's
 14 600-iteration auto budget would otherwise take minutes.
